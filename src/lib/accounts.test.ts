@@ -169,3 +169,16 @@ describe("ensureAccountsLoaded", () => {
     expect(accountsFor("claude")).toHaveLength(2);
   });
 });
+
+describe("renameAccount", () => {
+  it("passes id, provider and label so the default can be renamed too", async () => {
+    mocks.invoke.mockResolvedValue([]);
+    const { renameAccount } = await import("./accounts");
+    await renameAccount(dflt, "Personal");
+    expect(mocks.invoke).toHaveBeenCalledWith("accounts_rename", {
+      id: "default",
+      provider: "claude",
+      label: "Personal",
+    });
+  });
+});

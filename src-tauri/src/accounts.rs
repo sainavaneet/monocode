@@ -379,13 +379,56 @@ fn list_all(app: &AppHandle, store: &AccountStore) -> Result<Vec<Account>, Strin
             link_shared(Path::new(profile), &source, &account.provider);
         }
     }
-    let mut all = vec![default_account("claude"), default_account("codex")];
-    all.extend(extra);
-    Ok(all.into_iter().map(with_identity).collect())
+    Ok(with_defaults(extra)
+        .into_iter()
+        .map(with_identity)
+        .collect())
+}
+
+/// Defaults first, one per provider. A stored `default` row only carries a
+/// user-chosen label; otherwise the default is synthesised here.
+fn with_defaults(stored: Vec<Account>) -> Vec<Account> {
+    let mut all: Vec<Account> = ["claude", "codex"]
+        .into_iter()
+        .map(|provider| {
+            stored
+                .iter()
+                .find(|a| a.id == DEFAULT_ACCOUNT_ID && a.provider == provider)
+                .cloned()
+                .unwrap_or_else(|| default_account(provider))
+        })
+        .collect();
+    all.extend(stored.into_iter().filter(|a| a.id != DEFAULT_ACCOUNT_ID));
+    all
+}
+
+/// Renames an account in place. The default account is not stored until it
+/// is renamed, so renaming it inserts a label-only row.
+fn rename_in(
+    accounts: &mut Vec<Account>,
+    id: &str,
+    provider: &str,
+    label: String,
+) -> Result<(), String> {
+    if let Some(account) = accounts
+        .iter_mut()
+        .find(|a| a.id == id && a.provider == provider)
+    {
+        account.label = label;
+        return Ok(());
+    }
+    if id != DEFAULT_ACCOUNT_ID {
+        return Err("accounts: not found".into());
+    }
+    accounts.push(Account {
+        label,
+        ..default_account(provider)
+    });
+    Ok(())
 }
 
 /// Every account, defaults first. The default for each provider is the
-/// user's real `~/.claude` / `~/.codex` login and is never stored.
+/// user's real `~/.claude` / `~/.codex` login; only its label is ever stored.
 #[tauri::command(async)]
 pub fn accounts_list(
     app: AppHandle,
@@ -437,19 +480,14 @@ pub fn accounts_rename(
     app: AppHandle,
     store: State<'_, AccountStore>,
     id: String,
+    provider: String,
     label: String,
 ) -> Result<(), String> {
     let label = label.trim().to_string();
     if label.is_empty() {
         return Err("accounts: label is required".into());
     }
-    store.with(&app, |accounts| {
-        let Some(account) = accounts.iter_mut().find(|a| a.id == id) else {
-            return Err("accounts: not found".into());
-        };
-        account.label = label;
-        Ok(())
-    })
+    store.with(&app, |accounts| rename_in(accounts, &id, &provider, label))
 }
 
 #[tauri::command(async)]
@@ -625,6 +663,68 @@ mod tests {
         std::fs::write(root.join("c/.credentials.json"), "{}").unwrap();
         assert!(login_ready(&claude));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn stored(id: &str, provider: &str, label: &str) -> Account {
+        Account {
+            id: id.into(),
+            provider: provider.into(),
+            label: label.into(),
+            profile_dir: (id != DEFAULT_ACCOUNT_ID).then(|| format!("/p/{id}")),
+            identity: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn with_defaults_synthesises_missing_defaults_and_keeps_renamed_ones() {
+        let all = with_defaults(vec![
+            stored("w1", "claude", "Work"),
+            stored(DEFAULT_ACCOUNT_ID, "codex", "Personal"),
+        ]);
+        let heads: Vec<(&str, &str, &str)> = all
+            .iter()
+            .map(|a| (a.provider.as_str(), a.id.as_str(), a.label.as_str()))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                ("claude", "default", "Default"),
+                ("codex", "default", "Personal"),
+                ("claude", "w1", "Work"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_in_updates_existing_and_inserts_default_label() {
+        let mut accounts = vec![stored("w1", "claude", "Work")];
+        rename_in(&mut accounts, "w1", "claude", "Office".into()).unwrap();
+        assert_eq!(accounts[0].label, "Office");
+
+        rename_in(
+            &mut accounts,
+            DEFAULT_ACCOUNT_ID,
+            "claude",
+            "Personal".into(),
+        )
+        .unwrap();
+        let default = accounts
+            .iter()
+            .find(|a| a.id == DEFAULT_ACCOUNT_ID && a.provider == "claude")
+            .unwrap();
+        assert_eq!(default.label, "Personal");
+        assert!(default.profile_dir.is_none());
+
+        rename_in(&mut accounts, DEFAULT_ACCOUNT_ID, "claude", "Home".into()).unwrap();
+        assert_eq!(
+            accounts
+                .iter()
+                .filter(|a| a.id == DEFAULT_ACCOUNT_ID)
+                .count(),
+            1
+        );
+        assert!(rename_in(&mut accounts, "missing", "claude", "X".into()).is_err());
     }
 
     #[test]

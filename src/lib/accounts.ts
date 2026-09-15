@@ -136,8 +136,15 @@ export async function createAccount(
   return account;
 }
 
-export async function renameAccount(id: string, label: string): Promise<void> {
-  await invoke("accounts_rename", { id, label });
+export async function renameAccount(
+  account: Account,
+  label: string,
+): Promise<void> {
+  await invoke("accounts_rename", {
+    id: account.id,
+    provider: account.provider,
+    label,
+  });
   await refreshAccounts();
 }
 

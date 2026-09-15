@@ -97,7 +97,7 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
     if (label === account.label) return;
     setError(null);
     try {
-      await renameAccount(account.id, label);
+      await renameAccount(account, label);
     } catch (failure: unknown) {
       setError(errorText(failure));
     }
@@ -293,13 +293,11 @@ function AccountRow({
       <SecondaryButton onClick={onDefault} disabled={isDefault}>
         {isDefault ? "Default" : "Use by default"}
       </SecondaryButton>
+      <SecondaryButton onClick={onRename}>Rename</SecondaryButton>
       {isCustom ? (
-        <>
-          <SecondaryButton onClick={onRename}>Rename</SecondaryButton>
-          <SecondaryButton onClick={onRemove} danger>
-            Remove
-          </SecondaryButton>
-        </>
+        <SecondaryButton onClick={onRemove} danger>
+          Remove
+        </SecondaryButton>
       ) : null}
     </div>
   );
