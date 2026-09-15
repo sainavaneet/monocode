@@ -1,5 +1,6 @@
 use tauri::Manager;
 
+mod accounts;
 mod chat_background;
 mod checkpoint;
 mod control;
@@ -195,6 +196,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(harness::HarnessHost::new())
         .manage(pty::PtyHost::new())
+        .manage(accounts::AccountStore::default())
         .manage(window_transfer::WindowTransferState::new())
         .setup(|app| {
             harness::reap_orphaned_harness_processes();
@@ -223,6 +225,11 @@ pub fn run() {
             menu::dispatch(app, event.id().as_ref());
         })
         .invoke_handler(tauri::generate_handler![
+            accounts::accounts_list,
+            accounts::accounts_create,
+            accounts::accounts_rename,
+            accounts::accounts_remove,
+            accounts::accounts_login_ready,
             control::control_enable,
             control::control_disable,
             control::control_reply,
