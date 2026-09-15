@@ -3,6 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { GeneratedSessionTitle } from "../sessionTitle";
 import type { PrContent } from "../gitText";
 import { hasLiveCatalog } from "../models";
+import { sendTurnWithFailover } from "../accounts/failover";
 import type { UserQuestionReply } from "../userQuestion";
 import type { NativeCommandProvider } from "./nativeCommands";
 import type {
@@ -139,7 +140,7 @@ export async function sendHarnessTurn(
       cwd: input.cwd,
     });
   try {
-    await adapter.sendTurn(input);
+    await sendTurnWithFailover(input, (attempt) => adapter.sendTurn(attempt));
   } finally {
     if (controlled)
       await invoke("control_turn_finished", { sessionId: input.sessionId });
