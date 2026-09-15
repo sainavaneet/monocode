@@ -108,6 +108,11 @@ function oscColors() {
   return isLightScheme() ? OSC_LIGHT : OSC_DARK;
 }
 
+/// Which mount currently owns a PTY id. StrictMode (and fast remounts) run an
+/// effect cleanup after the next mount has already spawned a replacement under
+/// the same id; the stale cleanup must not kill the newcomer or drop its output.
+const ptyOwners = new Map<string, symbol>();
+
 export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
   const outerRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
@@ -195,6 +200,8 @@ export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
       },
     );
 
+    const owner = Symbol("pty-owner");
+    ptyOwners.set(id, owner);
     const starting = spawnPty(id, cwd, term.cols, term.rows)
       .then(() => {
         if (!closed) spawned.current = true;
@@ -315,7 +322,11 @@ export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
       renderSub.dispose();
       bufferSub.dispose();
       unsubscribe();
-      void starting.catch(() => undefined).then(() => killPty(id));
+      void starting.catch(() => undefined).then(() => {
+        if (ptyOwners.get(id) !== owner) return;
+        ptyOwners.delete(id);
+        return killPty(id);
+      });
       term.dispose();
       termRef.current = null;
       spawned.current = false;

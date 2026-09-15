@@ -3,7 +3,7 @@ import { TerminalView } from "../TerminalView";
 import { accountLoginReady, type Account } from "../../lib/accounts";
 import { loginCommand, LOGIN_POLL_MS } from "../../lib/accountLogin";
 import { homeDir } from "../../lib/fs";
-import { killPty, writePty } from "../../lib/pty";
+import { writePty } from "../../lib/pty";
 import { IS_WIN } from "../../lib/platform";
 import { SecondaryButton } from "./controls";
 
@@ -79,12 +79,6 @@ export function AccountLoginTerminal({
     }, LOGIN_POLL_MS);
     return () => window.clearInterval(poll);
   }, [account, onDone, status]);
-
-  useEffect(() => {
-    return () => {
-      void killPty(ptyId).catch(() => undefined);
-    };
-  }, [ptyId]);
 
   return (
     <div className="mt-3 overflow-hidden rounded-md border border-content/10">
