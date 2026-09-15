@@ -1,5 +1,6 @@
 import type { HarnessId } from "./session";
 import { HARNESSES } from "./session";
+import { ACCOUNT_SETTING_ID, stripAccountSetting } from "./accounts";
 
 export type ModelSettingChoice = {
   value: string;
@@ -363,6 +364,10 @@ export function mergeModelSettings(
     const value = compatibleSettingValue(setting, current[setting.id]);
     if (value != null) next[setting.id] = value;
   }
+  // The account is not a model setting but must survive a model change so
+  // the session keeps running on the login the user picked.
+  const account = current[ACCOUNT_SETTING_ID];
+  if (account) next[ACCOUNT_SETTING_ID] = account;
   return next;
 }
 
@@ -392,7 +397,7 @@ export function saveLastModelSettings(
   mode: "overwrite" | "fill" = "overwrite",
 ) {
   const prev = loadLastModelSettings();
-  const incoming = parseStringRecord(settings);
+  const incoming = parseStringRecord(stripAccountSetting(settings));
   const next =
     mode === "fill" ? { ...incoming, ...prev } : { ...prev, ...incoming };
   try {

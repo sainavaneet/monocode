@@ -351,3 +351,20 @@ describe("live catalog overlays", () => {
     expect(resolveModel("claude", "claude:opus").id).toBe("claude:opus-5");
   });
 });
+
+describe("account setting across model changes", () => {
+  beforeEach(() => {
+    mockLocalStorage();
+  });
+
+  it("mergeModelSettings keeps the account setting", () => {
+    const model = resolveModel("claude", defaultModelId("claude"));
+    const merged = mergeModelSettings(model, { account: "w1" });
+    expect(merged.account).toBe("w1");
+  });
+
+  it("saveLastModelSettings never remembers the account", () => {
+    saveLastModelSettings({ effort: "high", account: "w1" });
+    expect(loadLastModelSettings()).toEqual({ effort: "high" });
+  });
+});
