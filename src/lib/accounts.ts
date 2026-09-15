@@ -101,6 +101,8 @@ function isAccount(value: unknown): value is Account {
   );
 }
 
+let loadedOnce = false;
+
 export function refreshAccounts(): Promise<Account[]> {
   if (inflight) return inflight;
   inflight = invoke<unknown>("accounts_list")
@@ -114,6 +116,9 @@ export function refreshAccounts(): Promise<Account[]> {
       return accounts;
     })
     .finally(() => {
+      // A failed first load still counts as attempted; the UI refreshes
+      // again on its own, and turns must not stall on a broken backend.
+      loadedOnce = true;
       inflight = null;
     });
   return inflight;
@@ -148,11 +153,23 @@ export function accountLoginReady(account: Account): Promise<boolean> {
   });
 }
 
+/**
+ * Resolves once the list has been loaded at least once. Adapters await this
+ * before resolving a session's account, so a session pinned to a non-default
+ * login never spawns under the default one just because nothing has opened
+ * the picker or Settings yet.
+ */
+export function ensureAccountsLoaded(): Promise<void> {
+  if (loadedOnce) return Promise.resolve();
+  return refreshAccounts().then(() => undefined);
+}
+
 /** Test-only: reset the in-memory list. */
 export function __accountsTestReset() {
   accounts = [];
   inflight = null;
   version = 0;
+  loadedOnce = false;
 }
 
 // --- defaults ---------------------------------------------------------------

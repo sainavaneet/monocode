@@ -1,5 +1,10 @@
 import { nativeModelId } from "../models";
-import { accountEnv, accountFor, accountIdFor } from "../accounts";
+import {
+  accountEnv,
+  accountFor,
+  accountIdFor,
+  ensureAccountsLoaded,
+} from "../accounts";
 import type { RuntimeMode } from "../session";
 import { questionPromptTitle, type UserQuestionReply } from "../userQuestion";
 import {
@@ -310,6 +315,7 @@ export function bindCodexSession(
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
+  await ensureAccountsLoaded();
   const accountId = accountIdFor("codex", input.modelSettings);
   const existing = liveByThread.get(input.sessionId);
   if (

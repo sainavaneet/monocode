@@ -66,7 +66,7 @@ export async function fetchCodexRateLimits(
   account?: Account,
 ): Promise<ProviderRateLimits> {
   const childId = account?.profileDir
-    ? `-`
+    ? `${USAGE_CHILD_ID}-${account.id}`
     : USAGE_CHILD_ID;
   let path: string;
   try {

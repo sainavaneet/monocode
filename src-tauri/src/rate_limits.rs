@@ -17,7 +17,7 @@ const TOKEN_REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
-const LEGACY_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+const LEGACY_KEYCHAIN_SERVICE: &str = crate::accounts::KEYCHAIN_SERVICE_PREFIX;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_FALLBACK_USER: &str = "claude-code-user";
 

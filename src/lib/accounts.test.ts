@@ -158,3 +158,14 @@ describe("auto switch", () => {
     expect(loadAutoSwitchAccount()).toBe(false);
   });
 });
+
+describe("ensureAccountsLoaded", () => {
+  it("loads once and then resolves without another call", async () => {
+    mocks.invoke.mockResolvedValue([dflt, work]);
+    const { ensureAccountsLoaded } = await import("./accounts");
+    await ensureAccountsLoaded();
+    await ensureAccountsLoaded();
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+    expect(accountsFor("claude")).toHaveLength(2);
+  });
+});

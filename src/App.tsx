@@ -1,3 +1,4 @@
+import { refreshAccounts } from "./lib/accounts";
 import { invoke } from "@tauri-apps/api/core";
 import { orchestrator, type ControlOutcome } from "./lib/orchestration";
 import { modelsFor } from "./lib/models";
@@ -961,6 +962,7 @@ export default function App({
 
   useEffect(() => {
     void probeHarnessAvailability();
+    void refreshAccounts();
     // Only the harnesses already in this window. Probing every installed CLI
     // at boot left unused agents (especially Pi) running in the background.
     const harnesses = [

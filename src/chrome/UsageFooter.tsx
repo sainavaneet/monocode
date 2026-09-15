@@ -1,5 +1,11 @@
 import { RefreshCw } from "./icons";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { HarnessIcon } from "./HarnessIcon";
 import { Popover } from "./Popover";
 import {
@@ -20,7 +26,12 @@ import {
   type RateLimitWindow,
 } from "../lib/rateLimits";
 import { HARNESS_LABEL, HARNESS_TITLE, type HarnessId } from "../lib/session";
-import { accountFor, DEFAULT_ACCOUNT_ID } from "../lib/accounts";
+import {
+  accountFor,
+  DEFAULT_ACCOUNT_ID,
+  getAccountsSnapshot,
+  subscribeAccounts,
+} from "../lib/accounts";
 import {
   runningTerminalChipLabel,
   type RunningTerminal,
@@ -48,6 +59,11 @@ export function UsageFooter({
 }) {
   const wantClaude = providers.includes("claude");
   const wantCodex = providers.includes("codex");
+  useSyncExternalStore(
+    subscribeAccounts,
+    getAccountsSnapshot,
+    getAccountsSnapshot,
+  );
   // Usage follows the active session's account; other sessions may run on
   // different logins, but the footer describes the one in front of you.
   const claudeAccount = accountFor(

@@ -1,5 +1,10 @@
 import { nativeModelId } from "../models";
-import { accountEnv, accountFor, accountIdFor } from "../accounts";
+import {
+  accountEnv,
+  accountFor,
+  accountIdFor,
+  ensureAccountsLoaded,
+} from "../accounts";
 import type { RuntimeMode } from "../session";
 import { loadClaudeHooks } from "../settings";
 import {
@@ -194,6 +199,7 @@ export async function sendClaudeTurn(input: SendTurnInput): Promise<void> {
 export async function compactClaudeContext(
   input: CompactContextInput,
 ): Promise<void> {
+  await ensureAccountsLoaded();
   const settingsKey = settingsKeyFor(input);
   let live = liveByThread.get(input.sessionId);
   if (!live || live.cwd !== input.cwd || live.settingsKey !== settingsKey) {
@@ -328,6 +334,7 @@ export function bindClaudeSession(
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
+  await ensureAccountsLoaded();
   const settingsKey = settingsKeyFor(input);
   const planning = input.intent === "plan";
   const existing = liveByThread.get(input.sessionId);
