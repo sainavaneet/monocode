@@ -1,4 +1,5 @@
 import { nativeModelId } from "../models";
+import { accountEnv, accountFor, accountIdFor } from "../accounts";
 import type { RuntimeMode } from "../session";
 import { loadClaudeHooks } from "../settings";
 import {
@@ -424,6 +425,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     path,
     buildClaudeSpawnArgs(launch),
     input.cwd,
+    accountEnv(accountFor("claude", input.modelSettings)),
   );
 
   liveByThread.set(input.sessionId, live);
@@ -1348,7 +1350,10 @@ function writeJson(
 }
 
 function settingsKeyFor(input: HarnessSessionInput): string {
-  return claudeSettingsKey({
+  // The account is part of the key so a switch respawns Claude under the
+  // other login while `--resume` keeps the same conversation.
+  const account = accountIdFor("claude", input.modelSettings);
+  const launch = claudeSettingsKey({
     model: nativeModelId(input.model),
     effort: input.modelSettings?.effort,
     fast: input.modelSettings?.fast,
@@ -1357,6 +1362,7 @@ function settingsKeyFor(input: HarnessSessionInput): string {
     runtimeMode: input.runtimeMode,
     hooks: loadClaudeHooks(),
   });
+  return `${account}|${launch}`;
 }
 
 function launchOptions(

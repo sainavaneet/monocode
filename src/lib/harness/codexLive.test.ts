@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sent: string[] = [];
+const spawnedEnv: Array<Record<string, string> | undefined> = [];
 let onLine: ((line: string) => void) | undefined;
 const writeChild = vi.fn(async (_id: string, line: string) => {
   sent.push(line);
@@ -8,13 +9,43 @@ const writeChild = vi.fn(async (_id: string, line: string) => {
 
 vi.mock("./child", () => ({
   resolveCodexBinary: async () => ({ path: "/fake/codex" }),
-  spawnChild: async () => undefined,
+  spawnChild: async (
+    _id: string,
+    _path: string,
+    _args: string[],
+    _cwd: string,
+    env?: Record<string, string>,
+  ) => {
+    spawnedEnv.push(env);
+  },
   killChild: async () => undefined,
   unwatchChild: () => undefined,
   watchChild: (_id: string, line: (l: string) => void) => {
     onLine = line;
   },
   writeChild,
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: async (command: string) =>
+    command === "accounts_list"
+      ? [
+          {
+            id: "default",
+            provider: "codex",
+            label: "Default",
+            profileDir: null,
+            createdAt: 0,
+          },
+          {
+            id: "x1",
+            provider: "codex",
+            label: "Work",
+            profileDir: "/p/x1",
+            createdAt: 1,
+          },
+        ]
+      : undefined,
 }));
 
 const {
@@ -31,6 +62,7 @@ const {
 import type { HarnessEvent } from "./types";
 import { newSession, type RuntimeMode, type TurnIntent } from "../session";
 import { applyHarnessEvent } from "./apply";
+import { __accountsTestReset, refreshAccounts } from "../accounts";
 
 function parse() {
   return sent.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -61,6 +93,7 @@ async function startTurn(
     intent?: TurnIntent;
     resume?: boolean;
     beforeThreadReply?: () => Promise<void>;
+    modelSettings?: Record<string, string>;
   } = {},
 ) {
   const events: HarnessEvent[] = [];
@@ -69,7 +102,7 @@ async function startTurn(
     sessionId,
     cwd: "/repo",
     model: "codex:gpt-5.4",
-    modelSettings: {},
+    modelSettings: options.modelSettings ?? {},
     runtimeMode: options.runtimeMode ?? "supervised",
     intent: options.intent,
     text: "summarize the changelog",
@@ -1593,5 +1626,65 @@ describe("codex subagents", () => {
           event.text.includes("Child talking."),
       ),
     ).toBe(false);
+  });
+});
+
+describe("codex accounts", () => {
+  beforeEach(async () => {
+    sent.length = 0;
+    spawnedEnv.length = 0;
+    onLine = undefined;
+    writeChild.mockClear();
+    __accountsTestReset();
+    await refreshAccounts();
+  });
+
+  afterEach(async () => {
+    await stopCodexSession("codex-acct");
+    __codexTestReset();
+  });
+
+  it("spawns under the selected account and resumes the thread when it changes", async () => {
+    const first = await startTurn("codex-acct", {
+      modelSettings: { account: "x1" },
+    });
+    expect(spawnedEnv[0]).toEqual({ CODEX_HOME: "/p/x1" });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await first.turn;
+
+    const second = sendCodexTurn({
+      sessionId: "codex-acct",
+      cwd: "/repo",
+      model: "codex:gpt-5.4",
+      modelSettings: { account: "default" },
+      runtimeMode: "supervised",
+      text: "continue",
+      attachments: [],
+      onEvent: () => undefined,
+    });
+    await waitFor(() => spawnedEnv.length === 2, "respawn under default");
+    expect(spawnedEnv[1]).toEqual({});
+    await waitFor(
+      () => parse().filter((m) => m.method === "initialize").length === 2,
+      "second initialize",
+    );
+    reply(parse().filter((m) => m.method === "initialize")[1].id as number, {});
+    await waitFor(
+      () => parse().some((m) => m.method === "thread/resume"),
+      "thread/resume",
+    );
+    const resume = parse().find((m) => m.method === "thread/resume")!;
+    expect(resume.params).toMatchObject({ threadId: "thr_1" });
+    reply(resume.id as number, { thread: { id: "thr_1" } });
+    await waitFor(
+      () => parse().filter((m) => m.method === "turn/start").length === 2,
+      "second turn/start",
+    );
+    reply(parse().filter((m) => m.method === "turn/start")[1].id as number, {
+      turn: { id: "turn_2", status: "inProgress" },
+    });
+    notify("turn/started", { turn: { id: "turn_2", status: "inProgress" } });
+    notify("turn/completed", { turn: { id: "turn_2", status: "completed" } });
+    await second;
   });
 });

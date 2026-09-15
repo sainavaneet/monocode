@@ -1,4 +1,5 @@
 import { nativeModelId } from "../models";
+import { accountEnv, accountFor, accountIdFor } from "../accounts";
 import type { RuntimeMode } from "../session";
 import { questionPromptTitle, type UserQuestionReply } from "../userQuestion";
 import {
@@ -65,6 +66,8 @@ type Live = {
   rpc: JsonRpcClient;
   threadId: string;
   cwd: string;
+  /// Account the app-server was started under; a change forces a respawn.
+  accountId: string;
   runtimeMode: RuntimeMode;
   planning: boolean;
   onEvent: (event: HarnessEvent) => void;
@@ -307,13 +310,20 @@ export function bindCodexSession(
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
+  const accountId = accountIdFor("codex", input.modelSettings);
   const existing = liveByThread.get(input.sessionId);
-  if (existing && existing.cwd === input.cwd) {
+  if (
+    existing &&
+    existing.cwd === input.cwd &&
+    existing.accountId === accountId
+  ) {
     existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
-    resumeByThread.delete(input.sessionId);
+    // A cwd change invalidates the thread. An account change must keep it
+    // so the same conversation resumes under the new login.
+    if (existing.cwd !== input.cwd) resumeByThread.delete(input.sessionId);
     await stopCodexSession(input.sessionId);
   }
 
@@ -382,7 +392,13 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
   );
 
-  await spawnChild(input.sessionId, path, ["app-server"], input.cwd);
+  await spawnChild(
+    input.sessionId,
+    path,
+    ["app-server"],
+    input.cwd,
+    accountEnv(accountFor("codex", input.modelSettings)),
+  );
 
   try {
     await rpc.request("initialize", {
@@ -452,6 +468,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       rpc,
       threadId,
       cwd: input.cwd,
+      accountId,
       runtimeMode: input.runtimeMode,
       planning: input.intent === "plan",
       onEvent: input.onEvent,

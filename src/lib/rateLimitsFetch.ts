@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { accountEnv, type Account } from "./accounts";
 import { homeDir } from "./fs";
 import {
   errorRateLimits,
@@ -61,7 +62,12 @@ export async function fetchClaudeRateLimits(
   }
 }
 
-export async function fetchCodexRateLimits(): Promise<ProviderRateLimits> {
+export async function fetchCodexRateLimits(
+  account?: Account,
+): Promise<ProviderRateLimits> {
+  const childId = account?.profileDir
+    ? `-`
+    : USAGE_CHILD_ID;
   let path: string;
   try {
     path = (await resolveCodexBinary()).path;
@@ -71,7 +77,7 @@ export async function fetchCodexRateLimits(): Promise<ProviderRateLimits> {
 
   const cwd = await homeDir();
   const rpc = new JsonRpcClient(
-    USAGE_CHILD_ID,
+    childId,
     {
       onRequest: (id) => {
         void rpc.respond(id, {}).catch(() => undefined);
@@ -82,20 +88,26 @@ export async function fetchCodexRateLimits(): Promise<ProviderRateLimits> {
 
   const stop = async () => {
     rpc.close();
-    unwatchChild(USAGE_CHILD_ID);
-    await killChild(USAGE_CHILD_ID).catch(() => undefined);
+    unwatchChild(childId);
+    await killChild(childId).catch(() => undefined);
   };
 
-  await killChild(USAGE_CHILD_ID).catch(() => undefined);
+  await killChild(childId).catch(() => undefined);
 
   watchChild(
-    USAGE_CHILD_ID,
+    childId,
     (line) => rpc.pushLine(line),
     () => rpc.close(new Error("Codex usage probe exited")),
   );
 
   try {
-    await spawnChild(USAGE_CHILD_ID, path, ["app-server"], cwd);
+    await spawnChild(
+      childId,
+      path,
+      ["app-server"],
+      cwd,
+      accountEnv(account),
+    );
     return await withTimeout(
       DISCOVERY_TIMEOUT_MS,
       async () => {
