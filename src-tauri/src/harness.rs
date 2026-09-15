@@ -326,6 +326,7 @@ pub fn harness_spawn(
     command: String,
     args: Vec<String>,
     cwd: String,
+    env: Option<HashMap<String, String>>,
 ) -> Result<u32, String> {
     let (epoch, kill_all, prev) = host.begin_spawn(&session_id);
     if let Some(prev) = prev {
@@ -347,6 +348,7 @@ pub fn harness_spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
+    crate::accounts::apply_env(&mut cmd, env.as_ref())?;
 
     crate::control::configure_child(&app, &session_id, &mut cmd);
 
@@ -670,6 +672,7 @@ pub async fn harness_exec(
     command: String,
     args: Vec<String>,
     cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
 ) -> Result<String, String> {
     if !exec_args_allowed(&args) {
         return Err("harness_exec: unsupported arguments".into());
@@ -678,19 +681,25 @@ pub async fn harness_exec(
         if !is_resolved_harness_binary(&command) {
             return Err("harness_exec: not a resolved harness CLI".to_string());
         }
-        exec_capture(&command, &args, cwd.as_deref())
+        exec_capture(&command, &args, cwd.as_deref(), env.as_ref())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-fn exec_capture(command: &str, args: &[String], cwd: Option<&str>) -> Result<String, String> {
+fn exec_capture(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+) -> Result<String, String> {
     let mut cmd = Command::new(command);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, command);
+    crate::accounts::apply_env(&mut cmd, env)?;
     if let Some(dir) = cwd {
         let workdir = expand_home(dir);
         if workdir.is_dir() {
