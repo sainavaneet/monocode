@@ -318,15 +318,18 @@ pub fn harness_free_port() -> Result<u16, String> {
 /// Off the main thread: fork/exec, and `apply_gui_env` can wait on the first
 /// login-shell read. Callers await this before writing to the child. Kill can
 /// still race the fork, so a cancelled spawn must not reinsert the child.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(async)]
 pub fn harness_spawn(
     app: AppHandle,
     host: State<'_, HarnessHost>,
+    accounts: State<'_, crate::accounts::AccountStore>,
     session_id: String,
     command: String,
     args: Vec<String>,
     cwd: String,
     env: Option<HashMap<String, String>>,
+    account: Option<crate::accounts::AccountRef>,
 ) -> Result<u32, String> {
     let (epoch, kill_all, prev) = host.begin_spawn(&session_id);
     if let Some(prev) = prev {
@@ -349,6 +352,7 @@ pub fn harness_spawn(
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
     crate::accounts::apply_env(&mut cmd, env.as_ref())?;
+    crate::accounts::apply_account_secret(&app, &accounts, account.as_ref(), &mut cmd)?;
 
     crate::control::configure_child(&app, &session_id, &mut cmd);
 

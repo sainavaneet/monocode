@@ -6,6 +6,7 @@ import {
 import type { ModelSetting } from "./models";
 
 export function accountOptionLabel(account: Account): string {
+  if (account.kind === "apiKey") return `${account.label} · API key`;
   return account.identity
     ? `${account.label} · ${account.identity}`
     : account.label;
@@ -21,7 +22,9 @@ export function accountModelSetting(
   accounts: Account[],
   current: string,
 ): ModelSetting | null {
-  const mine = accounts.filter((account) => account.provider === provider);
+  const mine = accounts.filter(
+    (account) => account.provider === provider && account.enabled !== false,
+  );
   if (mine.length < 2) return null;
   return {
     id: ACCOUNT_SETTING_ID,

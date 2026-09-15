@@ -26,6 +26,16 @@ const codex: Account = {
 };
 
 describe("accountModelSetting", () => {
+  it("labels API keys and hides disabled accounts", () => {
+    const key: Account = { ...work, id: "k1", label: "Key", kind: "apiKey", enabled: true, identity: "API key ····7890" };
+    const off: Account = { ...work, id: "o1", enabled: false };
+    const setting = accountModelSetting("claude", [dflt, key, off], "k1");
+    expect(setting?.options).toEqual([
+      { value: "default", label: "Default" },
+      { value: "k1", label: "Key · API key" },
+    ]);
+  });
+
   it("returns null with a single account for the provider", () => {
     expect(accountModelSetting("claude", [dflt, codex], "default")).toBeNull();
   });

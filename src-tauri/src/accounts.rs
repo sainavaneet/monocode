@@ -46,6 +46,18 @@ const CODEX_SHARED: [&str; 8] = [
 ];
 const CLAUDE_JSON_STRIP: [&str; 2] = ["oauthAccount", "userID"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountKind {
+    #[default]
+    Subscription,
+    ApiKey,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -56,6 +68,40 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
     pub created_at: i64,
+    #[serde(default)]
+    pub kind: AccountKind,
+    /// Off by default for API keys, so they only bill when chosen on purpose.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Last four characters of an API key; never the key itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// A frontend reference to an account; the secret stays on this side.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRef {
+    pub provider: String,
+    pub id: String,
+}
+
+const API_KEY_SERVICE: &str = "MonoCode API Key";
+const API_KEY_FILE: &str = "api_key";
+const API_KEY_HINT_LEN: usize = 4;
+const CLAUDE_KEY_APPROVAL_LEN: usize = 20;
+
+fn api_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "claude" => Some("ANTHROPIC_API_KEY"),
+        "codex" => Some("OPENAI_API_KEY"),
+        _ => None,
+    }
+}
+
+fn tail(value: &str, len: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    chars[chars.len().saturating_sub(len)..].iter().collect()
 }
 
 #[derive(Default)]
@@ -237,6 +283,12 @@ fn claude_json_path(account: &Account) -> Option<PathBuf> {
 }
 
 fn read_identity(account: &Account) -> Option<String> {
+    if account.kind == AccountKind::ApiKey {
+        return Some(match &account.hint {
+            Some(hint) => format!("API key ····{hint}"),
+            None => "API key".into(),
+        });
+    }
     match account.provider.as_str() {
         "claude" => {
             let raw = std::fs::read_to_string(claude_json_path(account)?).ok()?;
@@ -330,6 +382,9 @@ fn default_account(provider: &str) -> Account {
         profile_dir: None,
         identity: None,
         created_at: 0,
+        kind: AccountKind::Subscription,
+        enabled: true,
+        hint: None,
     }
 }
 
@@ -444,35 +499,278 @@ pub fn accounts_create(
     provider: String,
     label: String,
 ) -> Result<Account, String> {
-    if !matches!(provider.as_str(), "claude" | "codex") {
+    let label = validate_provider_and_label(&provider, &label)?;
+    let account = new_profile_account(&app, &provider, label)?;
+    store.with(&app, |accounts| {
+        accounts.push(account.clone());
+        Ok(())
+    })?;
+    Ok(account)
+}
+
+/// Creates the profile directory with shared links and returns the row for
+/// it. Nothing is stored yet.
+fn new_profile_account(app: &AppHandle, provider: &str, label: &str) -> Result<Account, String> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let profile = accounts_root(app)?.join(provider).join(&id);
+    std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
+    if let Some(source) = provider_home(provider) {
+        link_shared(&profile, &source, provider);
+    }
+    if provider == "claude" {
+        seed_claude_json(&profile);
+    }
+    Ok(Account {
+        id,
+        provider: provider.to_string(),
+        label: label.to_string(),
+        profile_dir: Some(profile.to_string_lossy().into_owned()),
+        identity: None,
+        created_at: now_millis(),
+        kind: AccountKind::Subscription,
+        enabled: true,
+        hint: None,
+    })
+}
+
+fn validate_provider_and_label<'a>(provider: &str, label: &'a str) -> Result<&'a str, String> {
+    if !matches!(provider, "claude" | "codex") {
         return Err(format!("accounts: unsupported provider {provider}"));
     }
     let label = label.trim();
     if label.is_empty() {
         return Err("accounts: label is required".into());
     }
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let profile = accounts_root(&app)?.join(&provider).join(&id);
-    std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
-    if let Some(source) = provider_home(&provider) {
-        link_shared(&profile, &source, &provider);
+    Ok(label)
+}
+
+// --- API keys ----------------------------------------------------------------
+
+fn api_key_file(account: &Account) -> Option<PathBuf> {
+    account
+        .profile_dir
+        .as_ref()
+        .map(|dir| PathBuf::from(dir).join(API_KEY_FILE))
+}
+
+fn api_key_keychain_account(account: &Account) -> String {
+    format!("{}:{}", account.provider, account.id)
+}
+
+#[cfg(target_os = "macos")]
+fn security_output_trimmed(args: &[&str]) -> Option<String> {
+    let output = Command::new("security")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    if provider == "claude" {
-        seed_claude_json(&profile);
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_store_api_key(account: &Account, key: &str) -> bool {
+    security_status(&[
+        "add-generic-password",
+        "-U",
+        "-s",
+        API_KEY_SERVICE,
+        "-a",
+        &api_key_keychain_account(account),
+        "-w",
+        key,
+    ])
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_read_api_key(account: &Account) -> Option<String> {
+    security_output_trimmed(&[
+        "find-generic-password",
+        "-s",
+        API_KEY_SERVICE,
+        "-a",
+        &api_key_keychain_account(account),
+        "-w",
+    ])
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_delete_api_key(account: &Account) {
+    let _ = security_status(&[
+        "delete-generic-password",
+        "-s",
+        API_KEY_SERVICE,
+        "-a",
+        &api_key_keychain_account(account),
+    ]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_store_api_key(_account: &Account, _key: &str) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_read_api_key(_account: &Account) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_delete_api_key(_account: &Account) {}
+
+fn write_secret_file(path: &Path, secret: &str) -> Result<(), String> {
+    std::fs::write(path, secret).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    let account = Account {
-        id,
-        provider,
-        label: label.to_string(),
-        profile_dir: Some(profile.to_string_lossy().into_owned()),
-        identity: None,
-        created_at: now_millis(),
+    Ok(())
+}
+
+/// Keychain first; a 0600 file in the profile when the Keychain is not
+/// available or refuses the write.
+fn store_api_key(account: &Account, key: &str) -> Result<(), String> {
+    if keychain_store_api_key(account, key) {
+        return Ok(());
+    }
+    let path = api_key_file(account).ok_or("accounts: API key account has no profile")?;
+    write_secret_file(&path, key)
+}
+
+fn read_api_key(account: &Account) -> Option<String> {
+    if let Some(key) = keychain_read_api_key(account) {
+        return Some(key);
+    }
+    let raw = std::fs::read_to_string(api_key_file(account)?).ok()?;
+    let key = raw.trim().to_string();
+    (!key.is_empty()).then_some(key)
+}
+
+fn delete_api_key(account: &Account) {
+    keychain_delete_api_key(account);
+    if let Some(path) = api_key_file(account) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Claude Code asks before using a new API key and remembers the answer by
+/// the key's last 20 characters in `.claude.json`. Pre-approving keeps a
+/// headless session from stalling on that prompt.
+fn approve_claude_api_key(profile: &Path, key: &str) {
+    let path = profile.join(".claude.json");
+    let mut value: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let Some(object) = value.as_object_mut() else {
+        return;
     };
+    let responses = object
+        .entry("customApiKeyResponses")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Some(responses) = responses.as_object_mut() else {
+        return;
+    };
+    let approved = responses
+        .entry("approved")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(approved) = approved.as_array_mut() else {
+        return;
+    };
+    let entry = Value::String(tail(key, CLAUDE_KEY_APPROVAL_LEN));
+    if !approved.contains(&entry) {
+        approved.push(entry);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Adds the provider's API key variable for an API-key account. Subscription
+/// accounts and unknown ids leave the command untouched.
+pub fn apply_account_secret(
+    app: &AppHandle,
+    store: &AccountStore,
+    account: Option<&AccountRef>,
+    cmd: &mut Command,
+) -> Result<(), String> {
+    let Some(reference) = account else {
+        return Ok(());
+    };
+    let stored = store.with(app, |accounts| {
+        Ok(accounts
+            .iter()
+            .find(|a| a.id == reference.id && a.provider == reference.provider)
+            .cloned())
+    })?;
+    let Some(stored) = stored else { return Ok(()) };
+    if stored.kind != AccountKind::ApiKey {
+        return Ok(());
+    }
+    if !stored.enabled {
+        return Err(format!("accounts: {} is disabled", stored.label));
+    }
+    let Some(var) = api_key_env(&stored.provider) else {
+        return Ok(());
+    };
+    let key = read_api_key(&stored)
+        .ok_or_else(|| format!("accounts: no API key stored for {}", stored.label))?;
+    cmd.env(var, key);
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn accounts_create_api_key(
+    app: AppHandle,
+    store: State<'_, AccountStore>,
+    provider: String,
+    label: String,
+    key: String,
+) -> Result<Account, String> {
+    let label = validate_provider_and_label(&provider, &label)?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("accounts: API key is required".into());
+    }
+    let mut account = new_profile_account(&app, &provider, label)?;
+    account.kind = AccountKind::ApiKey;
+    account.enabled = false;
+    account.hint = Some(tail(key, API_KEY_HINT_LEN));
+    store_api_key(&account, key)?;
+    if provider == "claude" {
+        if let Some(profile) = &account.profile_dir {
+            approve_claude_api_key(Path::new(profile), key);
+        }
+    }
     store.with(&app, |accounts| {
         accounts.push(account.clone());
         Ok(())
     })?;
-    Ok(account)
+    Ok(with_identity(account))
+}
+
+#[tauri::command(async)]
+pub fn accounts_set_enabled(
+    app: AppHandle,
+    store: State<'_, AccountStore>,
+    id: String,
+    provider: String,
+    enabled: bool,
+) -> Result<(), String> {
+    store.with(&app, |accounts| {
+        let Some(account) = accounts
+            .iter_mut()
+            .find(|a| a.id == id && a.provider == provider)
+        else {
+            return Err("accounts: not found".into());
+        };
+        account.enabled = enabled;
+        Ok(())
+    })
 }
 
 #[tauri::command(async)]
@@ -505,7 +803,9 @@ pub fn accounts_remove(
         };
         Ok(accounts.remove(index))
     })?;
-    if removed.provider == "claude" {
+    if removed.kind == AccountKind::ApiKey {
+        delete_api_key(&removed);
+    } else if removed.provider == "claude" {
         claude_keychain_delete(&removed);
     }
     if let Some(dir) = &removed.profile_dir {
@@ -646,6 +946,9 @@ mod tests {
             profile_dir: Some(root.join("c").to_string_lossy().into_owned()),
             identity: None,
             created_at: 0,
+            kind: AccountKind::Subscription,
+            enabled: true,
+            hint: None,
         };
         let codex = Account {
             id: "x".into(),
@@ -654,6 +957,9 @@ mod tests {
             profile_dir: Some(root.join("x").to_string_lossy().into_owned()),
             identity: None,
             created_at: 0,
+            kind: AccountKind::Subscription,
+            enabled: true,
+            hint: None,
         };
         std::fs::create_dir_all(root.join("c")).unwrap();
         std::fs::create_dir_all(root.join("x")).unwrap();
@@ -673,7 +979,88 @@ mod tests {
             profile_dir: (id != DEFAULT_ACCOUNT_ID).then(|| format!("/p/{id}")),
             identity: None,
             created_at: 0,
+            kind: AccountKind::Subscription,
+            enabled: true,
+            hint: None,
         }
+    }
+
+    #[test]
+    fn account_serde_defaults_kind_and_enabled() {
+        let raw = r#"{"id":"a","provider":"claude","label":"A","profileDir":null,"createdAt":1}"#;
+        let account: Account = serde_json::from_str(raw).unwrap();
+        assert_eq!(account.kind, AccountKind::Subscription);
+        assert!(account.enabled);
+        let json = serde_json::to_string(&Account {
+            kind: AccountKind::ApiKey,
+            enabled: false,
+            hint: Some("abcd".into()),
+            ..stored("k", "codex", "Key")
+        })
+        .unwrap();
+        assert!(json.contains(r#""kind":"apiKey""#));
+        assert!(json.contains(r#""enabled":false"#));
+        assert!(json.contains(r#""hint":"abcd""#));
+    }
+
+    #[test]
+    fn tail_and_identity_for_api_keys() {
+        assert_eq!(tail("sk-ant-1234567890", 4), "7890");
+        assert_eq!(tail("ab", 4), "ab");
+        let account = Account {
+            kind: AccountKind::ApiKey,
+            hint: Some("7890".into()),
+            ..stored("k", "claude", "Key")
+        };
+        assert_eq!(read_identity(&account).as_deref(), Some("API key ····7890"));
+    }
+
+    #[test]
+    fn api_key_file_roundtrip_and_delete() {
+        let root = temp_root("apikey");
+        let account = Account {
+            kind: AccountKind::ApiKey,
+            profile_dir: Some(root.to_string_lossy().into_owned()),
+            ..stored("k", "codex", "Key")
+        };
+        let path = api_key_file(&account).unwrap();
+        write_secret_file(&path, "sk-test-key").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sk-test-key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approve_claude_api_key_records_last_20_chars() {
+        let root = temp_root("approve");
+        std::fs::write(root.join(".claude.json"), r#"{"mcpServers":{}}"#).unwrap();
+        let key = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        approve_claude_api_key(&root, key);
+        approve_claude_api_key(&root, key);
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".claude.json")).unwrap())
+                .unwrap();
+        let approved = value["customApiKeyResponses"]["approved"]
+            .as_array()
+            .unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0], Value::String(tail(key, 20)));
+        assert!(value["mcpServers"].is_object());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn api_key_env_maps_providers() {
+        assert_eq!(api_key_env("claude"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(api_key_env("codex"), Some("OPENAI_API_KEY"));
+        assert_eq!(api_key_env("cursor"), None);
     }
 
     #[test]
@@ -738,6 +1125,9 @@ mod tests {
             profile_dir: Some("/tmp/x".into()),
             identity: None,
             created_at: 1,
+            kind: AccountKind::Subscription,
+            enabled: true,
+            hint: None,
         }];
         save_accounts_file(&file, &accounts).unwrap();
         let loaded = load_accounts_file(&file);

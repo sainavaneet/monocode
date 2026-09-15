@@ -1,4 +1,9 @@
-import type { Account, AccountProvider } from "../accounts";
+import {
+  isAccountEnabled,
+  isApiKeyAccount,
+  type Account,
+  type AccountProvider,
+} from "../accounts";
 import type { ProviderRateLimits } from "../rateLimits";
 
 const EXHAUSTED_PERCENT = 100;
@@ -17,7 +22,9 @@ export function tightestUsedPercent(
 /**
  * Picks the account a rate-limited session should move to: same provider,
  * not the one that just failed, most quota left. Accounts with no usage
- * data count as available. Null when nothing qualifies.
+ * data count as available. API-key accounts and disabled accounts are never
+ * chosen: spending API credit is the user's explicit call. Null when nothing
+ * qualifies.
  */
 export function selectFailover(input: {
   provider: AccountProvider;
@@ -28,7 +35,10 @@ export function selectFailover(input: {
   const candidates = input.accounts
     .filter(
       (account) =>
-        account.provider === input.provider && account.id !== input.exclude,
+        account.provider === input.provider &&
+        account.id !== input.exclude &&
+        isAccountEnabled(account) &&
+        !isApiKeyAccount(account),
     )
     .map((account) => ({
       account,

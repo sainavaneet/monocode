@@ -28,10 +28,11 @@ import {
 import { HARNESS_LABEL, HARNESS_TITLE, type HarnessId } from "../lib/session";
 import {
   accountFor,
-  accountsFor,
   DEFAULT_ACCOUNT_ID,
   getAccountsSnapshot,
+  isApiKeyAccount,
   subscribeAccounts,
+  usableAccountsFor,
   type Account,
 } from "../lib/accounts";
 import {
@@ -108,7 +109,7 @@ export function UsageFooter({
     if (fetchClaude) {
       setClaude((current) => fetchingRateLimits("claude", current));
       jobs.push(
-        fetchClaudeRateLimits(claudeProfileDir).then((value) => {
+        fetchClaudeRateLimits(claudeProfileDir, claudeAccount).then((value) => {
           setClaude(value);
         }),
       );
@@ -129,7 +130,7 @@ export function UsageFooter({
       });
     inflight.current = run;
     return run;
-  }, [claudeProfileDir, codexAccount, wantClaude, wantCodex]);
+  }, [claudeAccount, claudeProfileDir, codexAccount, wantClaude, wantCodex]);
 
   const accountKeys = `${claudeKey}|${codexKey}`;
   useEffect(() => {
@@ -333,8 +334,9 @@ function ProviderChip({
   account?: Account;
 }) {
   // Name the login only once there is more than one to tell apart.
-  const hasChoice = accountsFor(limits.provider).length > 1;
+  const hasChoice = usableAccountsFor(limits.provider).length > 1;
   const accountLabel = hasChoice ? (account?.label ?? "Default") : null;
+  const isApi = isApiKeyAccount(account);
   const accountTitle = account
     ? account.identity
       ? `${account.label} (${account.identity})`
@@ -378,7 +380,14 @@ function ProviderChip({
       {accountLabel ? (
         <span className="max-w-24 truncate text-content/60">{accountLabel}</span>
       ) : null}
-      {loading ? (
+      {isApi ? (
+        <span
+          className="rounded-sm bg-amber-500/20 px-1 text-[10px] font-semibold uppercase tracking-wide text-amber-400"
+          title="This session bills your API key directly"
+        >
+          API
+        </span>
+      ) : loading ? (
         <span className="animate-pulse text-content/35">···</span>
       ) : disconnected ? (
         <span className="text-content/35">not connected</span>

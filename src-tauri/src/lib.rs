@@ -230,6 +230,8 @@ pub fn run() {
             accounts::accounts_rename,
             accounts::accounts_remove,
             accounts::accounts_login_ready,
+            accounts::accounts_create_api_key,
+            accounts::accounts_set_enabled,
             control::control_enable,
             control::control_disable,
             control::control_reply,

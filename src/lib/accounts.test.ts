@@ -16,6 +16,8 @@ import {
   saveAutoSwitchAccount,
   saveDefaultAccountId,
   stripAccountSetting,
+  usableAccountsFor,
+  accountRef,
   withAccountSetting,
   type Account,
 } from "./accounts";
@@ -179,6 +181,61 @@ describe("renameAccount", () => {
       id: "default",
       provider: "claude",
       label: "Personal",
+    });
+  });
+});
+
+describe("API-key accounts", () => {
+  const apiKey: Account = {
+    id: "k1",
+    provider: "claude",
+    label: "Key",
+    profileDir: "/p/k1",
+    createdAt: 2,
+    kind: "apiKey",
+    enabled: false,
+    hint: "7890",
+  };
+
+  it("hides disabled accounts from usable list and falls back for them", async () => {
+    mocks.invoke.mockResolvedValueOnce([dflt, work, apiKey]);
+    await refreshAccounts();
+    expect(usableAccountsFor("claude").map((a) => a.id)).toEqual([
+      "default",
+      "w1",
+    ]);
+    expect(accountIdFor("claude", { [ACCOUNT_SETTING_ID]: "k1" })).toBe(
+      "default",
+    );
+  });
+
+  it("uses an enabled API-key account when chosen", async () => {
+    mocks.invoke.mockResolvedValueOnce([dflt, { ...apiKey, enabled: true }]);
+    await refreshAccounts();
+    expect(accountIdFor("claude", { [ACCOUNT_SETTING_ID]: "k1" })).toBe("k1");
+    expect(accountRef(accountFor("claude", { account: "k1" }))).toEqual({
+      provider: "claude",
+      id: "k1",
+    });
+    expect(accountRef(dflt)).toBeUndefined();
+  });
+
+  it("creates and toggles through the backend", async () => {
+    mocks.invoke.mockResolvedValue([]);
+    const { createApiKeyAccount, setAccountEnabled } = await import(
+      "./accounts"
+    );
+    await createApiKeyAccount("codex", "Key", "sk-x");
+    expect(mocks.invoke).toHaveBeenCalledWith("accounts_create_api_key", {
+      provider: "codex",
+      label: "Key",
+      key: "sk-x",
+    });
+    await setAccountEnabled(apiKey, true);
+    expect(mocks.invoke).toHaveBeenCalledWith("accounts_set_enabled", {
+      id: "k1",
+      provider: "claude",
+      enabled: true,
     });
   });
 });

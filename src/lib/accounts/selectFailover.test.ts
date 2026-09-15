@@ -65,6 +65,18 @@ describe("selectFailover", () => {
     expect(picked?.id).toBe("a");
   });
 
+  it("never falls over to an API-key or disabled account", () => {
+    const key: Account = { ...acct("k"), kind: "apiKey", enabled: true };
+    const off: Account = { ...acct("o"), enabled: false };
+    const picked = selectFailover({
+      provider: "claude",
+      accounts: [acct("default"), key, off],
+      usage: { default: usage(100) },
+      exclude: "default",
+    });
+    expect(picked).toBeNull();
+  });
+
   it("never returns the excluded account or another provider's account", () => {
     const codex: Account = { ...acct("x"), provider: "codex" };
     const picked = selectFailover({

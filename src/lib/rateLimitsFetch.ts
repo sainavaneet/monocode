@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { accountEnv, type Account } from "./accounts";
+import { accountEnv, isApiKeyAccount, type Account } from "./accounts";
 import { homeDir } from "./fs";
 import {
   errorRateLimits,
@@ -29,9 +29,15 @@ type ClaudeUsageFetch = {
   error?: string | null;
 };
 
+const API_KEY_USAGE_NOTE = "API key: billed per use, no quota window";
+
 export async function fetchClaudeRateLimits(
   profileDir?: string | null,
+  account?: Account,
 ): Promise<ProviderRateLimits> {
+  if (isApiKeyAccount(account)) {
+    return unavailableRateLimits("claude", API_KEY_USAGE_NOTE);
+  }
   try {
     const result = await invoke<ClaudeUsageFetch>("fetch_claude_usage", {
       profileDir: profileDir ?? null,
@@ -65,6 +71,9 @@ export async function fetchClaudeRateLimits(
 export async function fetchCodexRateLimits(
   account?: Account,
 ): Promise<ProviderRateLimits> {
+  if (isApiKeyAccount(account)) {
+    return unavailableRateLimits("codex", API_KEY_USAGE_NOTE);
+  }
   const childId = account?.profileDir
     ? `${USAGE_CHILD_ID}-${account.id}`
     : USAGE_CHILD_ID;

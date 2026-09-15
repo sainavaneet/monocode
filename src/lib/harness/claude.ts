@@ -3,6 +3,7 @@ import {
   accountEnv,
   accountFor,
   accountIdFor,
+  accountRef,
   ensureAccountsLoaded,
 } from "../accounts";
 import type { RuntimeMode } from "../session";
@@ -433,6 +434,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     buildClaudeSpawnArgs(launch),
     input.cwd,
     accountEnv(accountFor("claude", input.modelSettings)),
+    accountRef(accountFor("claude", input.modelSettings)),
   );
 
   liveByThread.set(input.sessionId, live);

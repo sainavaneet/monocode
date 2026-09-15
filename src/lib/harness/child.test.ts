@@ -162,5 +162,16 @@ describe("spawnChild env", () => {
       args: [],
       cwd: "/tmp",
     });
+    await child.spawnChild("s3", "/bin/codex", [], "/tmp", undefined, {
+      provider: "codex",
+      id: "k1",
+    });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("harness_spawn", {
+      sessionId: "s3",
+      command: "/bin/codex",
+      args: [],
+      cwd: "/tmp",
+      account: { provider: "codex", id: "k1" },
+    });
   });
 });

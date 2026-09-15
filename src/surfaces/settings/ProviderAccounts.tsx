@@ -9,13 +9,17 @@ import {
 import {
   accountsFor,
   createAccount,
+  createApiKeyAccount,
   DEFAULT_ACCOUNT_ID,
   getAccountsSnapshot,
+  isAccountEnabled,
+  isApiKeyAccount,
   loadDefaultAccountId,
   refreshAccounts,
   removeAccount,
   renameAccount,
   saveDefaultAccountId,
+  setAccountEnabled,
   subscribeAccounts,
   type Account,
   type AccountProvider,
@@ -30,7 +34,7 @@ import {
   type ProviderRateLimits,
   type RateLimitWindow,
 } from "../../lib/rateLimits";
-import { SecondaryButton } from "./controls";
+import { SecondaryButton, Toggle } from "./controls";
 import { AccountLoginTerminal } from "./AccountLoginTerminal";
 
 function fetchUsage(
@@ -56,10 +60,10 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
   const accountKey = accounts.map((account) => account.id).join(",");
   const [usage, setUsage] = useState<Record<string, ProviderRateLimits>>({});
   const [pendingLogin, setPendingLogin] = useState<Account | null>(null);
-  // Which inline name field is open: the "new account" row or a rename.
-  const [naming, setNaming] = useState<"new" | { renameId: string } | null>(
-    null,
-  );
+  // Which inline form is open: a new login, a new API key, or a rename.
+  const [naming, setNaming] = useState<
+    "new" | "newApiKey" | { renameId: string } | null
+  >(null);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const defaultId = loadDefaultAccountId(provider);
@@ -70,6 +74,8 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
 
   const refreshUsage = useCallback(() => {
     for (const account of accountsFor(provider)) {
+      // An API key has no quota window; nothing to fetch.
+      if (isApiKeyAccount(account)) continue;
       void fetchUsage(provider, account).then((limits) => {
         setUsage((prev) => ({ ...prev, [account.id]: limits }));
         setNow(Date.now());
@@ -87,6 +93,25 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
     setError(null);
     try {
       setPendingLogin(await createAccount(provider, label));
+    } catch (failure: unknown) {
+      setError(errorText(failure));
+    }
+  };
+
+  const onCreateApiKey = async (label: string, key: string) => {
+    setNaming(null);
+    setError(null);
+    try {
+      await createApiKeyAccount(provider, label, key);
+    } catch (failure: unknown) {
+      setError(errorText(failure));
+    }
+  };
+
+  const onToggleEnabled = async (account: Account, enabled: boolean) => {
+    setError(null);
+    try {
+      await setAccountEnabled(account, enabled);
     } catch (failure: unknown) {
       setError(errorText(failure));
     }
@@ -147,6 +172,7 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
             onRename={() => setNaming({ renameId: account.id })}
             onRemove={() => void onRemove(account)}
             onSignIn={() => setPendingLogin(account)}
+            onToggleEnabled={(enabled) => void onToggleEnabled(account, enabled)}
           />
         ),
       )}
@@ -159,17 +185,32 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
           onCancel={() => setNaming(null)}
         />
       ) : null}
+      {naming === "newApiKey" ? (
+        <ApiKeyField
+          provider={provider}
+          onSubmit={(label, key) => void onCreateApiKey(label, key)}
+          onCancel={() => setNaming(null)}
+        />
+      ) : null}
       <div className="flex items-center justify-between gap-3 px-3 py-2">
         <span className="text-[12px] text-content/45">
           Each account signs in once and keeps its own login. Config and
-          history are shared.
+          history are shared. API keys stay off until you enable them.
         </span>
-        <SecondaryButton
-          onClick={() => setNaming("new")}
-          disabled={naming === "new" || pendingLogin != null}
-        >
-          Add account
-        </SecondaryButton>
+        <div className="flex shrink-0 items-center gap-2">
+          <SecondaryButton
+            onClick={() => setNaming("newApiKey")}
+            disabled={naming != null || pendingLogin != null}
+          >
+            Add API key
+          </SecondaryButton>
+          <SecondaryButton
+            onClick={() => setNaming("new")}
+            disabled={naming != null || pendingLogin != null}
+          >
+            Add account
+          </SecondaryButton>
+        </div>
       </div>
       {error ? (
         <p className="px-3 pb-2 text-[12px] text-red-400">{error}</p>
@@ -248,6 +289,76 @@ function NameField({
   );
 }
 
+const API_KEY_PLACEHOLDER: Record<AccountProvider, string> = {
+  claude: "sk-ant-…",
+  codex: "sk-…",
+};
+
+interface ApiKeyFieldProps {
+  provider: AccountProvider;
+  onSubmit: (label: string, key: string) => void;
+  onCancel: () => void;
+}
+
+/** Name plus masked key. The key goes straight to the backend and is never
+ * shown again; only its last four characters come back as a hint. */
+function ApiKeyField({ provider, onSubmit, onCancel }: ApiKeyFieldProps) {
+  const [label, setLabel] = useState("");
+  const [key, setKey] = useState("");
+  const labelInput = useRef<HTMLInputElement>(null);
+  const canSubmit = label.trim().length > 0 && key.trim().length > 0;
+
+  useEffect(() => {
+    labelInput.current?.focus();
+  }, []);
+
+  const submit = () => {
+    if (canSubmit) onSubmit(label.trim(), key.trim());
+  };
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submit();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      onCancel();
+    }
+  };
+
+  const inputClass =
+    "min-w-0 flex-1 rounded-md border border-content/10 bg-content/5 px-2 py-1 text-[13px] text-content outline-none placeholder:text-content/35 focus:border-content/30";
+
+  return (
+    <div className="flex items-center gap-2 border-b border-content/5 px-3 py-2 last:border-b-0">
+      <input
+        ref={labelInput}
+        aria-label="API key account name"
+        value={label}
+        placeholder="Name, for example Pay as you go"
+        onChange={(event) => setLabel(event.target.value)}
+        onKeyDown={onKeyDown}
+        className={inputClass}
+      />
+      <input
+        aria-label={`${provider === "claude" ? "Anthropic" : "OpenAI"} API key`}
+        type="password"
+        autoComplete="off"
+        spellCheck={false}
+        value={key}
+        placeholder={API_KEY_PLACEHOLDER[provider]}
+        onChange={(event) => setKey(event.target.value)}
+        onKeyDown={onKeyDown}
+        className={inputClass}
+      />
+      <SecondaryButton onClick={submit} disabled={!canSubmit}>
+        Save key
+      </SecondaryButton>
+      <SecondaryButton onClick={onCancel}>Cancel</SecondaryButton>
+    </div>
+  );
+}
+
 interface AccountRowProps {
   account: Account;
   isDefault: boolean;
@@ -257,6 +368,7 @@ interface AccountRowProps {
   onRename: () => void;
   onRemove: () => void;
   onSignIn: () => void;
+  onToggleEnabled: (enabled: boolean) => void;
 }
 
 function AccountRow({
@@ -268,8 +380,11 @@ function AccountRow({
   onRename,
   onRemove,
   onSignIn,
+  onToggleEnabled,
 }: AccountRowProps) {
-  const isSignedOut = limits?.status === "unavailable";
+  const isApi = isApiKeyAccount(account);
+  const isEnabled = isAccountEnabled(account);
+  const isSignedOut = !isApi && limits?.status === "unavailable";
   const isCustom = account.id !== DEFAULT_ACCOUNT_ID;
   return (
     <div className="flex items-center gap-3 border-b border-content/5 px-3 py-2 last:border-b-0">
@@ -281,16 +396,33 @@ function AccountRow({
               Default
             </span>
           ) : null}
+          {isApi ? (
+            <span className="rounded-sm bg-amber-500/20 px-1 text-[10px] font-semibold uppercase tracking-wide text-amber-400">
+              API
+            </span>
+          ) : null}
         </div>
         <div className="truncate text-[12px] text-content/45">
           {account.identity ?? (isSignedOut ? "Not signed in" : "Signed in")}
+          {isApi && !isEnabled ? " · off" : ""}
         </div>
       </div>
-      <UsageSummary limits={limits} now={now} />
+      {isApi ? (
+        <div className="flex items-center gap-2">
+          <span className="text-[12px] text-content/50">Enabled</span>
+          <Toggle
+            label={`Enable ${account.label}`}
+            on={isEnabled}
+            onChange={onToggleEnabled}
+          />
+        </div>
+      ) : (
+        <UsageSummary limits={limits} now={now} />
+      )}
       {isSignedOut && isCustom ? (
         <SecondaryButton onClick={onSignIn}>Sign in</SecondaryButton>
       ) : null}
-      <SecondaryButton onClick={onDefault} disabled={isDefault}>
+      <SecondaryButton onClick={onDefault} disabled={isDefault || (isApi && !isEnabled)}>
         {isDefault ? "Default" : "Use by default"}
       </SecondaryButton>
       <SecondaryButton onClick={onRename}>Rename</SecondaryButton>

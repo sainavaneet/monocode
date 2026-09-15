@@ -3,6 +3,8 @@ import type { HarnessId } from "./session";
 
 export type AccountProvider = "claude" | "codex";
 
+export type AccountKind = "subscription" | "apiKey";
+
 export type Account = {
   id: string;
   provider: AccountProvider;
@@ -10,7 +12,16 @@ export type Account = {
   profileDir: string | null;
   identity?: string;
   createdAt: number;
+  /** Absent in older rows; treated as a subscription login. */
+  kind?: AccountKind;
+  /** Absent in older rows; treated as enabled. */
+  enabled?: boolean;
+  /** Last four characters of an API key. */
+  hint?: string;
 };
+
+/** What the backend needs to look an account up; never carries a secret. */
+export type AccountRef = { provider: AccountProvider; id: string };
 
 /** Key inside a session's `modelSettings` that names its account. */
 export const ACCOUNT_SETTING_ID = "account";
@@ -30,6 +41,19 @@ export function isAccountProvider(
   harness: HarnessId,
 ): harness is AccountProvider {
   return harness === "claude" || harness === "codex";
+}
+
+export function isApiKeyAccount(account: Account | undefined): boolean {
+  return account?.kind === "apiKey";
+}
+
+export function isAccountEnabled(account: Account | undefined): boolean {
+  return account?.enabled !== false;
+}
+
+export function accountRef(account: Account | undefined): AccountRef | undefined {
+  if (!account || account.id === DEFAULT_ACCOUNT_ID) return undefined;
+  return { provider: account.provider, id: account.id };
 }
 
 export function accountEnv(
@@ -91,6 +115,16 @@ export function findAccount(
   return accounts.find((a) => a.provider === provider && a.id === id);
 }
 
+/** Accounts a session may run on: everything that is not switched off. */
+export function usableAccountsFor(provider: AccountProvider): Account[] {
+  return accountsFor(provider).filter(isAccountEnabled);
+}
+
+function isUsable(provider: AccountProvider, id: string): boolean {
+  if (id === DEFAULT_ACCOUNT_ID) return true;
+  return isAccountEnabled(findAccount(provider, id));
+}
+
 function isAccount(value: unknown): value is Account {
   if (!value || typeof value !== "object") return false;
   const rec = value as Record<string, unknown>;
@@ -134,6 +168,32 @@ export async function createAccount(
   });
   await refreshAccounts();
   return account;
+}
+
+export async function createApiKeyAccount(
+  provider: AccountProvider,
+  label: string,
+  key: string,
+): Promise<Account> {
+  const account = await invoke<Account>("accounts_create_api_key", {
+    provider,
+    label,
+    key,
+  });
+  await refreshAccounts();
+  return account;
+}
+
+export async function setAccountEnabled(
+  account: Account,
+  enabled: boolean,
+): Promise<void> {
+  await invoke("accounts_set_enabled", {
+    id: account.id,
+    provider: account.provider,
+    enabled,
+  });
+  await refreshAccounts();
 }
 
 export async function renameAccount(
@@ -213,14 +273,15 @@ export function accountIdFor(
   settings?: Record<string, string>,
 ): string {
   const chosen = settings?.[ACCOUNT_SETTING_ID];
-  if (
-    chosen &&
-    (chosen === DEFAULT_ACCOUNT_ID || findAccount(provider, chosen))
-  ) {
+  if (chosen && findAccount(provider, chosen) && isUsable(provider, chosen)) {
     return chosen;
   }
+  if (chosen === DEFAULT_ACCOUNT_ID) return chosen;
   const preferred = loadDefaultAccountId(provider);
-  if (preferred === DEFAULT_ACCOUNT_ID || findAccount(provider, preferred)) {
+  if (
+    preferred === DEFAULT_ACCOUNT_ID ||
+    (findAccount(provider, preferred) && isUsable(provider, preferred))
+  ) {
     return preferred;
   }
   return DEFAULT_ACCOUNT_ID;

@@ -3,6 +3,7 @@ import {
   accountEnv,
   accountFor,
   accountIdFor,
+  accountRef,
   ensureAccountsLoaded,
 } from "../accounts";
 import type { RuntimeMode } from "../session";
@@ -404,6 +405,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     ["app-server"],
     input.cwd,
     accountEnv(accountFor("codex", input.modelSettings)),
+    accountRef(accountFor("codex", input.modelSettings)),
   );
 
   try {
