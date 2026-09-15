@@ -33,6 +33,7 @@ pub struct ClaudeUsageFetch {
 enum ClaudeCredStore {
     #[cfg(target_os = "macos")]
     Keychain {
+        service: String,
         account: String,
     },
     File {
@@ -65,14 +66,18 @@ fn usage_result(
 /// Fetch Claude Code 5-hour / weekly usage via the local OAuth token.
 /// The token never leaves the host process.
 #[tauri::command]
-pub async fn fetch_claude_usage() -> Result<ClaudeUsageFetch, String> {
-    tauri::async_runtime::spawn_blocking(fetch_claude_usage_sync)
+pub async fn fetch_claude_usage(
+    profile_dir: Option<String>,
+) -> Result<ClaudeUsageFetch, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_claude_usage_sync(profile_dir.as_deref().map(Path::new))
+    })
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn fetch_claude_usage_sync() -> Result<ClaudeUsageFetch, String> {
-    let Some(mut creds) = read_claude_credentials() else {
+fn fetch_claude_usage_sync(profile_dir: Option<&Path>) -> Result<ClaudeUsageFetch, String> {
+    let Some(mut creds) = read_claude_credentials(profile_dir) else {
         return Ok(usage_result(
             "unavailable",
             None,
@@ -183,7 +188,9 @@ fn persist_claude_credentials(creds: &ClaudeCredentials) -> bool {
     };
     match &creds.store {
         #[cfg(target_os = "macos")]
-        ClaudeCredStore::Keychain { account } => write_macos_keychain_blob(account, &raw),
+        ClaudeCredStore::Keychain { service, account } => {
+            write_macos_keychain_blob(service, account, &raw)
+        }
         ClaudeCredStore::File { path } => write_credentials_file(path, &raw),
     }
 }
@@ -200,23 +207,26 @@ fn write_credentials_file(path: &Path, raw: &str) -> bool {
     true
 }
 
-fn read_claude_credentials() -> Option<ClaudeCredentials> {
+fn read_claude_credentials(profile_dir: Option<&Path>) -> Option<ClaudeCredentials> {
     #[cfg(target_os = "macos")]
     {
-        if let Some(creds) = read_macos_keychain_credentials() {
+        if let Some(creds) = read_macos_keychain_credentials(profile_dir) {
             return Some(creds);
         }
     }
-    read_credentials_file()
+    read_credentials_file(profile_dir)
 }
 
-fn read_credentials_file() -> Option<ClaudeCredentials> {
-    let path = claude_credentials_path()?;
+fn read_credentials_file(profile_dir: Option<&Path>) -> Option<ClaudeCredentials> {
+    let path = claude_credentials_path(profile_dir)?;
     let raw = std::fs::read_to_string(&path).ok()?;
     credentials_from_blob(&raw, ClaudeCredStore::File { path })
 }
 
-fn claude_credentials_path() -> Option<PathBuf> {
+fn claude_credentials_path(profile_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = profile_dir {
+        return Some(dir.join(".credentials.json"));
+    }
     let home = dirs_home().or_else(|| {
         std::env::var_os("USERPROFILE").map(|value| value.to_string_lossy().into_owned())
     })?;
@@ -353,21 +363,25 @@ fn now_ms() -> i64 {
 }
 
 #[cfg(target_os = "macos")]
-fn read_macos_keychain_credentials() -> Option<ClaudeCredentials> {
+fn read_macos_keychain_credentials(profile_dir: Option<&Path>) -> Option<ClaudeCredentials> {
+    let service = match profile_dir {
+        Some(dir) => crate::accounts::claude_keychain_service(dir),
+        None => LEGACY_KEYCHAIN_SERVICE.to_string(),
+    };
     let user = keychain_user();
     let candidates = [
         (user.clone(), {
-            let mut args = keychain_find_args();
+            let mut args = keychain_find_args(&service);
             args.push("-w".into());
             args
         }),
         (user.clone(), {
-            let mut args = keychain_find_args();
+            let mut args = keychain_find_args(&service);
             args.extend(["-a".into(), user.clone(), "-w".into()]);
             args
         }),
         (KEYCHAIN_FALLBACK_USER.into(), {
-            let mut args = keychain_find_args();
+            let mut args = keychain_find_args(&service);
             args.extend(["-a".into(), KEYCHAIN_FALLBACK_USER.into(), "-w".into()]);
             args
         }),
@@ -375,7 +389,13 @@ fn read_macos_keychain_credentials() -> Option<ClaudeCredentials> {
     for (account, args) in candidates {
         if let Some(secret) = security_output(&args) {
             if let Some(creds) =
-                credentials_from_blob(&secret, ClaudeCredStore::Keychain { account })
+                credentials_from_blob(
+                    &secret,
+                    ClaudeCredStore::Keychain {
+                        service: service.clone(),
+                        account,
+                    },
+                )
             {
                 return Some(creds);
             }
@@ -385,12 +405,12 @@ fn read_macos_keychain_credentials() -> Option<ClaudeCredentials> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_macos_keychain_blob(account: &str, raw: &str) -> bool {
+fn write_macos_keychain_blob(service: &str, account: &str, raw: &str) -> bool {
     let args = vec![
         "add-generic-password".into(),
         "-U".into(),
         "-s".into(),
-        LEGACY_KEYCHAIN_SERVICE.into(),
+        service.into(),
         "-a".into(),
         account.into(),
         "-w".into(),
@@ -400,11 +420,11 @@ fn write_macos_keychain_blob(account: &str, raw: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_find_args() -> Vec<String> {
+fn keychain_find_args(service: &str) -> Vec<String> {
     vec![
         "find-generic-password".into(),
         "-s".into(),
-        LEGACY_KEYCHAIN_SERVICE.into(),
+        service.into(),
     ]
 }
 
@@ -484,6 +504,12 @@ fn run_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_path_uses_profile_dir_when_given() {
+        let path = claude_credentials_path(Some(Path::new("/tmp/profile"))).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/profile/.credentials.json"));
+    }
 
     #[test]
     fn extract_access_token_from_claude_credentials() {
