@@ -18,9 +18,15 @@ import {
   useState,
   useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
-  type ReactNode,
 } from "react";
 import { HarnessIcon } from "../chrome/HarnessIcon";
+import { Row, SecondaryButton, Toggle } from "./settings/controls";
+import { ProviderAccounts } from "./settings/ProviderAccounts";
+import {
+  isAccountProvider,
+  loadAutoSwitchAccount,
+  saveAutoSwitchAccount,
+} from "../lib/accounts";
 import {
   ColorPickerPopover,
   ColorSwatchRow,
@@ -200,7 +206,7 @@ import {
   type FollowUpBehavior,
   type SettingsSectionId,
 } from "../lib/settings";
-import { loadSoundsEnabled, playCue, saveSoundsEnabled } from "../lib/sounds";
+import { loadSoundsEnabled, saveSoundsEnabled } from "../lib/sounds";
 import {
   cachedNotificationPermission,
   loadNotificationsEnabled,
@@ -383,6 +389,9 @@ function GeneralPage({
     loadGridArcadeEnabled,
   );
   const [notesEnabled, setNotesEnabled] = useState(loadNotesEnabled);
+  const [autoSwitchAccount, setAutoSwitchAccount] = useState(
+    loadAutoSwitchAccount,
+  );
   const [liveAgentsEnabled, setLiveAgentsEnabled] = useState(
     loadLiveAgentsEnabled,
   );
@@ -454,6 +463,11 @@ function GeneralPage({
   const onNotesEnabled = (next: boolean) => {
     saveNotesEnabled(next);
     setNotesEnabled(next);
+  };
+
+  const onAutoSwitchAccount = (next: boolean) => {
+    saveAutoSwitchAccount(next);
+    setAutoSwitchAccount(next);
   };
 
   const onLiveAgentsEnabled = (next: boolean) => {
@@ -567,6 +581,16 @@ function GeneralPage({
         description="A global markdown notebook on the project rail. Save a finished turn from the transcript, then mention it later with @note or add it to chat. Turn this off to hide Notes from the UI."
       >
         <Toggle label="Notes" on={notesEnabled} onChange={onNotesEnabled} />
+      </Row>
+      <Row
+        label="Switch account on rate limit"
+        description="When a Claude Code or Codex turn fails with a rate limit, retry it once on another signed-in account with the most quota left. Add accounts under Providers."
+      >
+        <Toggle
+          label="Switch account on rate limit"
+          on={autoSwitchAccount}
+          onChange={onAutoSwitchAccount}
+        />
       </Row>
       <Row
         label="Working agents"
@@ -1715,52 +1739,57 @@ function ProviderRow({
   };
 
   return (
-    <Row
-      label={
-        <span className="flex items-center gap-2">
-          <HarnessIcon harness={harness} className="size-4 shrink-0" />
-          {HARNESS_TITLE[harness]}
-          {isDefault ? (
-            <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-content/60">
-              Default
-            </span>
-          ) : null}
-        </span>
-      }
-      description={
-        available
-          ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
-          : harnessUnavailableHint(harness)
-      }
-    >
-      {current ? (
-        <Select
-          label={`${HARNESS_TITLE[harness]} model`}
-          value={current.id}
-          onChange={(next) => onModelChange(harness, next)}
-          options={models.map((item) => ({
-            value: item.id,
-            label: item.name,
-          }))}
-        />
-      ) : null}
-      <SecondaryButton
-        onClick={() => current && onDefault(harness, current.id)}
-        disabled={isDefault || !current}
+    <>
+      <Row
+        label={
+          <span className="flex items-center gap-2">
+            <HarnessIcon harness={harness} className="size-4 shrink-0" />
+            {HARNESS_TITLE[harness]}
+            {isDefault ? (
+              <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-content/60">
+                Default
+              </span>
+            ) : null}
+          </span>
+        }
+        description={
+          available
+            ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
+            : harnessUnavailableHint(harness)
+        }
       >
-        {isDefault ? "Default" : "Use by default"}
-      </SecondaryButton>
-      {available ? (
-        <div className="flex items-center gap-2">
-          <span className="text-[12px] text-content/50">Show in picker</span>
-          <Toggle
-            label={`Show ${HARNESS_TITLE[harness]} in the model picker`}
-            on={inPicker}
-            onChange={onPickerVisible}
+        {current ? (
+          <Select
+            label={`${HARNESS_TITLE[harness]} model`}
+            value={current.id}
+            onChange={(next) => onModelChange(harness, next)}
+            options={models.map((item) => ({
+              value: item.id,
+              label: item.name,
+            }))}
           />
-        </div>
+        ) : null}
+        <SecondaryButton
+          onClick={() => current && onDefault(harness, current.id)}
+          disabled={isDefault || !current}
+        >
+          {isDefault ? "Default" : "Use by default"}
+        </SecondaryButton>
+        {available ? (
+          <div className="flex items-center gap-2">
+            <span className="text-[12px] text-content/50">Show in picker</span>
+            <Toggle
+              label={`Show ${HARNESS_TITLE[harness]} in the model picker`}
+              on={inPicker}
+              onChange={onPickerVisible}
+            />
+          </div>
+        ) : null}
+      </Row>
+      {isAccountProvider(harness) && available ? (
+        <ProviderAccounts provider={harness} />
       ) : null}
-    </Row>
+    </>
   );
 }
 
@@ -1986,32 +2015,6 @@ function Heading({
   );
 }
 
-function Row({
-  label,
-  description,
-  children,
-}: {
-  label: ReactNode;
-  description?: string;
-  children?: ReactNode;
-}) {
-  return (
-    <div className="flex items-start gap-6 border-b border-content/5 py-4 last:border-b-0">
-      <div className="min-w-0 flex-1">
-        <div className="text-[13px] font-medium text-content">{label}</div>
-        {description ? (
-          <p className="mt-1 text-[12px] leading-relaxed text-content/45">
-            {description}
-          </p>
-        ) : null}
-      </div>
-      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-        {children}
-      </div>
-    </div>
-  );
-}
-
 function Segmented<T extends string>({
   label,
   value,
@@ -2178,41 +2181,6 @@ function NotificationsBlocked() {
   );
 }
 
-function Toggle({
-  label,
-  on,
-  onChange,
-  disabled = false,
-}: {
-  label: string;
-  on: boolean;
-  onChange: (on: boolean) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-label={label}
-      aria-checked={on}
-      disabled={disabled}
-      onClick={() => {
-        onChange(!on);
-        playCue("switch");
-      }}
-      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-        on ? "bg-accent" : "bg-content/20"
-      }`}
-    >
-      <span
-        className={`absolute top-0.5 size-4 rounded-full bg-white transition-[left] ${
-          on ? "left-4.5" : "left-0.5"
-        }`}
-      />
-    </button>
-  );
-}
-
 /** Theme-aware dropdown for a Settings row: a trigger button opening a Popover listbox. Used instead of a native select, whose option popup is OS-rendered and unreadable in dark mode on Windows/Linux. */
 function Select({
   label,
@@ -2365,32 +2333,5 @@ function Select({
         </Popover>
       ) : null}
     </div>
-  );
-}
-
-function SecondaryButton({
-  onClick,
-  disabled = false,
-  danger = false,
-  children,
-}: {
-  onClick: () => void;
-  disabled?: boolean;
-  danger?: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      className={`flex shrink-0 items-center gap-1.5 rounded-md border border-content/10 px-2.5 py-1 text-[12px] ${
-        danger
-          ? "text-red-400 hover:border-red-400/40 hover:bg-red-400/10"
-          : "text-content/70 hover:bg-content/10 hover:text-content"
-      } disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent`}
-    >
-      {children}
-    </button>
   );
 }
