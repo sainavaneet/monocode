@@ -1052,8 +1052,8 @@ export default function App({
   }, [active?.harness]);
   const usageSession = useMemo(() => {
     if (!active) return undefined;
-    return { harness: active.harness };
-  }, [active?.harness]);
+    return { harness: active.harness, modelSettings: active.modelSettings };
+  }, [active?.harness, active?.modelSettings]);
   const runningTerminals = useMemo(() => {
     const files: FilePaneTab[] = [];
     const dock = findProjectTerminal(projectTerminals, projectCwd);

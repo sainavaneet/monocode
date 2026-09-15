@@ -20,6 +20,7 @@ import {
   type RateLimitWindow,
 } from "../lib/rateLimits";
 import { HARNESS_LABEL, HARNESS_TITLE, type HarnessId } from "../lib/session";
+import { accountFor, DEFAULT_ACCOUNT_ID } from "../lib/accounts";
 import {
   runningTerminalChipLabel,
   type RunningTerminal,
@@ -29,6 +30,7 @@ const CLOCK_MS = 30_000;
 
 export type UsageFooterSession = {
   harness: HarnessId;
+  modelSettings?: Record<string, string>;
 };
 
 export function UsageFooter({
@@ -46,6 +48,19 @@ export function UsageFooter({
 }) {
   const wantClaude = providers.includes("claude");
   const wantCodex = providers.includes("codex");
+  // Usage follows the active session's account; other sessions may run on
+  // different logins, but the footer describes the one in front of you.
+  const claudeAccount = accountFor(
+    "claude",
+    session?.harness === "claude" ? session.modelSettings : undefined,
+  );
+  const codexAccount = accountFor(
+    "codex",
+    session?.harness === "codex" ? session.modelSettings : undefined,
+  );
+  const claudeKey = claudeAccount?.id ?? DEFAULT_ACCOUNT_ID;
+  const codexKey = codexAccount?.id ?? DEFAULT_ACCOUNT_ID;
+  const claudeProfileDir = claudeAccount?.profileDir ?? null;
   const [claude, setClaude] = useState<ProviderRateLimits>(() =>
     idleRateLimits("claude"),
   );
@@ -75,7 +90,7 @@ export function UsageFooter({
     if (fetchClaude) {
       setClaude((current) => fetchingRateLimits("claude", current));
       jobs.push(
-        fetchClaudeRateLimits().then((value) => {
+        fetchClaudeRateLimits(claudeProfileDir).then((value) => {
           setClaude(value);
         }),
       );
@@ -83,7 +98,7 @@ export function UsageFooter({
     if (fetchCodex) {
       setCodex((current) => fetchingRateLimits("codex", current));
       jobs.push(
-        fetchCodexRateLimits().then((value) => {
+        fetchCodexRateLimits(codexAccount).then((value) => {
           setCodex(value);
         }),
       );
@@ -96,7 +111,13 @@ export function UsageFooter({
       });
     inflight.current = run;
     return run;
-  }, [wantClaude, wantCodex]);
+  }, [claudeProfileDir, codexAccount, wantClaude, wantCodex]);
+
+  const accountKeys = `${claudeKey}|${codexKey}`;
+  useEffect(() => {
+    void accountKeys;
+    void refresh(true);
+  }, [accountKeys, refresh]);
 
   useEffect(() => {
     void refresh();
