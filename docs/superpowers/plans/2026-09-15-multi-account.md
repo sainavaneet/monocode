@@ -2203,3 +2203,26 @@ Expected: vitest all green, `tsc` clean, `cargo fmt --check` clean, clippy no wa
 git -C /Users/navaneet/Developer/monocode add docs README.md
 git -C /Users/navaneet/Developer/monocode commit -m "docs: describe multi-account support"
 ```
+
+---
+
+## Deviations during execution
+
+- **Accounts storage:** JSON file `<app data dir>/accounts/accounts.json`
+  instead of a SQLite table; the default account is synthesised, not stored.
+- **Login terminal:** `pty_spawn` is unchanged. The login panel embeds the
+  normal shell and types the `export VAR=... && <login>` line into it
+  (`src/lib/accountLogin.ts`).
+- **Controls move:** only `Row`, `Toggle`, `SecondaryButton` moved to
+  `src/surfaces/settings/controls.tsx`; `Select` stayed in `SettingsView.tsx`.
+- **Failover location (Task 9):** implemented as `sendTurnWithFailover` in
+  `src/lib/accounts/failover.ts` and applied inside `sendHarnessTurn`
+  (`src/lib/harness/registry.ts`) rather than in `App.tsx`. The wrapper holds
+  back the rate-limit `session.error`, retries once on the chosen account, and
+  emits `status` plus `session.configChanged` so the session rebinds without
+  re-adding the user's message to the transcript.
+- **Link repair:** shared links are repaired on every `accounts_list` call
+  rather than on app start.
+- **Pre-existing test failures:** 49 vitest tests fail on `main` and on this
+  branch alike under Node 26 (`localStorage.clear` is undefined without
+  `--localstorage-file`). None are related to this work.

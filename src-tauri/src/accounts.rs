@@ -75,10 +75,7 @@ pub fn validate_env(env: &HashMap<String, String>) -> Result<(), String> {
 /// Applies a caller-supplied env to a child after checking the allowlist.
 /// The frontend only ever needs to point a CLI at a profile directory, so
 /// anything else is rejected rather than forwarded.
-pub fn apply_env(
-    cmd: &mut Command,
-    env: Option<&HashMap<String, String>>,
-) -> Result<(), String> {
+pub fn apply_env(cmd: &mut Command, env: Option<&HashMap<String, String>>) -> Result<(), String> {
     let Some(env) = env else { return Ok(()) };
     validate_env(env)?;
     for (key, value) in env {
@@ -373,6 +370,15 @@ fn with_identity(mut account: Account) -> Account {
 
 fn list_all(app: &AppHandle, store: &AccountStore) -> Result<Vec<Account>, String> {
     let extra = store.with(app, |accounts| Ok(accounts.clone()))?;
+    // Repair links the user may have created since (a new plugins dir, a
+    // first CLAUDE.md). Idempotent and a handful of stat calls.
+    for account in &extra {
+        if let (Some(profile), Some(source)) =
+            (&account.profile_dir, provider_home(&account.provider))
+        {
+            link_shared(Path::new(profile), &source, &account.provider);
+        }
+    }
     let mut all = vec![default_account("claude"), default_account("codex")];
     all.extend(extra);
     Ok(all.into_iter().map(with_identity).collect())

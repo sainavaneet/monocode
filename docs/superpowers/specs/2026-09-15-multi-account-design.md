@@ -43,8 +43,8 @@ config dir so all accounts behave the same and history is shared:
 - Codex: symlink `config.toml`, `AGENTS.md`, `skills`, `rules`, `hooks.json`,
   `plugins`, `sessions`, `memories` (if present). Never link `auth.json`.
 
-Linking happens at account creation and is repaired on app start if a target is
-missing. On Windows, symlinks fall back to copies for files and junctions for
+Linking happens at account creation and is repaired whenever accounts are
+listed (Settings, picker) if a target appeared since. On Windows, symlinks fall back to copies for files and junctions for
 directories.
 
 The user's existing `~/.claude` and `~/.codex` logins are the "Default" account
@@ -53,31 +53,32 @@ behaviour is unchanged when only one account exists.
 
 ## Data model
 
-New table `accounts` in the existing SQLite database:
+Extra accounts are stored as JSON in `<app data dir>/accounts/accounts.json`
+(`id`, `provider`, `label`, `profileDir`, `createdAt`). The default account for
+each provider is synthesised at read time and never stored. Identity (email)
+is read live from the profile's `.claude.json` or `auth.json`.
 
-```
-id TEXT PRIMARY KEY, provider TEXT NOT NULL, label TEXT NOT NULL,
-profile_dir TEXT, identity TEXT, created_at INTEGER NOT NULL, sort INTEGER NOT NULL
-```
-
-`sessions` gains `account_id TEXT` (nullable, null = default account). The
-frontend `Session` type gains `accountId?: string`, and `HarnessSessionInput`
-gains `accountId?: string`.
+A session's account id lives in its existing `modelSettings` under the key
+`account`. It therefore persists with the session, flows to the adapters
+through `HarnessSessionInput.modelSettings`, and needs no schema change.
+`mergeModelSettings` preserves the key across model changes, and the
+"last used settings" memory never records it, so new sessions start on the
+provider default chosen in Settings.
 
 ## Backend commands (Rust, `accounts.rs`)
 
-- `accounts_list(provider?)` returns accounts with identity.
+- `accounts_list()` returns every account (defaults first) with identity, and
+  repairs missing shared links for each profile while it is at it.
 - `accounts_create(provider, label)` creates the profile dir, links shared
   config, inserts the row, returns the account.
 - `accounts_rename(id, label)`, `accounts_remove(id)` (removes dir and, for
   Claude on macOS, the Keychain item).
-- `accounts_env(id)` returns the env map for a session: `{}` for default,
-  otherwise `{CLAUDE_CONFIG_DIR: dir}` or `{CODEX_HOME: dir}`.
-- `accounts_identity(id)` reads the email: Claude from `<dir>/.claude.json`
-  `oauthAccount.emailAddress`, Codex from the `id_token` JWT in `auth.json`.
-- `accounts_login_ready(id)` returns whether a credential now exists (polled
-  during login).
-- `harness_spawn`, `harness_exec`, and `pty_spawn` accept an optional
+- `accounts_list` includes each account's identity: Claude from
+  `<dir>/.claude.json` `oauthAccount.emailAddress`, Codex from the `id_token`
+  JWT in `auth.json`. The frontend derives the env map from `profileDir`.
+- `accounts_login_ready(id, provider)` returns whether a credential now exists
+  (polled during login).
+- `harness_spawn` and `harness_exec` accept an optional
   `env: HashMap<String, String>`. Keys are validated against the allowlist
   `{CLAUDE_CONFIG_DIR, CODEX_HOME}`; anything else is rejected.
 - `fetch_claude_usage(profile_dir?)` reads the credential for that profile
@@ -87,19 +88,21 @@ gains `accountId?: string`.
 
 - `src/lib/accounts.ts`: types, list/create/remove wrappers, default account per
   provider (localStorage, `monocode.defaultAccount.<provider>`), the
-  `subscribe/snapshot` store pattern used elsewhere in `settings.ts`.
+  `subscribe/snapshot` store pattern used elsewhere in `settings.ts`, and
+  `accountIdFor(provider, modelSettings)` which resolves the effective account.
 - `src/lib/accounts/selectFailover.ts`: pure function choosing the next account
   from the usage snapshot: same provider, not the failing one, lowest used
   percent across its windows, excluding accounts whose tightest window is at
   100 percent.
-- `src/lib/accounts/rateLimitDetect.ts`: pure `isRateLimitFailure(provider,
-  message)` matching "hit your limit", "usage limit", "rate limit",
+- `src/lib/accounts/rateLimitDetect.ts`: pure `isRateLimitFailure(message)`
+  matching "hit your limit", "usage limit", "rate limit",
   "rate_limit", "429", "too many requests", "quota".
 - Settings → Providers: each Claude/Codex row gains an Accounts list showing
   label, email, 5-hour and weekly usage bars, a "Default" marker, rename,
-  remove, and "Add account". Add opens the in-app terminal running
-  `claude auth login` or `codex login` with the profile env, polls
-  `accounts_login_ready`, then labels the account with its email.
+  remove, and "Add account". Add opens an embedded terminal (the normal shell)
+  and types `export CLAUDE_CONFIG_DIR='<dir>' && claude auth login` (or the
+  Codex / PowerShell equivalent) into it, polls `accounts_login_ready`, then
+  shows the account's email.
 - Settings → General: toggle "Switch account automatically on rate limit",
   default on (`monocode.autoSwitchAccount`).
 - Composer model picker: an account row for Claude and Codex when the provider
@@ -111,15 +114,24 @@ gains `accountId?: string`.
 
 ## Automatic failover
 
-When a turn fails and `isRateLimitFailure` matches:
+Implemented in `src/lib/accounts/failover.ts` and applied in
+`sendHarnessTurn` (`src/lib/harness/registry.ts`), so the app's transcript and
+turn bookkeeping are untouched:
 
-1. If auto-switch is off, or this turn already failed over once, show the error
-   as today plus the soonest reset time across accounts.
-2. Otherwise refresh usage for the provider's accounts, call `selectFailover`.
-3. If none: same as step 1.
-4. Else rebind the session to the chosen account, respawn with resume, emit a
-   `status` event "Switched to <label> after rate limit", and re-send the same
-   turn text and attachments once.
+1. The turn runs with a wrapped `onEvent`. A `session.error` whose message
+   matches `isRateLimitFailure` is held back; a thrown rate-limit error is
+   caught.
+2. If auto-switch is off, the provider has no accounts, or the failure is not a
+   rate limit, the held error is delivered (or the error rethrown) unchanged.
+3. Otherwise usage is refreshed for every account of the provider and
+   `selectFailover` picks the one with the most quota left.
+4. If none qualifies, the original error is delivered unchanged.
+5. Else the wrapper emits `status` "Switched to <label> after a rate limit",
+   emits `session.configChanged` with `modelSettings.account = <id>` so the
+   session, picker and footer follow the new account, and calls the adapter's
+   `sendTurn` once more with the new settings. The adapter's settings key
+   includes the account, so it respawns under the new login and resumes the
+   same conversation. Only one retry per turn.
 
 ## Error handling
 

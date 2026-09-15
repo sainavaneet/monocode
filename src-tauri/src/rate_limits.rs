@@ -66,14 +66,12 @@ fn usage_result(
 /// Fetch Claude Code 5-hour / weekly usage via the local OAuth token.
 /// The token never leaves the host process.
 #[tauri::command]
-pub async fn fetch_claude_usage(
-    profile_dir: Option<String>,
-) -> Result<ClaudeUsageFetch, String> {
+pub async fn fetch_claude_usage(profile_dir: Option<String>) -> Result<ClaudeUsageFetch, String> {
     tauri::async_runtime::spawn_blocking(move || {
         fetch_claude_usage_sync(profile_dir.as_deref().map(Path::new))
     })
-        .await
-        .map_err(|e| e.to_string())?
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn fetch_claude_usage_sync(profile_dir: Option<&Path>) -> Result<ClaudeUsageFetch, String> {
@@ -388,15 +386,13 @@ fn read_macos_keychain_credentials(profile_dir: Option<&Path>) -> Option<ClaudeC
     ];
     for (account, args) in candidates {
         if let Some(secret) = security_output(&args) {
-            if let Some(creds) =
-                credentials_from_blob(
-                    &secret,
-                    ClaudeCredStore::Keychain {
-                        service: service.clone(),
-                        account,
-                    },
-                )
-            {
+            if let Some(creds) = credentials_from_blob(
+                &secret,
+                ClaudeCredStore::Keychain {
+                    service: service.clone(),
+                    account,
+                },
+            ) {
                 return Some(creds);
             }
         }
@@ -421,11 +417,7 @@ fn write_macos_keychain_blob(service: &str, account: &str, raw: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn keychain_find_args(service: &str) -> Vec<String> {
-    vec![
-        "find-generic-password".into(),
-        "-s".into(),
-        service.into(),
-    ]
+    vec!["find-generic-password".into(), "-s".into(), service.into()]
 }
 
 #[cfg(target_os = "macos")]
