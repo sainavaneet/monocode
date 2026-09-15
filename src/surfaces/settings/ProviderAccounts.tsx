@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import {
   accountsFor,
   createAccount,
@@ -49,6 +56,10 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
   const accountKey = accounts.map((account) => account.id).join(",");
   const [usage, setUsage] = useState<Record<string, ProviderRateLimits>>({});
   const [pendingLogin, setPendingLogin] = useState<Account | null>(null);
+  // Which inline name field is open: the "new account" row or a rename.
+  const [naming, setNaming] = useState<"new" | { renameId: string } | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const defaultId = loadDefaultAccountId(provider);
@@ -71,23 +82,22 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
     refreshUsage();
   }, [accountKey, refreshUsage]);
 
-  const onAdd = async () => {
-    const label = window.prompt("Name this account (for example Work):");
-    if (!label?.trim()) return;
+  const onCreate = async (label: string) => {
+    setNaming(null);
     setError(null);
     try {
-      setPendingLogin(await createAccount(provider, label.trim()));
+      setPendingLogin(await createAccount(provider, label));
     } catch (failure: unknown) {
       setError(errorText(failure));
     }
   };
 
-  const onRename = async (account: Account) => {
-    const label = window.prompt("Rename account:", account.label);
-    if (!label?.trim() || label.trim() === account.label) return;
+  const onRename = async (account: Account, label: string) => {
+    setNaming(null);
+    if (label === account.label) return;
     setError(null);
     try {
-      await renameAccount(account.id, label.trim());
+      await renameAccount(account.id, label);
     } catch (failure: unknown) {
       setError(errorText(failure));
     }
@@ -116,25 +126,48 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
 
   return (
     <div className="mb-4 rounded-md border border-content/10">
-      {accounts.map((account) => (
-        <AccountRow
-          key={account.id}
-          account={account}
-          isDefault={defaultId === account.id}
-          limits={usage[account.id]}
-          now={now}
-          onDefault={() => saveDefaultAccountId(provider, account.id)}
-          onRename={() => void onRename(account)}
-          onRemove={() => void onRemove(account)}
-          onSignIn={() => setPendingLogin(account)}
+      {accounts.map((account) =>
+        typeof naming === "object" && naming?.renameId === account.id ? (
+          <NameField
+            key={account.id}
+            label="Rename account"
+            initial={account.label}
+            submitLabel="Save"
+            onSubmit={(label) => void onRename(account, label)}
+            onCancel={() => setNaming(null)}
+          />
+        ) : (
+          <AccountRow
+            key={account.id}
+            account={account}
+            isDefault={defaultId === account.id}
+            limits={usage[account.id]}
+            now={now}
+            onDefault={() => saveDefaultAccountId(provider, account.id)}
+            onRename={() => setNaming({ renameId: account.id })}
+            onRemove={() => void onRemove(account)}
+            onSignIn={() => setPendingLogin(account)}
+          />
+        ),
+      )}
+      {naming === "new" ? (
+        <NameField
+          label="Name this account"
+          placeholder="For example Work"
+          submitLabel="Create and sign in"
+          onSubmit={(label) => void onCreate(label)}
+          onCancel={() => setNaming(null)}
         />
-      ))}
+      ) : null}
       <div className="flex items-center justify-between gap-3 px-3 py-2">
         <span className="text-[12px] text-content/45">
           Each account signs in once and keeps its own login. Config and
           history are shared.
         </span>
-        <SecondaryButton onClick={() => void onAdd()}>
+        <SecondaryButton
+          onClick={() => setNaming("new")}
+          disabled={naming === "new" || pendingLogin != null}
+        >
           Add account
         </SecondaryButton>
       </div>
@@ -148,6 +181,69 @@ export function ProviderAccounts({ provider }: { provider: AccountProvider }) {
           onCancel={() => setPendingLogin(null)}
         />
       ) : null}
+    </div>
+  );
+}
+
+interface NameFieldProps {
+  label: string;
+  initial?: string;
+  placeholder?: string;
+  submitLabel: string;
+  onSubmit: (label: string) => void;
+  onCancel: () => void;
+}
+
+/**
+ * Inline text entry. The Tauri webview does not implement `window.prompt`,
+ * so names are collected in the list itself.
+ */
+function NameField({
+  label,
+  initial = "",
+  placeholder,
+  submitLabel,
+  onSubmit,
+  onCancel,
+}: NameFieldProps) {
+  const [value, setValue] = useState(initial);
+  const input = useRef<HTMLInputElement>(null);
+  const trimmed = value.trim();
+
+  useEffect(() => {
+    input.current?.focus();
+    input.current?.select();
+  }, []);
+
+  const submit = () => {
+    if (trimmed) onSubmit(trimmed);
+  };
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submit();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      onCancel();
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2 border-b border-content/5 px-3 py-2 last:border-b-0">
+      <input
+        ref={input}
+        aria-label={label}
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => setValue(event.target.value)}
+        onKeyDown={onKeyDown}
+        className="min-w-0 flex-1 rounded-md border border-content/10 bg-content/5 px-2 py-1 text-[13px] text-content outline-none placeholder:text-content/35 focus:border-content/30"
+      />
+      <SecondaryButton onClick={submit} disabled={!trimmed}>
+        {submitLabel}
+      </SecondaryButton>
+      <SecondaryButton onClick={onCancel}>Cancel</SecondaryButton>
     </div>
   );
 }
