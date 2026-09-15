@@ -36,6 +36,15 @@ import {
 } from "../lib/harness/availability";
 import { refreshHarnessCatalogs } from "../lib/harness/registry";
 import { HARNESSES, HARNESS_TITLE, type HarnessId } from "../lib/session";
+import {
+  accountIdFor,
+  getAccountsSnapshot,
+  isAccountProvider,
+  listAccounts,
+  refreshAccounts,
+  subscribeAccounts,
+} from "../lib/accounts";
+import { accountModelSetting } from "../lib/accountSetting";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { LAYER } from "../lib/layers";
 import { HarnessIcon } from "./HarnessIcon";
@@ -83,6 +92,7 @@ const SETTING_ORDER = [
   "variant",
   "agent",
   "context",
+  "account",
 ];
 
 const EFFORT_SETTING_IDS = new Set(["effort", "reasoning", "reasoningEffort"]);
@@ -166,6 +176,11 @@ export function ModelPicker({
     getPickerVisibilitySnapshot,
     getPickerVisibilitySnapshot,
   );
+  const accountsVersion = useSyncExternalStore(
+    subscribeAccounts,
+    getAccountsSnapshot,
+    getAccountsSnapshot,
+  );
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<ModelPickerTab>(harness);
   const [active, setActive] = useState(0);
@@ -189,14 +204,28 @@ export function ModelPicker({
   openRef.current = open;
   recentOpenRef.current = recentMenu != null;
 
+  useEffect(() => {
+    if (open && isAccountProvider(harness)) void refreshAccounts();
+  }, [harness, open]);
+
   const current = resolveModel(harness, model);
   currentRef.current = current;
   const settings = useMemo(() => {
     void catalogVersion;
-    return pickerSettings(current).filter(
+    void accountsVersion;
+    const base = pickerSettings(current).filter(
       (setting) => !hideEffort || !isEffortSetting(setting),
     );
-  }, [catalogVersion, current, hideEffort]);
+    if (!isAccountProvider(harness)) return base;
+    // Only offered once a second account exists; the picker otherwise
+    // looks exactly as it did before accounts were introduced.
+    const account = accountModelSetting(
+      harness,
+      listAccounts(),
+      accountIdFor(harness, values),
+    );
+    return account ? [...base, account] : base;
+  }, [accountsVersion, catalogVersion, current, harness, hideEffort, values]);
   const entries = useMemo<MenuEntry[]>(
     () => [
       ...settings.map((setting) => ({
