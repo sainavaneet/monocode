@@ -28,9 +28,11 @@ import {
 import { HARNESS_LABEL, HARNESS_TITLE, type HarnessId } from "../lib/session";
 import {
   accountFor,
+  accountsFor,
   DEFAULT_ACCOUNT_ID,
   getAccountsSnapshot,
   subscribeAccounts,
+  type Account,
 } from "../lib/accounts";
 import {
   runningTerminalChipLabel,
@@ -171,8 +173,12 @@ export function UsageFooter({
     >
       {showUsage ? (
         <>
-          {wantClaude ? <ProviderChip limits={claude} now={now} /> : null}
-          {wantCodex ? <ProviderChip limits={codex} now={now} /> : null}
+          {wantClaude ? (
+            <ProviderChip limits={claude} now={now} account={claudeAccount} />
+          ) : null}
+          {wantCodex ? (
+            <ProviderChip limits={codex} now={now} account={codexAccount} />
+          ) : null}
         </>
       ) : session ? (
         <SessionChip session={session} />
@@ -320,10 +326,20 @@ function RunningTerminalChip({
 function ProviderChip({
   limits,
   now,
+  account,
 }: {
   limits: ProviderRateLimits;
   now: number;
+  account?: Account;
 }) {
+  // Name the login only once there is more than one to tell apart.
+  const hasChoice = accountsFor(limits.provider).length > 1;
+  const accountLabel = hasChoice ? (account?.label ?? "Default") : null;
+  const accountTitle = account
+    ? account.identity
+      ? `${account.label} (${account.identity})`
+      : account.label
+    : null;
   const loading =
     limits.status === "idle" ||
     (limits.status === "fetching" && !limits.session && !limits.weekly);
@@ -348,8 +364,9 @@ function ProviderChip({
     <span
       className="inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap"
       title={
-        tooltip ||
-        limits.error ||
+        [accountTitle, tooltip || limits.error || null]
+          .filter(Boolean)
+          .join(" · ") ||
         (disconnected
           ? "Not connected"
           : loading
@@ -358,6 +375,9 @@ function ProviderChip({
       }
     >
       <HarnessIcon harness={limits.provider} className="size-3 shrink-0" />
+      {accountLabel ? (
+        <span className="max-w-24 truncate text-content/60">{accountLabel}</span>
+      ) : null}
       {loading ? (
         <span className="animate-pulse text-content/35">···</span>
       ) : disconnected ? (
