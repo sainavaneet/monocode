@@ -139,39 +139,3 @@ describe("child bridge", () => {
     release();
   });
 });
-
-describe("spawnChild env", () => {
-  it("forwards env to harness_spawn and omits it when empty", async () => {
-    installResolvedListeners();
-    mocks.invoke.mockResolvedValue(7);
-    const child = await loadChild();
-    await child.spawnChild("s1", "/bin/claude", ["--x"], "/tmp", {
-      CLAUDE_CONFIG_DIR: "/tmp/p",
-    });
-    expect(mocks.invoke).toHaveBeenCalledWith("harness_spawn", {
-      sessionId: "s1",
-      command: "/bin/claude",
-      args: ["--x"],
-      cwd: "/tmp",
-      env: { CLAUDE_CONFIG_DIR: "/tmp/p" },
-    });
-    await child.spawnChild("s2", "/bin/claude", [], "/tmp", {});
-    expect(mocks.invoke).toHaveBeenLastCalledWith("harness_spawn", {
-      sessionId: "s2",
-      command: "/bin/claude",
-      args: [],
-      cwd: "/tmp",
-    });
-    await child.spawnChild("s3", "/bin/codex", [], "/tmp", undefined, {
-      provider: "codex",
-      id: "k1",
-    });
-    expect(mocks.invoke).toHaveBeenLastCalledWith("harness_spawn", {
-      sessionId: "s3",
-      command: "/bin/codex",
-      args: [],
-      cwd: "/tmp",
-      account: { provider: "codex", id: "k1" },
-    });
-  });
-});

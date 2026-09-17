@@ -1,6 +1,5 @@
 use tauri::Manager;
 
-mod accounts;
 mod chat_background;
 mod checkpoint;
 mod control;
@@ -196,7 +195,6 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(harness::HarnessHost::new())
         .manage(pty::PtyHost::new())
-        .manage(accounts::AccountStore::default())
         .manage(window_transfer::WindowTransferState::new())
         .setup(|app| {
             harness::reap_orphaned_harness_processes();
@@ -225,19 +223,13 @@ pub fn run() {
             menu::dispatch(app, event.id().as_ref());
         })
         .invoke_handler(tauri::generate_handler![
-            accounts::accounts_list,
-            accounts::accounts_create,
-            accounts::accounts_rename,
-            accounts::accounts_remove,
-            accounts::accounts_login_ready,
-            accounts::accounts_create_api_key,
-            accounts::accounts_set_enabled,
             control::control_enable,
             control::control_disable,
             control::control_reply,
             control::control_save,
             control::control_load,
             control::control_scopes,
+            control::control_write_path,
             control::control_attach_worker,
             control::control_authorize_turn,
             control::control_turn_finished,
@@ -280,11 +272,13 @@ pub fn run() {
             fs::git_pr_create,
             fs::git_github_status,
             fs::git_github_repo,
+            fs::git_github_repositories,
             fs::git_github_work_item,
             fs::git_github_work_items,
             fs::git_github_work_item_details,
             fs::git_github_work_item_thread,
             fs::git_github_work_item_comment,
+            fs::git_github_pr_action,
             fs::git_github_pr_diff,
             inbox_media::fetch_inbox_media,
             gitlab::gitlab_status,
@@ -339,6 +333,7 @@ pub fn run() {
             harness::harness_resolve_grok,
             harness::harness_free_port,
             harness::harness_spawn,
+            harness::provider_account_remove,
             harness::harness_write,
             harness::harness_kill,
             harness::harness_kill_all,

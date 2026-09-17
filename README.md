@@ -38,8 +38,6 @@ Windows (x86_64): download the NSIS installer from [GitHub Releases](https://git
 
 ## Some notes
 
-- **Multiple accounts.** Settings → Providers lets you sign in to more than one Claude Code or Codex account. Pick the account per session from the model picker, or let MonoCode switch to the account with the most quota left when a turn hits a rate limit (General → Switch account on rate limit).
-
 This is very early and you should expect bugs.
 
 Small, focused pull requests are welcome. Anything large is worth an issue first - see [CONTRIBUTING.md](CONTRIBUTING.md).

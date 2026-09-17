@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { accountEnv, isApiKeyAccount, type Account } from "./accounts";
 import { homeDir } from "./fs";
 import {
   errorRateLimits,
@@ -22,6 +21,9 @@ const USAGE_CHILD_ID = "monocode-codex-usage";
 const DISCOVERY_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 
+export type CodexRateLimitResetOutcome =
+  "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed";
+
 type ClaudeUsageFetch = {
   status: "ok" | "error" | "unavailable" | string;
   httpStatus?: number | null;
@@ -29,18 +31,12 @@ type ClaudeUsageFetch = {
   error?: string | null;
 };
 
-const API_KEY_USAGE_NOTE = "API key: billed per use, no quota window";
-
 export async function fetchClaudeRateLimits(
-  profileDir?: string | null,
-  account?: Account,
+  accountId = "default",
 ): Promise<ProviderRateLimits> {
-  if (isApiKeyAccount(account)) {
-    return unavailableRateLimits("claude", API_KEY_USAGE_NOTE);
-  }
   try {
     const result = await invoke<ClaudeUsageFetch>("fetch_claude_usage", {
-      profileDir: profileDir ?? null,
+      accountId,
     });
     if (result.status === "ok" && result.body) {
       const parsed = parseClaudeOAuthUsage(result.body);
@@ -69,14 +65,8 @@ export async function fetchClaudeRateLimits(
 }
 
 export async function fetchCodexRateLimits(
-  account?: Account,
+  accountId = "default",
 ): Promise<ProviderRateLimits> {
-  if (isApiKeyAccount(account)) {
-    return unavailableRateLimits("codex", API_KEY_USAGE_NOTE);
-  }
-  const childId = account?.profileDir
-    ? `${USAGE_CHILD_ID}-${account.id}`
-    : USAGE_CHILD_ID;
   let path: string;
   try {
     path = (await resolveCodexBinary()).path;
@@ -85,8 +75,74 @@ export async function fetchCodexRateLimits(
   }
 
   const cwd = await homeDir();
+  try {
+    const result = await requestCodexAccount<unknown>(
+      path,
+      cwd,
+      "account/rateLimits/read",
+      {},
+      accountId,
+    );
+    const parsed = parseCodexRateLimits(result);
+    if (parsed.session || parsed.weekly || parsed.resetCredits) return parsed;
+    const rec = asRecord(result);
+    if (rec && !parsed.session && !parsed.weekly) {
+      return unavailableRateLimits("codex", "No Codex usage data");
+    }
+    return parsed;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      /not signed in|chatgpt authentication required|not authenticated/i.test(
+        message,
+      )
+    ) {
+      return unavailableRateLimits("codex", "Codex not signed in");
+    }
+    if (/ENOENT|not found|could not run/i.test(message)) {
+      return unavailableRateLimits("codex", "Codex CLI not found");
+    }
+    return errorRateLimits("codex", message);
+  }
+}
+
+export async function consumeCodexRateLimitResetCredit(
+  creditId?: string,
+  accountId = "default",
+): Promise<CodexRateLimitResetOutcome> {
+  const path = (await resolveCodexBinary()).path;
+  const cwd = await homeDir();
+  const result = await requestCodexAccount<unknown>(
+    path,
+    cwd,
+    "account/rateLimitResetCredit/consume",
+    {
+      idempotencyKey: crypto.randomUUID(),
+      ...(creditId ? { creditId } : {}),
+    },
+    accountId,
+  );
+  const outcome = asRecord(result)?.outcome;
+  if (
+    outcome === "reset" ||
+    outcome === "nothingToReset" ||
+    outcome === "noCredit" ||
+    outcome === "alreadyRedeemed"
+  ) {
+    return outcome;
+  }
+  throw new Error("Codex returned an unknown reset result");
+}
+
+async function requestCodexAccount<T>(
+  path: string,
+  cwd: string,
+  method: string,
+  params: unknown,
+  accountId: string,
+): Promise<T> {
   const rpc = new JsonRpcClient(
-    childId,
+    USAGE_CHILD_ID,
     {
       onRequest: (id) => {
         void rpc.respond(id, {}).catch(() => undefined);
@@ -97,26 +153,23 @@ export async function fetchCodexRateLimits(
 
   const stop = async () => {
     rpc.close();
-    unwatchChild(childId);
-    await killChild(childId).catch(() => undefined);
+    unwatchChild(USAGE_CHILD_ID);
+    await killChild(USAGE_CHILD_ID).catch(() => undefined);
   };
 
-  await killChild(childId).catch(() => undefined);
+  await killChild(USAGE_CHILD_ID).catch(() => undefined);
 
   watchChild(
-    childId,
+    USAGE_CHILD_ID,
     (line) => rpc.pushLine(line),
     () => rpc.close(new Error("Codex usage probe exited")),
   );
 
   try {
-    await spawnChild(
-      childId,
-      path,
-      ["app-server"],
-      cwd,
-      accountEnv(account),
-    );
+    await spawnChild(USAGE_CHILD_ID, path, ["app-server"], cwd, {
+      provider: "codex",
+      id: accountId,
+    });
     return await withTimeout(
       DISCOVERY_TIMEOUT_MS,
       async () => {
@@ -134,36 +187,12 @@ export async function fetchCodexRateLimits(
         );
         await rpc.notify("initialized", undefined);
 
-        const result = await rpc.request<unknown>(
-          "account/rateLimits/read",
-          {},
-          REQUEST_TIMEOUT_MS,
-        );
-        const parsed = parseCodexRateLimits(result);
-        if (parsed.session || parsed.weekly) return parsed;
-        const rec = asRecord(result);
-        if (rec && !parsed.session && !parsed.weekly) {
-          return unavailableRateLimits("codex", "No Codex usage data");
-        }
-        return parsed;
+        return rpc.request<T>(method, params, REQUEST_TIMEOUT_MS);
       },
       () => {
         void stop();
       },
     );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (
-      /not signed in|chatgpt authentication required|not authenticated/i.test(
-        message,
-      )
-    ) {
-      return unavailableRateLimits("codex", "Codex not signed in");
-    }
-    if (/ENOENT|not found|could not run/i.test(message)) {
-      return unavailableRateLimits("codex", "Codex CLI not found");
-    }
-    return errorRateLimits("codex", message);
   } finally {
     await stop();
   }

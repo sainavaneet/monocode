@@ -1,6 +1,5 @@
 import type { HarnessId } from "./session";
 import { HARNESSES } from "./session";
-import { ACCOUNT_SETTING_ID, stripAccountSetting } from "./accounts";
 
 export type ModelSettingChoice = {
   value: string;
@@ -21,6 +20,11 @@ export type AgentModel = {
   harness: HarnessId;
   name: string;
   nativeId?: string;
+  /** Upstream provider inside a multi-provider harness such as OpenCode. */
+  provider?: {
+    id: string;
+    name: string;
+  };
   settings?: ModelSetting[];
   /** Context window, when the harness catalog reports one. */
   contextWindow?: number;
@@ -364,11 +368,31 @@ export function mergeModelSettings(
     const value = compatibleSettingValue(setting, current[setting.id]);
     if (value != null) next[setting.id] = value;
   }
-  // The account is not a model setting but must survive a model change so
-  // the session keeps running on the login the user picked.
-  const account = current[ACCOUNT_SETTING_ID];
-  if (account) next[ACCOUNT_SETTING_ID] = account;
   return next;
+}
+
+const EFFORT_SETTING_IDS = new Set(["effort", "reasoning", "reasoningEffort"]);
+
+/** The select setting that controls reasoning effort for this model, if any. */
+export function modelEffortSetting(
+  model: AgentModel,
+): ModelSetting | undefined {
+  return model.settings?.find(
+    (setting) =>
+      setting.kind === "select" && EFFORT_SETTING_IDS.has(setting.id),
+  );
+}
+
+export function modelEffortLabel(
+  model: AgentModel,
+  values?: Record<string, string>,
+): string | undefined {
+  const setting = modelEffortSetting(model);
+  if (!setting) return undefined;
+  const value = values?.[setting.id] ?? setting.value;
+  return (
+    setting.options.find((option) => option.value === value)?.label ?? value
+  );
 }
 
 /** Last chosen effort/fast/etc., applied to any model that supports those values. */
@@ -397,7 +421,7 @@ export function saveLastModelSettings(
   mode: "overwrite" | "fill" = "overwrite",
 ) {
   const prev = loadLastModelSettings();
-  const incoming = parseStringRecord(stripAccountSetting(settings));
+  const incoming = parseStringRecord(settings);
   const next =
     mode === "fill" ? { ...incoming, ...prev } : { ...prev, ...incoming };
   try {

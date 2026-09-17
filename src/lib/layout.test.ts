@@ -395,6 +395,20 @@ describe("resetTabToSession", () => {
 });
 
 describe("openEditorTab", () => {
+  it("can put the first file before a focused session", () => {
+    const file = newFileTab("/repo/App.tsx", "/repo");
+    const next = openEditorTab(newTab("session-a"), file, { split: "left" });
+    const leaves = layoutLeaves(next.layout);
+
+    expect(leaves.map((pane) => pane.id)).toEqual([
+      next.editorPanes[0]?.id,
+      "session-a",
+    ]);
+    expect(leaves[0]?.rect).toEqual({ x: 0, y: 0, w: 0.5, h: 1 });
+    expect(leaves[1]?.rect).toEqual({ x: 0.5, y: 0, w: 0.5, h: 1 });
+    expect(next.focusedId).toBe(next.editorPanes[0]?.id);
+  });
+
   it("does not open files into a terminal pane", () => {
     const terminal = openTerminalTab(
       newTab("session-a"),

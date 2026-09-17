@@ -1,11 +1,4 @@
 import { nativeModelId } from "../models";
-import {
-  accountEnv,
-  accountFor,
-  accountIdFor,
-  accountRef,
-  ensureAccountsLoaded,
-} from "../accounts";
 import type { RuntimeMode } from "../session";
 import { loadClaudeHooks } from "../settings";
 import {
@@ -121,6 +114,7 @@ type LiveAgentTask = {
 type Live = {
   cwd: string;
   claudeSessionId: string;
+  providerAccountId?: string;
   runtimeMode: RuntimeMode;
   planning: boolean;
   settingsKey: string;
@@ -152,6 +146,7 @@ type Live = {
 type Resume = {
   sessionId: string;
   cwd: string;
+  providerAccountId?: string;
 };
 
 const INIT_TIMEOUT_MS = 8_000;
@@ -200,7 +195,6 @@ export async function sendClaudeTurn(input: SendTurnInput): Promise<void> {
 export async function compactClaudeContext(
   input: CompactContextInput,
 ): Promise<void> {
-  await ensureAccountsLoaded();
   const settingsKey = settingsKeyFor(input);
   let live = liveByThread.get(input.sessionId);
   if (!live || live.cwd !== input.cwd || live.settingsKey !== settingsKey) {
@@ -328,14 +322,14 @@ export function bindClaudeSession(
   threadId: string,
   providerSessionId: string,
   cwd: string,
+  providerAccountId?: string,
 ): void {
   const sessionId = providerSessionId.trim();
   if (!threadId || !sessionId || !cwd.trim()) return;
-  resumeByThread.set(threadId, { sessionId, cwd });
+  resumeByThread.set(threadId, { sessionId, cwd, providerAccountId });
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
-  await ensureAccountsLoaded();
   const settingsKey = settingsKeyFor(input);
   const planning = input.intent === "plan";
   const existing = liveByThread.get(input.sessionId);
@@ -358,8 +352,15 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   }
 
   const resume = resumeByThread.get(input.sessionId);
-  const canResume = resume != null && resume.cwd === input.cwd;
-  if (resume && resume.cwd !== input.cwd) {
+  const canResume =
+    resume != null &&
+    resume.cwd === input.cwd &&
+    resume.providerAccountId === input.providerAccountId;
+  if (
+    resume &&
+    (resume.cwd !== input.cwd ||
+      resume.providerAccountId !== input.providerAccountId)
+  ) {
     resumeByThread.delete(input.sessionId);
   }
 
@@ -376,6 +377,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const live: Live = {
     cwd: input.cwd,
     claudeSessionId,
+    providerAccountId: input.providerAccountId,
     runtimeMode: input.runtimeMode,
     planning,
     settingsKey,
@@ -433,14 +435,14 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     path,
     buildClaudeSpawnArgs(launch),
     input.cwd,
-    accountEnv(accountFor("claude", input.modelSettings)),
-    accountRef(accountFor("claude", input.modelSettings)),
+    { provider: "claude", id: input.providerAccountId ?? "default" },
   );
 
   liveByThread.set(input.sessionId, live);
   resumeByThread.set(input.sessionId, {
     sessionId: claudeSessionId,
     cwd: input.cwd,
+    providerAccountId: input.providerAccountId,
   });
 
   try {
@@ -552,6 +554,7 @@ function handleLine(sessionId: string, live: Live, line: string): void {
     resumeByThread.set(sessionId, {
       sessionId: sessionIdFromLine,
       cwd: live.cwd,
+      providerAccountId: live.providerAccountId,
     });
     live.onEvent({
       type: "session.providerBound",
@@ -1359,10 +1362,7 @@ function writeJson(
 }
 
 function settingsKeyFor(input: HarnessSessionInput): string {
-  // The account is part of the key so a switch respawns Claude under the
-  // other login while `--resume` keeps the same conversation.
-  const account = accountIdFor("claude", input.modelSettings);
-  const launch = claudeSettingsKey({
+  return `${input.providerAccountId ?? "default"}:${claudeSettingsKey({
     model: nativeModelId(input.model),
     effort: input.modelSettings?.effort,
     fast: input.modelSettings?.fast,
@@ -1370,8 +1370,7 @@ function settingsKeyFor(input: HarnessSessionInput): string {
     context: input.modelSettings?.context,
     runtimeMode: input.runtimeMode,
     hooks: loadClaudeHooks(),
-  });
-  return `${account}|${launch}`;
+  })}`;
 }
 
 function launchOptions(

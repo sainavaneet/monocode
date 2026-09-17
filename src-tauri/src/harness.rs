@@ -10,7 +10,7 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dirs_home;
@@ -22,6 +22,15 @@ const STDERR_EVENT: &str = "harness-stderr";
 const EXIT_EVENT: &str = "harness-exit";
 const SSE_EVENT: &str = "harness-sse";
 const SSE_END_EVENT: &str = "harness-sse-end";
+
+const DEFAULT_PROVIDER_ACCOUNT_ID: &str = "default";
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessAccount {
+    provider: String,
+    id: String,
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -318,18 +327,15 @@ pub fn harness_free_port() -> Result<u16, String> {
 /// Off the main thread: fork/exec, and `apply_gui_env` can wait on the first
 /// login-shell read. Callers await this before writing to the child. Kill can
 /// still race the fork, so a cancelled spawn must not reinsert the child.
-#[allow(clippy::too_many_arguments)]
 #[tauri::command(async)]
 pub fn harness_spawn(
     app: AppHandle,
     host: State<'_, HarnessHost>,
-    accounts: State<'_, crate::accounts::AccountStore>,
     session_id: String,
     command: String,
     args: Vec<String>,
     cwd: String,
-    env: Option<HashMap<String, String>>,
-    account: Option<crate::accounts::AccountRef>,
+    account: Option<HarnessAccount>,
 ) -> Result<u32, String> {
     let (epoch, kill_all, prev) = host.begin_spawn(&session_id);
     if let Some(prev) = prev {
@@ -351,8 +357,7 @@ pub fn harness_spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
-    crate::accounts::apply_env(&mut cmd, env.as_ref())?;
-    crate::accounts::apply_account_secret(&app, &accounts, account.as_ref(), &mut cmd)?;
+    apply_provider_account(&app, &mut cmd, account.as_ref())?;
 
     crate::control::configure_child(&app, &session_id, &mut cmd);
 
@@ -440,6 +445,107 @@ pub fn harness_spawn(
     });
 
     Ok(pid)
+}
+
+pub(crate) fn provider_account_dir(
+    app: &AppHandle,
+    provider: &str,
+    account_id: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(dir) = provider_account_path(app, provider, account_id)? else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "Could not create the {provider} account directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    Ok(Some(dir))
+}
+
+fn provider_account_path(
+    app: &AppHandle,
+    provider: &str,
+    account_id: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(account_id) = account_id.filter(|id| *id != DEFAULT_PROVIDER_ACCOUNT_ID) else {
+        return Ok(None);
+    };
+    if provider != "claude" && provider != "codex" {
+        return Err("Provider account profiles are only supported for Claude and Codex".into());
+    }
+    if account_id.is_empty()
+        || account_id.len() > 80
+        || !account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Invalid provider account id".into());
+    }
+    Ok(Some(
+        app.path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?
+            .join("provider-accounts")
+            .join(provider)
+            .join(account_id),
+    ))
+}
+
+#[tauri::command(async)]
+pub fn provider_account_remove(
+    app: AppHandle,
+    provider: String,
+    account_id: String,
+) -> Result<(), String> {
+    let Some(dir) = provider_account_path(&app, &provider, Some(&account_id))? else {
+        return Err("The default provider account cannot be removed".into());
+    };
+    if provider == "claude" {
+        crate::rate_limits::delete_claude_credentials(&dir);
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not remove the {provider} account directory {}: {error}",
+            dir.display()
+        )),
+    }
+}
+
+fn apply_provider_account(
+    app: &AppHandle,
+    cmd: &mut Command,
+    account: Option<&HarnessAccount>,
+) -> Result<(), String> {
+    let Some(account) = account else {
+        return Ok(());
+    };
+    let Some(dir) = provider_account_dir(app, &account.provider, Some(&account.id))? else {
+        return Ok(());
+    };
+    match account.provider.as_str() {
+        "claude" => {
+            // Claude scopes both its ordinary config and its macOS Keychain
+            // credential to these exact strings. Setting both keeps profiles
+            // isolated on every supported platform.
+            cmd.env("CLAUDE_CONFIG_DIR", &dir)
+                .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &dir)
+                .env_remove("ANTHROPIC_API_KEY")
+                .env_remove("ANTHROPIC_AUTH_TOKEN")
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+        }
+        "codex" => {
+            cmd.env("CODEX_HOME", &dir)
+                .env_remove("OPENAI_API_KEY")
+                .env_remove("CODEX_API_KEY")
+                .env_remove("CODEX_ACCESS_TOKEN");
+        }
+        _ => unreachable!("provider_account_dir validates the provider"),
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -676,7 +782,6 @@ pub async fn harness_exec(
     command: String,
     args: Vec<String>,
     cwd: Option<String>,
-    env: Option<HashMap<String, String>>,
 ) -> Result<String, String> {
     if !exec_args_allowed(&args) {
         return Err("harness_exec: unsupported arguments".into());
@@ -685,25 +790,19 @@ pub async fn harness_exec(
         if !is_resolved_harness_binary(&command) {
             return Err("harness_exec: not a resolved harness CLI".to_string());
         }
-        exec_capture(&command, &args, cwd.as_deref(), env.as_ref())
+        exec_capture(&command, &args, cwd.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-fn exec_capture(
-    command: &str,
-    args: &[String],
-    cwd: Option<&str>,
-    env: Option<&HashMap<String, String>>,
-) -> Result<String, String> {
+fn exec_capture(command: &str, args: &[String], cwd: Option<&str>) -> Result<String, String> {
     let mut cmd = Command::new(command);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, command);
-    crate::accounts::apply_env(&mut cmd, env)?;
     if let Some(dir) = cwd {
         let workdir = expand_home(dir);
         if workdir.is_dir() {

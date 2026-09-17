@@ -4,7 +4,6 @@ import { newSession } from "../session";
 
 const sent: string[] = [];
 const spawned: string[][] = [];
-const spawnedEnv: Array<Record<string, string> | undefined> = [];
 let onLine: ((line: string) => void) | undefined;
 let onExit: ((code?: number | null) => void) | undefined;
 const writeChild = vi.fn(async (_id: string, line: string) => {
@@ -13,15 +12,8 @@ const writeChild = vi.fn(async (_id: string, line: string) => {
 
 vi.mock("./child", () => ({
   resolveClaudeBinary: async () => ({ path: "/fake/claude" }),
-  spawnChild: async (
-    _id: string,
-    _path: string,
-    args: string[],
-    _cwd: string,
-    env?: Record<string, string>,
-  ) => {
+  spawnChild: async (_id: string, _path: string, args: string[]) => {
     spawned.push(args);
-    spawnedEnv.push(env);
   },
   killChild: async () => undefined,
   unwatchChild: () => undefined,
@@ -36,28 +28,6 @@ vi.mock("./child", () => ({
   writeChild,
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: async (command: string) =>
-    command === "accounts_list"
-      ? [
-          {
-            id: "default",
-            provider: "claude",
-            label: "Default",
-            profileDir: null,
-            createdAt: 0,
-          },
-          {
-            id: "w1",
-            provider: "claude",
-            label: "Work",
-            profileDir: "/p/w1",
-            createdAt: 1,
-          },
-        ]
-      : undefined,
-}));
-
 const {
   compactClaudeContext,
   respondClaudeApproval,
@@ -68,7 +38,6 @@ const {
 } = await import("./claude");
 import type { HarnessEvent } from "./types";
 import type { RuntimeMode, TurnIntent } from "../session";
-import { __accountsTestReset, refreshAccounts } from "../accounts";
 
 function parse() {
   return sent.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -93,7 +62,7 @@ async function startTurn(
   options: {
     runtimeMode?: RuntimeMode;
     intent?: TurnIntent;
-    modelSettings?: Record<string, string>;
+    providerAccountId?: string;
   } = {},
 ) {
   const events: HarnessEvent[] = [];
@@ -101,9 +70,10 @@ async function startTurn(
     sessionId,
     cwd: "/repo",
     model: "claude:claude-sonnet-5",
-    modelSettings: options.modelSettings ?? {},
+    modelSettings: {},
     runtimeMode: options.runtimeMode ?? "supervised",
     intent: options.intent,
+    providerAccountId: options.providerAccountId,
     text: "explore the codebase",
     attachments: [],
     onEvent: (event) => events.push(event),
@@ -129,7 +99,6 @@ async function startTurn(
 beforeEach(() => {
   sent.length = 0;
   spawned.length = 0;
-  spawnedEnv.length = 0;
   onLine = undefined;
   onExit = undefined;
   writeChild.mockClear();
@@ -142,8 +111,10 @@ afterEach(async () => {
 });
 
 describe("claude model switching", () => {
-  it("restarts with the new model while resuming the provider conversation", async () => {
-    const first = await startTurn("s1");
+  it("restarts a named account with the new model while resuming the provider conversation", async () => {
+    const first = await startTurn("s1", {
+      providerAccountId: "account-work",
+    });
     emit({ type: "result", subtype: "success", session_id: "sess_1" });
     await first.turn;
 
@@ -156,6 +127,7 @@ describe("claude model switching", () => {
       model: "claude:opus-5",
       modelSettings: {},
       runtimeMode: "supervised",
+      providerAccountId: "account-work",
       text: "what did I ask before?",
       attachments: [],
       onEvent: () => undefined,
@@ -797,42 +769,5 @@ describe("claude manual compaction", () => {
       text: "Compacted context",
     });
     expect(events.some((event) => event.type === "message.delta")).toBe(false);
-  });
-});
-
-describe("claude accounts", () => {
-  beforeEach(async () => {
-    __accountsTestReset();
-    await refreshAccounts();
-  });
-
-  it("spawns under the selected account and resumes when it changes", async () => {
-    const first = await startTurn("s1", { modelSettings: { account: "w1" } });
-    expect(spawnedEnv[0]).toEqual({ CLAUDE_CONFIG_DIR: "/p/w1" });
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await first.turn;
-
-    const userCount = parse().filter((m) => m.type === "user").length;
-    const second = sendClaudeTurn({
-      sessionId: "s1",
-      cwd: "/repo",
-      model: "claude:claude-sonnet-5",
-      modelSettings: { account: "default" },
-      runtimeMode: "supervised",
-      text: "continue",
-      attachments: [],
-      onEvent: () => undefined,
-    });
-    await waitFor(() => spawned.length === 2, "respawn under default account");
-    expect(spawnedEnv[1]).toEqual({});
-    expect(spawned[1]).toEqual(expect.arrayContaining(["--resume", "sess_1"]));
-
-    emit({ type: "system", subtype: "init", session_id: "sess_1" });
-    await waitFor(
-      () => parse().filter((m) => m.type === "user").length > userCount,
-      "follow-up prompt",
-    );
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await second;
   });
 });

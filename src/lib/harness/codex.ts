@@ -1,11 +1,4 @@
 import { nativeModelId } from "../models";
-import {
-  accountEnv,
-  accountFor,
-  accountIdFor,
-  accountRef,
-  ensureAccountsLoaded,
-} from "../accounts";
 import type { RuntimeMode } from "../session";
 import { questionPromptTitle, type UserQuestionReply } from "../userQuestion";
 import {
@@ -72,8 +65,7 @@ type Live = {
   rpc: JsonRpcClient;
   threadId: string;
   cwd: string;
-  /// Account the app-server was started under; a change forces a respawn.
-  accountId: string;
+  providerAccountId?: string;
   runtimeMode: RuntimeMode;
   planning: boolean;
   onEvent: (event: HarnessEvent) => void;
@@ -103,6 +95,7 @@ type Live = {
 type Resume = {
   threadId: string;
   cwd: string;
+  providerAccountId?: string;
 };
 
 const liveByThread = new Map<string, Live>();
@@ -309,34 +302,42 @@ export function bindCodexSession(
   threadId: string,
   providerSessionId: string,
   cwd: string,
+  providerAccountId?: string,
 ): void {
   const providerThreadId = providerSessionId.trim();
   if (!threadId || !providerThreadId || !cwd.trim()) return;
-  resumeByThread.set(threadId, { threadId: providerThreadId, cwd });
+  resumeByThread.set(threadId, {
+    threadId: providerThreadId,
+    cwd,
+    providerAccountId,
+  });
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
-  await ensureAccountsLoaded();
-  const accountId = accountIdFor("codex", input.modelSettings);
   const existing = liveByThread.get(input.sessionId);
   if (
     existing &&
     existing.cwd === input.cwd &&
-    existing.accountId === accountId
+    existing.providerAccountId === input.providerAccountId
   ) {
     existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
-    // A cwd change invalidates the thread. An account change must keep it
-    // so the same conversation resumes under the new login.
-    if (existing.cwd !== input.cwd) resumeByThread.delete(input.sessionId);
+    resumeByThread.delete(input.sessionId);
     await stopCodexSession(input.sessionId);
   }
 
   const resume = resumeByThread.get(input.sessionId);
-  const canResume = resume != null && resume.cwd === input.cwd;
-  if (resume && resume.cwd !== input.cwd) {
+  const canResume =
+    resume != null &&
+    resume.cwd === input.cwd &&
+    resume.providerAccountId === input.providerAccountId;
+  if (
+    resume &&
+    (resume.cwd !== input.cwd ||
+      resume.providerAccountId !== input.providerAccountId)
+  ) {
     resumeByThread.delete(input.sessionId);
   }
 
@@ -399,14 +400,10 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
   );
 
-  await spawnChild(
-    input.sessionId,
-    path,
-    ["app-server"],
-    input.cwd,
-    accountEnv(accountFor("codex", input.modelSettings)),
-    accountRef(accountFor("codex", input.modelSettings)),
-  );
+  await spawnChild(input.sessionId, path, ["app-server"], input.cwd, {
+    provider: "codex",
+    id: input.providerAccountId ?? "default",
+  });
 
   try {
     await rpc.request("initialize", {
@@ -476,7 +473,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       rpc,
       threadId,
       cwd: input.cwd,
-      accountId,
+      providerAccountId: input.providerAccountId,
       runtimeMode: input.runtimeMode,
       planning: input.intent === "plan",
       onEvent: input.onEvent,
@@ -502,6 +499,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     resumeByThread.set(input.sessionId, {
       threadId,
       cwd: input.cwd,
+      providerAccountId: input.providerAccountId,
     });
     live.onEvent({
       type: "session.providerBound",

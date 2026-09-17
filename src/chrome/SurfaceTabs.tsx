@@ -243,12 +243,12 @@ export function SurfaceTabs({
   }, [activeFileId, sortable.draggingId]);
 
   return (
-    <div className="flex h-9 min-w-0 shrink-0 border-b border-content/10 bg-content/2">
+    <div className="flex h-9 min-w-0 shrink-0 border-b border-stroke">
       <div
         ref={lockOverscroll}
         role="tablist"
         aria-label={label}
-        className="scrollbar-none flex min-w-0 flex-1 overflow-x-auto overscroll-none"
+        className="scrollbar-none flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto overscroll-none pl-1.5 pr-2.5"
       >
       {onPaneDragStart ? (
         <div
@@ -256,7 +256,7 @@ export function SurfaceTabs({
           title="Drag to reorder pane"
           aria-label="Drag to reorder pane"
           tabIndex={-1}
-          className="grid h-full w-5 shrink-0 cursor-grab place-items-center text-content/35 hover:bg-content/5 hover:text-content/70 active:cursor-grabbing touch-none"
+          className="grid h-7.5 w-5 shrink-0 cursor-grab place-items-center rounded-md text-content/35 hover:bg-content/5 hover:text-content/70 active:cursor-grabbing touch-none"
           onPointerDown={(event) => {
             if (event.button !== 0) return;
             event.preventDefault();
@@ -284,9 +284,7 @@ export function SurfaceTabs({
               sortable.setItemRef(file.id, el);
               if (el && file.id === activeFileId) activeTabRef.current = el;
             }}
-            className={`reorder-item tab-motion group relative flex w-52 min-w-28 shrink touch-none items-stretch border-r border-content/10 ${
-              active ? "bg-content/8" : "hover:bg-content/5"
-            } ${
+            className={`reorder-item tab-motion group relative flex h-full w-56 min-w-28 shrink touch-none items-center ${
               canDrag ? "cursor-grab active:cursor-grabbing" : ""
             }`}
             onMouseDownCapture={(event) => {
@@ -328,10 +326,12 @@ export function SurfaceTabs({
                 if (sortable.consumeClick()) return;
                 onSelectFile(file.id);
               }}
-              className={`flex min-w-0 flex-1 items-center gap-1.5 px-3 pr-8 text-left text-[12px] ${
-                canDrag ? "cursor-grab active:cursor-grabbing" : ""
+              className={`relative flex h-7.5 min-w-0 flex-1 items-center gap-1.5 self-center rounded-md px-2 pr-7 text-left text-[13px] ${
+                canDrag ? "cursor-grab active:cursor-grabbing" : "cursor-default"
               } ${
-                active ? "text-content" : "text-content/55 hover:text-content"
+                active
+                  ? "bg-selection text-content"
+                  : "text-content/50 hover:bg-content/5 hover:text-content"
               }`}
             >
               {terminal ? (
@@ -344,7 +344,7 @@ export function SurfaceTabs({
               ) : changes || commit ? (
                 <GitCompare className="size-3.5 shrink-0" strokeWidth={1.75} />
               ) : (
-                <FileTypeIcon name={iconName} isDir={false} size={15} />
+                <FileTypeIcon name={iconName} isDir={false} size={14} />
               )}
               <span
                 className={`min-w-0 flex-1 truncate ${review ? "italic" : ""} ${
@@ -359,7 +359,7 @@ export function SurfaceTabs({
               </span>
               {dirty ? (
                 <span
-                  className="size-1.5 shrink-0 rounded-full bg-content/75"
+                  className="size-1.5 shrink-0 rounded-full bg-content/70"
                   title="Unsaved changes"
                   aria-label="Unsaved changes"
                 />
@@ -375,7 +375,7 @@ export function SurfaceTabs({
                 event.stopPropagation();
                 onCloseFile(file.id);
               }}
-              className={`absolute right-1.5 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded text-content/50 hover:bg-content/10 hover:text-content ${
+              className={`absolute right-1 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded text-content/50 hover:bg-content/10 hover:text-content ${
                 active ? "opacity-100" : "opacity-0 group-hover:opacity-100"
               }`}
             >

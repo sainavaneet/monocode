@@ -3,7 +3,6 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { GeneratedSessionTitle } from "../sessionTitle";
 import type { PrContent } from "../gitText";
 import { hasLiveCatalog } from "../models";
-import { sendTurnWithFailover } from "../accounts/failover";
 import type { UserQuestionReply } from "../userQuestion";
 import type { NativeCommandProvider } from "./nativeCommands";
 import type {
@@ -17,6 +16,7 @@ export type TitleInput = {
   sessionId: string;
   cwd: string;
   message: string;
+  providerAccountId?: string;
 };
 
 /**
@@ -52,7 +52,12 @@ export type HarnessAdapter = {
   /** Drop resume state and kill the child (delete, harness switch, idle detach). */
   forgetSession(sessionId: string): Promise<void>;
   /** Seed resume state from a restored MonoCode session. */
-  bindSession(threadId: string, providerSessionId: string, cwd: string): void;
+  bindSession(
+    threadId: string,
+    providerSessionId: string,
+    cwd: string,
+    providerAccountId?: string,
+  ): void;
   /** Refresh the model catalog overlay when supported. */
   refreshCatalog?(): Promise<void>;
   /** Optional LLM tab title for the first turn. */
@@ -140,7 +145,7 @@ export async function sendHarnessTurn(
       cwd: input.cwd,
     });
   try {
-    await sendTurnWithFailover(input, (attempt) => adapter.sendTurn(attempt));
+    await adapter.sendTurn(input);
   } finally {
     if (controlled)
       await invoke("control_turn_finished", { sessionId: input.sessionId });
@@ -250,8 +255,14 @@ export function bindHarnessSession(
   threadId: string,
   providerSessionId: string,
   cwd: string,
+  providerAccountId?: string,
 ): void {
-  getHarness(harness)?.bindSession(threadId, providerSessionId, cwd);
+  getHarness(harness)?.bindSession(
+    threadId,
+    providerSessionId,
+    cwd,
+    providerAccountId,
+  );
 }
 
 /**
