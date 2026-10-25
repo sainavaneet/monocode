@@ -10,10 +10,14 @@ workspace switches to that project. Same feel as the Cmd+P file search.
 
 ## Behaviour
 
-- **Chord.** Ctrl+P on macOS. Alt+P on Linux and Windows, because Ctrl+P is
-  already Go to File there. The action is named `SwitchProject`, appears in
-  Settings → Keybindings as "App: Switch Project", and can be rebound through
-  the existing keymap override path. Cmd+Shift+P stays the command palette.
+- **Chord.** Cmd+Shift+P on macOS, Ctrl+Shift+P on Linux and Windows. The
+  action is named `SwitchProject`, appears in Settings → Keybindings as
+  "App: Switch Project", and can be rebound through the existing keymap
+  override path.
+- **Command palette.** It gives up Cmd+Shift+P. Its new default is
+  Cmd+Option+P (Ctrl+Alt+P elsewhere), which is unused today, so it keeps a
+  default chord and stays rebindable. It also remains reachable by typing `>`
+  in the Cmd+P popup, and the Settings label "App: Command Palette" is unchanged.
 - **Opening.** The chord opens the Quick Open popup in project mode: the search
   field contains `@`, the placeholder reads "Switch project…". Typing `@` as the
   first character in the Cmd+P popup enters the same mode, matching the `>`
@@ -55,9 +59,10 @@ All in `crates/monocode-gpui/src`.
   - Map `Picked::Project` to `select_project`, and `Command::SwitchProject` to
     the new action.
 - `shell.rs`
-  - Add `SwitchProject` to the `workspace` actions, bind `ctrl-p` on macOS and
-    `alt-p` elsewhere in the Workspace context, and dispatch it to
+  - Add `SwitchProject` to the `workspace` actions, bind `cmd-shift-p`
+    (`ctrl-shift-p` elsewhere) in the Workspace context, and dispatch it to
     `open_quick_open(Mode::Projects)`.
+  - Rebind `OpenCommandPalette` to `cmd-alt-p` (`ctrl-alt-p` elsewhere).
 - `settings/keymap.rs`
   - Map `workspace::SwitchProject` to "App: Switch Project".
 
@@ -75,7 +80,8 @@ file listing.
 - Shell tests, next to the existing Quick Open test: the action opens the popup
   in project mode; picking a row changes `workspace.project`; Escape restores
   focus to the composer and keeps its draft.
-- Keymap test: the new label resolves and an override chord round-trips.
+- Keymap test: the new label resolves, an override chord round-trips, and the
+  palette's moved default still maps to "App: Command Palette".
 
 ## Out of scope
 
