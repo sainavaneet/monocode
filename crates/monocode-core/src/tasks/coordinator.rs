@@ -293,7 +293,9 @@ impl<P: Policy> Coordinator<P> {
                 break;
             }
             // Two agents never work one workspace.
-            if self.held_by_stop(&tasks, &task.id, &assignment.id, now, tick)? {
+            if self.held_by_stop(&tasks, &task.id, &assignment.id, now, tick)?
+                || super::guard::workspace_owner(tasks.conn, &task.id, &assignment.id)?.is_some()
+            {
                 continue;
             }
             // A question holds what its scope covers; the rest continues.
@@ -350,3 +352,7 @@ pub(super) fn in_flight(attempt: &Attempt) -> bool {
 #[cfg(test)]
 #[path = "coordinator_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "scheduling_tests.rs"]
+mod scheduling_tests;

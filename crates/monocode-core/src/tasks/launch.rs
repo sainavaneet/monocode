@@ -78,6 +78,11 @@ impl<P: Policy> Coordinator<P> {
             }
             Err(PrepareError::Storage(error)) => return Err(error),
         };
+        // A worktree another live attempt owns is not shared (the record
+        // may only now exist, so this is checked after preparing too).
+        if super::guard::workspace_owner(tasks.conn, &task.id, &assignment.id)?.is_some() {
+            return Ok(None);
+        }
         let attempt = match latest_attempt(&tasks, &task.id, &assignment.id)? {
             Some(attempt) if in_flight(&attempt) => attempt,
             _ => {

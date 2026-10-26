@@ -155,6 +155,80 @@ pub fn create_task_with(
     Ok(task)
 }
 
+/// Acceptance criteria for a reviewed plan started without explicit ones:
+/// each assignment's checks, run on the task's result (the integrated one
+/// when several worktrees hold the work). Assignments without checks add
+/// none; a task left without criteria goes to Mono at verification.
+pub fn plan_criteria(plan: &crate::orchestration::Plan) -> Vec<super::AcceptanceCriterion> {
+    plan.tasks
+        .iter()
+        .filter(|a| !a.verification.is_empty())
+        .map(|a| super::AcceptanceCriterion {
+            id: format!("plan-{}", a.id),
+            description: format!("The checks of \"{}\" pass on the task's result.", a.title),
+            required: true,
+            checks: a.verification.clone(),
+        })
+        .collect()
+}
+
+/// Creates a task from a reviewed plan and starts it as `requester` (the
+/// user's Start on a plan card is an explicit start): the policy snapshot
+/// is taken at creation, the plan saved, and the stage moved Planning →
+/// Ready → Implementing. The coordinator then schedules it. An invalid plan
+/// creates nothing.
+pub fn start_plan(
+    store: &Store,
+    new: &NewTask,
+    plan: &crate::orchestration::Plan,
+    provider: &str,
+    requester: super::Requester,
+    now: u64,
+) -> Result<Task, TaskError> {
+    crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
+    let task = create_task(store, new, provider, now)?;
+    let tasks = store.tasks()?;
+    tasks.save_plan(&task.id, task.revision, plan, now)?;
+    let subject = super::Subject::Task(&task.id);
+    for stage in [super::TaskStage::Ready, super::TaskStage::Implementing] {
+        let revision = tasks.revision(subject)?;
+        tasks.transition(
+            subject,
+            super::State::Stage(stage),
+            requester,
+            revision,
+            now,
+        )?;
+    }
+    tasks
+        .task(&task.id)?
+        .ok_or_else(|| TaskError::NotFound(format!("task:{}", task.id)))
+}
+
+/// The id prefix of tasks started from the plan card of session `lead`.
+pub fn plan_task_prefix(lead: i64) -> String {
+    format!("plan-{lead}-")
+}
+
+/// Unfinished tasks started from `lead`'s plan card, oldest first.
+pub fn started_plans(store: &Store, lead: i64) -> Result<Vec<Task>, TaskError> {
+    let Some(tasks) = store.existing_tasks()? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = tasks.conn.prepare(
+        "SELECT id FROM native_tasks WHERE substr(id,1,length(?1))=?1
+           AND lifecycle NOT IN ('cancelled','completed') ORDER BY rowid",
+    )?;
+    let ids = statement
+        .query_map([plan_task_prefix(lead)], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut started = Vec::new();
+    for id in ids {
+        started.extend(tasks.task(&id)?);
+    }
+    Ok(started)
+}
+
 /// The live allowlist for the task: the Mono's, else the project's, else
 /// only the account the task started on.
 pub fn allowlist(store: &Store, task: &Task, policy: &TaskPolicy) -> Result<Allowlist, TaskError> {

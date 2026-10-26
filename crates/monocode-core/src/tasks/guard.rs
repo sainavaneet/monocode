@@ -1,7 +1,8 @@
 //! The one rule every launch path follows: two agents never work one
 //! workspace. Nothing launches for an assignment while an earlier worker of
 //! it, or of another assignment of the task sharing its workspace, has a
-//! stop the app has not confirmed (a stop is confirmed only once the
+//! stop the app has not confirmed, nor while another live attempt (of any
+//! task) works in the same recorded worktree (a stop is confirmed only once the
 //! session's turn has ended in every window). A stop that stays unconfirmed
 //! past [`STOP_STALL_MS`] is reported once to Mono.
 //!
@@ -55,6 +56,30 @@ pub(super) fn pending_stop(
              ORDER BY d.rowid LIMIT 1",
             params![task, assignment, WORKER_STOP],
             |row| Ok((row.get::<_, String>(0)?, read_ms(row, 1)?)),
+        )
+        .optional()?)
+}
+
+/// Another live attempt (of any task) whose recorded worktree is the one
+/// recorded for `assignment`: one mutable workspace is never owned by two
+/// live attempts. Returns that attempt. Checkout records are read-only
+/// investigations and are not owned.
+pub(super) fn workspace_owner(
+    conn: &Connection,
+    task: &str,
+    assignment: &str,
+) -> Result<Option<String>, TaskError> {
+    Ok(conn
+        .query_row(
+            "SELECT t.id FROM native_task_workspaces mine
+               JOIN native_task_workspaces o ON o.path=mine.path AND o.mode='worktree'
+                 AND NOT (o.task_id=mine.task_id AND o.assignment_id=mine.assignment_id)
+               JOIN native_task_attempts t ON t.task_id=o.task_id AND t.assignment_id=o.assignment_id
+             WHERE mine.task_id=?1 AND mine.assignment_id=?2 AND mine.mode='worktree'
+               AND t.status IN ('created','starting','running','waiting')
+             ORDER BY t.rowid LIMIT 1",
+            params![task, assignment],
+            |row| row.get(0),
         )
         .optional()?)
 }

@@ -155,6 +155,12 @@ fn requesters_follow_the_behaviour_rules() {
         State::Assignment(A::Running),
         Requester::Mono
     ));
+    // The user's Start on a reviewed plan starts it explicitly.
+    assert!(allowed(
+        State::Stage(TaskStage::Ready),
+        State::Stage(TaskStage::Implementing),
+        Requester::User
+    ));
 }
 
 #[test]

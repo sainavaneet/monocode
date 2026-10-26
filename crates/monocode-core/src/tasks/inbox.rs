@@ -414,8 +414,14 @@ fn context(
 }
 
 fn question(tasks: &TaskStore<'_>, decision: &DecisionRequest) -> Result<String, TaskError> {
+    // The coordinator asks only when integrating the task's work needs
+    // judgement or authority it does not have.
+    let asker = match decision.asked_by {
+        super::Requester::Coordinator => "Integration question",
+        _ => "Worker question",
+    };
     let mut text = format!(
-        "Worker question, decision {} (revision {}, scope {}).\n{}\nQuestion: {}",
+        "{asker}, decision {} (revision {}, scope {}).\n{}\nQuestion: {}",
         decision.id,
         decision.revision,
         decision.scope.as_str(),

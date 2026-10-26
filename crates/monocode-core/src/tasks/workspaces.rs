@@ -178,7 +178,11 @@ pub fn prepare(
 /// Creates it from `base`, or adopts what an earlier run left behind (the
 /// branch name is ours alone): a worktree on the branch, or the branch alone,
 /// which is then checked out in a new worktree with its commits kept.
-fn worktree(project: &Path, branch: &str, base: &str) -> Result<(String, String), String> {
+pub(super) fn worktree(
+    project: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(String, String), String> {
     let forked = |tip: &str| {
         git(project, &["merge-base", tip, base])
             .map(|s| s.trim().to_owned())

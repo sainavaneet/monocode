@@ -279,7 +279,8 @@ pub static TRANSITIONS: &[Transition] = &[
     // Task stage.
     rule!(Stage [Planning] -> Ready, [M, U], [], "stage", "task.ready", Eligible, Resume),
     rule!(Stage [Ready] -> Planning, [U, M], [], "stage", "task.replanning", Ineligible, Resume),
-    rule!(Stage [Ready] -> Implementing, [C, M], [TaskActive], "stage", "task.implementing", Eligible, Resume),
+    // The user's Start on a reviewed plan is an explicit start.
+    rule!(Stage [Ready] -> Implementing, [C, M, U], [TaskActive], "stage", "task.implementing", Eligible, Resume),
     rule!(Stage [Implementing] -> Reviewing, [C, M], [TaskActive], "stage", "task.reviewing", Unchanged, Resume),
     rule!(Stage [Reviewing, Integrating, Verifying] -> Implementing, [C, M], [], "stage", "task.sent_back", Eligible, Resume),
     rule!(Stage [Reviewing] -> Integrating, [C, M], [TaskActive, AssignmentsAccepted], "stage", "task.integrating", Unchanged, Resume),
@@ -417,7 +418,10 @@ impl TaskStore<'_> {
 
     /// Returns a Blocked task to Active for `requester`, in one transaction
     /// through the table (which clears the blocked reason). A task that is
-    /// not Blocked is refused. Returns the task's new revision.
+    /// not Blocked is refused, and so is one whose recorded worktrees are
+    /// missing or moved (checked as resume checks them), so it is not
+    /// unblocked into a launch that cannot start. Returns the task's new
+    /// revision.
     pub fn unblock(
         &self,
         task_id: &str,
@@ -425,6 +429,24 @@ impl TaskStore<'_> {
         requester: Requester,
         now: u64,
     ) -> Result<u64, TaskError> {
+        if let Some(task) = self.task(task_id)? {
+            let problems = super::workspace_check::verify(self, &task)?;
+            if !problems.is_empty() {
+                let lines: Vec<String> = problems
+                    .iter()
+                    .map(|(w, why)| {
+                        format!(
+                            "assignment {}: {why}",
+                            w.assignment_id.as_deref().unwrap_or("integration")
+                        )
+                    })
+                    .collect();
+                return Err(TaskError::Invalid(format!(
+                    "Task {task_id} stays blocked: a recorded workspace is missing or moved ({}). Restore the worktree, or decide with Mono how to continue.",
+                    lines.join("; ")
+                )));
+            }
+        }
         let tx = self.begin()?;
         let subject = Subject::Task(task_id);
         let lifecycle = self.state(subject, State::Lifecycle(TaskLifecycle::Active))?;

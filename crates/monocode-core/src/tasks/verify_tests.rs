@@ -174,7 +174,7 @@ fn a_round_waiting_for_mono_runs_again_when_its_evidence_goes_stale() {
 }
 
 #[test]
-fn several_worktrees_wait_for_integration() {
+fn several_worktrees_wait_at_integrating_for_integration_not_mono() {
     let store = memory();
     let tasks = store.tasks().unwrap();
     tasks.create_task(&new_task("t"), 1).unwrap();
@@ -206,14 +206,12 @@ fn several_worktrees_wait_for_integration() {
     }
     let coordinator = Coordinator::new("gpui-1", ExplicitStart);
     assert!(coordinator.verify(&store, 10).unwrap().is_empty());
+    // Integration (task-11) merges them; Mono is not asked to.
     assert_eq!(task(&store).stage, TaskStage::Integrating);
-    let waiting = tasks.pending_deliveries(MONO_REVIEW).unwrap();
-    assert_eq!(waiting.len(), 1);
-    let needs = events(&store, "task.needs_integration");
-    assert!(needs[0].payload.to_string().contains("integrated result"));
-    // Repeated passes queue it once.
     coordinator.verify(&store, 11).unwrap();
-    assert_eq!(tasks.pending_deliveries(MONO_REVIEW).unwrap().len(), 1);
+    assert_eq!(task(&store).stage, TaskStage::Integrating);
+    assert!(tasks.pending_deliveries(MONO_REVIEW).unwrap().is_empty());
+    assert!(events(&store, "task.needs_integration").is_empty());
 }
 
 fn verification_rows(store: &Store) -> usize {

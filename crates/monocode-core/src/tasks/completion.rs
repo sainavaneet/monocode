@@ -49,8 +49,11 @@ pub(super) fn evidence(workspace: &Workspace, run: &CheckRun) -> String {
 }
 
 /// Sending work back makes the verifications of what is being redone stop
-/// counting: an assignment's own when it returns to Queued, every one of the
-/// task's when its stage returns to Implementing.
+/// counting: an assignment's own when it returns to Queued, and the task's
+/// criterion verifications when its stage returns to Implementing (the
+/// task's result will change). An untouched assignment keeps its own checks:
+/// `refresh_verifications` still invalidates them once its worktree
+/// changes.
 pub(super) fn invalidate_on_send_back(
     conn: &Connection,
     task: &str,
@@ -69,7 +72,8 @@ pub(super) fn invalidate_on_send_back(
         }
         (State::Stage(Reviewing | Integrating | Verifying), State::Stage(Implementing)) => {
             conn.execute(
-                "UPDATE native_task_verifications SET invalidated=1 WHERE task_id=?1 AND invalidated=0",
+                "UPDATE native_task_verifications SET invalidated=1
+                 WHERE task_id=?1 AND criterion_id IS NOT NULL AND invalidated=0",
                 [task],
             )?;
         }
@@ -325,6 +329,10 @@ pub struct FinalReport {
     pub assignments: Vec<AssignmentReport>,
     pub criteria: Vec<CriterionReport>,
     pub generated_at: u64,
+    /// The task's final integration record, when several worktrees were
+    /// integrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<serde_json::Value>,
 }
 
 fn branch_facts(workspace: &Workspace, report: &mut AssignmentReport) {
@@ -426,6 +434,7 @@ pub fn final_report(store: &Store, task_id: &str, now: u64) -> Result<FinalRepor
         assignments,
         criteria,
         generated_at: now,
+        integration: tasks.integration(task_id)?,
     })
 }
 

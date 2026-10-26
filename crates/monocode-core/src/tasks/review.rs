@@ -58,6 +58,9 @@ pub struct ReviewJob {
     /// The task may not commit now (its effective policy says so), so any
     /// commit in the worktree is sent back.
     commits_refused: bool,
+    /// The integration commit the previous review asked the worker to
+    /// rebase onto; once the worktree descends from it, it is the base.
+    rebase_onto: Option<String>,
 }
 
 /// What inspecting the workspace found; no store access.
@@ -69,6 +72,8 @@ pub struct Inspection {
     batch: Batch,
     /// Git could not inspect the workspace; the review is retried.
     error: Option<String>,
+    /// The worktree was rebased onto this integration commit, now its base.
+    rebased_onto: Option<String>,
 }
 
 /// A fingerprint of what the worker was asked to do, recorded with its
@@ -159,6 +164,14 @@ impl ReviewJob {
             });
             return found;
         };
+        // A worker sent back to rebase onto the integration branch is
+        // scoped against what it rebased onto, not its original base.
+        let rebased = self.rebase_onto.as_deref().filter(|onto| {
+            let path = Path::new(&workspace.path);
+            crate::git::git(path, &["merge-base", "--is-ancestor", onto, "HEAD"]).is_ok()
+        });
+        found.rebased_onto = rebased.map(str::to_owned);
+        let base = rebased.unwrap_or(base);
         let refs = ["attempts", &self.assignment.id, &self.attempt.id];
         let before_ref = task_ref(&self.task.id, &[&refs[..], &["before"]].concat());
         let checkpoint = match checkpoint::snapshot_workspace(&workspace.path, &before_ref)
@@ -380,8 +393,11 @@ impl<P: Policy> Coordinator<P> {
                 Err(TaskError::Invalid(_)) => true,
                 Err(error) => return Err(error),
             };
+            let rebase_onto =
+                super::integration::rebase_onto(tasks.reviews(&task.id, &assignment.id)?.last());
             jobs.push(ReviewJob {
                 commits_refused,
+                rebase_onto,
                 superseded: superseded(&tasks, &task, &assignment, &attempt, claim.as_ref())?,
                 stale: stale(&tasks, &attempt, &assignment)?,
                 exhausted,
@@ -461,6 +477,9 @@ impl<P: Policy> Coordinator<P> {
         if let Some(to) = to {
             let (from, coordinator) = (job.assignment.revision, Requester::Coordinator);
             apply(&tx, subject, State::Assignment(to), coordinator, from, now)?;
+        }
+        if let (Some(onto), Some(workspace)) = (&inspection.rebased_onto, &job.workspace) {
+            super::integration::rebased(&tx, workspace, onto, now)?;
         }
         let verifications = record_checks(&tasks, job, &inspection, now)?;
         let review = Review {

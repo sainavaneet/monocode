@@ -4,8 +4,10 @@
 //! moves the stage Implementing → Reviewing → Integrating → Verifying on its
 //! own authority. The criteria are checked on the task's result: the one
 //! worktree when exactly one assignment has a worktree. With several, the
-//! result is their integration (task-11), so the task waits for Mono at
-//! Integrating; with none, Mono verifies.
+//! result is their integration (`integration`, which moves the stage on to
+//! Verifying once they merge cleanly): the integration worktree, where a
+//! failing criterion cannot be pinned on one assignment, so Mono decides
+//! what goes back. With none, Mono verifies.
 //!
 //! A verification round runs every check of each required criterion that no
 //! live passing verification satisfies yet, in that worktree, between two
@@ -37,7 +39,7 @@ const WAITING: &str = "task.verification_waiting";
 const FAILED: &str = "task.verification_failed";
 const NO_CRITERIA: &str = "The task has no required acceptance criterion, so nothing mechanical can verify it; Mono decides.";
 const NO_RESULT: &str = "No assignment produced a worktree whose result can be checked, so Mono verifies the acceptance criteria.";
-const SEVERAL: &str = "Several worktrees hold the task's work; the acceptance criteria are checked on their integrated result, which integration produces.";
+const COMBINED: &str = "The acceptance criteria failed on the integrated result of several assignments, so no single assignment is sent back automatically; Mono decides which work goes back.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoundOutcome {
@@ -64,8 +66,9 @@ pub struct Round {
 /// A task in Verifying with the criteria still to check.
 pub struct VerifyJob {
     task: Task,
-    /// The assignment whose worktree is the task's result.
-    assignment: Assignment,
+    /// The assignment whose worktree is the task's result; None for the
+    /// integrated result of several.
+    assignment: Option<Assignment>,
     workspace: Workspace,
     /// Required criteria with checks and no live passing verification.
     pending: Vec<AcceptanceCriterion>,
@@ -183,7 +186,7 @@ impl<P: Policy> Coordinator<P> {
         tasks: &TaskStore<'_>,
         id: &str,
         now: u64,
-    ) -> Result<Option<(Task, Assignment, Workspace)>, TaskError> {
+    ) -> Result<Option<(Task, Option<Assignment>, Workspace)>, TaskError> {
         let reload = || {
             tasks
                 .task(id)?
@@ -222,14 +225,13 @@ impl<P: Policy> Coordinator<P> {
             }
         }
         if task.stage == TaskStage::Integrating {
-            if results.len() != 1 {
-                let reason = if results.is_empty() {
-                    NO_RESULT
-                } else {
-                    SEVERAL
-                };
+            // Several worktrees: integration merges them and moves on.
+            if results.len() > 1 {
+                return Ok(None);
+            }
+            if results.is_empty() {
                 let waiting = [Finding::NotChecked {
-                    reason: reason.into(),
+                    reason: NO_RESULT.into(),
                 }];
                 let key = format!("integrate:{id}@{}", task.revision);
                 hand_to_mono(tasks, id, &key, NEEDS_INTEGRATION, &waiting, now)?;
@@ -246,11 +248,17 @@ impl<P: Policy> Coordinator<P> {
             )?;
             task = reload()?;
         }
-        if task.stage != TaskStage::Verifying || results.len() != 1 {
+        if task.stage != TaskStage::Verifying || results.is_empty() {
             return Ok(None);
         }
+        if results.len() > 1 {
+            let integrated = workspaces
+                .into_iter()
+                .find(|w| w.id == super::integration::workspace_id(id));
+            return Ok(integrated.map(|w| (task, None, w)));
+        }
         let (assignment, workspace) = results.into_iter().next().expect("one result");
-        Ok(Some((task, assignment, workspace)))
+        Ok(Some((task, Some(assignment), workspace)))
     }
 
     /// Advances tasks whose work is accepted and returns the verification
@@ -325,11 +333,14 @@ impl<P: Policy> Coordinator<P> {
                 pending.push(criterion.clone());
             }
         }
-        let corrections = tasks
-            .reviews(id, &assignment.id)?
-            .iter()
-            .filter(|r| r.outcome == ReviewOutcome::Correction)
-            .count();
+        let corrections = match &assignment {
+            Some(assignment) => tasks
+                .reviews(id, &assignment.id)?
+                .iter()
+                .filter(|r| r.outcome == ReviewOutcome::Correction)
+                .count(),
+            None => 0,
+        };
         Ok(Some(VerifyJob {
             task,
             assignment,
@@ -390,10 +401,16 @@ impl<P: Policy> Coordinator<P> {
         }
         let mut findings = round_findings(job, &inspection);
         let corrective = findings.iter().any(Finding::is_corrective);
-        if corrective && job.corrections < MAX_CORRECTIONS {
-            return send_back(&tasks, job, &inspection, findings, now).map(Some);
+        if let Some(assignment) = job.assignment.as_ref().filter(|_| corrective) {
+            if job.corrections < MAX_CORRECTIONS {
+                return send_back(&tasks, job, assignment, &inspection, findings, now).map(Some);
+            }
         }
-        if corrective {
+        if corrective && job.assignment.is_none() {
+            findings.push(Finding::NotChecked {
+                reason: COMBINED.into(),
+            });
+        } else if corrective {
             findings.push(Finding::CorrectionLimit {
                 corrections: job.corrections,
             });
@@ -540,7 +557,7 @@ fn record_criteria(
         tasks.record_verification(&Verification {
             id: id.clone(),
             task_id: job.task.id.clone(),
-            assignment_id: Some(job.assignment.id.clone()),
+            assignment_id: job.assignment.as_ref().map(|a| a.id.clone()),
             criterion_id: Some(criterion.clone()),
             checkpoint_commit: checkpoint.clone(),
             check: run.check.clone(),
@@ -561,6 +578,7 @@ fn record_criteria(
 fn send_back(
     tasks: &TaskStore<'_>,
     job: &VerifyJob,
+    responsible: &Assignment,
     inspection: &RoundInspection,
     findings: Vec<Finding>,
     now: u64,
@@ -568,7 +586,7 @@ fn send_back(
     let tx = tasks.begin()?;
     let assignment = Subject::Assignment {
         task: &job.task.id,
-        id: &job.assignment.id,
+        id: &responsible.id,
     };
     let queued = State::Assignment(AssignmentState::Queued);
     let coordinator = Requester::Coordinator;
@@ -591,10 +609,10 @@ fn send_back(
         now,
     )?;
     let verifications = record_criteria(tasks, job, inspection, now)?;
-    let attempt = tasks.attempts(&job.task.id, &job.assignment.id)?.pop();
+    let attempt = tasks.attempts(&job.task.id, &responsible.id)?.pop();
     let review = Review {
         attempt_id: attempt.as_ref().map(|a| a.id.clone()).unwrap_or_default(),
-        assignment_id: job.assignment.id.clone(),
+        assignment_id: responsible.id.clone(),
         outcome: ReviewOutcome::Correction,
         checkpoint: inspection.checkpoint.clone(),
         changed_files: inspection.batch.modified.clone(),
@@ -604,7 +622,7 @@ fn send_back(
     let event = NewEvent {
         id: format!("verified:{}@{}", job.task.id, job.round),
         task_id: job.task.id.clone(),
-        assignment_id: Some(job.assignment.id.clone()),
+        assignment_id: Some(responsible.id.clone()),
         attempt_id: attempt.map(|a| a.id),
         kind: REVIEWED.into(),
         payload: serde_json::to_value(&review)?,

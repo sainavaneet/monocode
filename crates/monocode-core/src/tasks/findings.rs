@@ -77,6 +77,17 @@ pub enum Finding {
     UnauthorizedCommits {
         commits: Vec<String>,
     },
+    /// Merging the branch onto the task's integration branch conflicted.
+    IntegrationConflict {
+        branch: String,
+        onto: String,
+        files: Vec<String>,
+    },
+    /// The worktree holds changes no commit has, so integration cannot
+    /// merge them.
+    UncommittedWork {
+        files: Vec<String>,
+    },
 }
 
 fn check_failure(check: &str, exit_code: Option<i32>, timed_out: bool, output: &str) -> String {
@@ -104,6 +115,8 @@ impl Finding {
                 | Self::CriterionNotMet { .. }
                 | Self::ModifiedByCheck { .. }
                 | Self::UnauthorizedCommits { .. }
+                | Self::IntegrationConflict { .. }
+                | Self::UncommittedWork { .. }
         )
     }
 
@@ -164,6 +177,18 @@ impl Finding {
             Self::UnauthorizedCommits { commits } => format!(
                 "Commits made without commit authority: {}. The Mono's policy no longer allows this task to commit: undo them (keep the changes uncommitted, for example with git reset --soft to the base commit) and report again.",
                 commits.join(", ")
+            ),
+            Self::IntegrationConflict {
+                branch,
+                onto,
+                files,
+            } => format!(
+                "Merging your branch onto the task's integration branch {branch} (at {onto}) conflicted in {}. Rebase your branch onto it (git rebase {branch}), resolve the conflicts keeping the intent of both changes, make sure the checks pass, commit, and report again.",
+                files.join(", ")
+            ),
+            Self::UncommittedWork { files } => format!(
+                "Your worktree has uncommitted changes ({}); integration merges committed work only. Commit them on your branch and report again.",
+                files.join(", ")
             ),
         }
     }
