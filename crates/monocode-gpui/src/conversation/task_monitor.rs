@@ -173,7 +173,7 @@ fn kind_color(kind: TimelineKind) -> gpui::Hsla {
         TimelineKind::Failure => tint(RED_400, 0.85),
         TimelineKind::Verification => tint(DIFF_ADD, 0.85),
         TimelineKind::Decision => tint(AMBER_400, 0.85),
-        TimelineKind::Launch | TimelineKind::Correction => content(0.6),
+        TimelineKind::Launch | TimelineKind::Correction | TimelineKind::Integration => content(0.6),
     }
 }
 

@@ -7,6 +7,7 @@
 use super::events::Event;
 use super::findings::ReviewOutcome;
 use super::handoff::redact;
+use super::integration::Outcome;
 use std::collections::HashMap;
 
 /// Entries kept per task, newest first.
@@ -48,6 +49,10 @@ pub const KINDS: &[&str] = &[
     "task.verification_failed",
     "verification.invalidated",
     "task.completed",
+    "task.integrating",
+    "task.integration",
+    "task.needs_integration",
+    "workspace.owned_notice",
 ];
 /// The longest reason an entry shows.
 const REASON_LIMIT: usize = 160;
@@ -60,6 +65,7 @@ pub enum TimelineKind {
     Failure,
     Correction,
     Verification,
+    Integration,
 }
 
 impl TimelineKind {
@@ -70,6 +76,7 @@ impl TimelineKind {
             Self::Failure => "Failure",
             Self::Correction => "Correction",
             Self::Verification => "Verification",
+            Self::Integration => "Integration",
         }
     }
 }
@@ -244,6 +251,13 @@ pub fn entry(event: &Event, names: &Names) -> Option<TimelineEntry> {
             "A verification no longer matches the workspace".to_owned(),
         ),
         "task.completed" => (Verification, "The task is complete".to_owned()),
+        "task.integrating" => (Integration, "Integration started".to_owned()),
+        "task.integration" => (Integration, integration_text(event)?),
+        "task.needs_integration" => (Decision, "Integration needs Mono's judgement".to_owned()),
+        "workspace.owned_notice" => (
+            Launch,
+            format!("{who} waits for its worktree, which another attempt still uses"),
+        ),
         _ => return None,
     };
     Some(TimelineEntry {
@@ -252,6 +266,34 @@ pub fn entry(event: &Event, names: &Names) -> Option<TimelineEntry> {
         kind,
         assignment_id: event.assignment_id.clone(),
         text,
+    })
+}
+
+/// What one integration pass ended in: counts and ids only, never a path
+/// or the text of a Git error.
+fn integration_text(event: &Event) -> Option<String> {
+    let merged = event.payload["merges"].as_array().map_or(0, Vec::len);
+    let outcome: Outcome = serde_json::from_value(event.payload["outcome"].clone()).ok()?;
+    Some(match outcome {
+        Outcome::Clean => format!("Integration merged {merged} branch(es) cleanly"),
+        Outcome::Conflict {
+            assignment, files, ..
+        } => format!(
+            "Integration conflicted on {} file(s) merging {}",
+            files.len(),
+            safe(&assignment)
+        ),
+        Outcome::Uncommitted {
+            assignment, files, ..
+        } => format!(
+            "{} has {} file(s) never committed",
+            safe(&assignment),
+            files.len()
+        ),
+        Outcome::NoCommits { assignment, .. } => {
+            format!("{} has no commits to merge", safe(&assignment))
+        }
+        Outcome::Failed { .. } => "Integration failed".to_owned(),
     })
 }
 
@@ -359,10 +401,21 @@ mod tests {
         "mono.inbox",
         "mono.inbox_failed",
         "mono.inbox_abandoned",
+        "task.integration",
+        "workspace.owned",
+        "workspace.owned_notice",
         "unknown.kind",
     ];
 
     fn event(kind: &str) -> Event {
+        let mut event = plain_event(kind);
+        if kind == "task.integration" {
+            event.payload = serde_json::json!({"merges": [], "outcome": {"state": "clean"}});
+        }
+        event
+    }
+
+    fn plain_event(kind: &str) -> Event {
         Event {
             seq: 1,
             id: kind.into(),
@@ -383,5 +436,45 @@ mod tests {
             let shown = entry(&event(kind), &names).is_some();
             assert_eq!(shown, KINDS.contains(kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn integration_passes_show_their_outcome_by_counts_only() {
+        let names = Names::default();
+        let text = |outcome: serde_json::Value| {
+            let mut e = event("task.integration");
+            e.payload = serde_json::json!({"merges": [{}, {}], "outcome": outcome});
+            entry(&e, &names).map(|x| (x.kind, x.text))
+        };
+        let shown = |o| text(o).unwrap();
+        assert_eq!(
+            shown(serde_json::json!({"state": "clean"})).1,
+            "Integration merged 2 branch(es) cleanly"
+        );
+        let conflict = serde_json::json!({"state": "conflict", "assignment": "a", "branch": "b", "files": ["x.rs", "Bearer sk-ant-api03-SECRETSECRET"]});
+        let (kind, line) = shown(conflict);
+        assert_eq!(kind, TimelineKind::Integration);
+        assert_eq!(line, "Integration conflicted on 2 file(s) merging a");
+        assert!(shown(serde_json::json!({"state": "uncommitted", "assignment": "a", "branch": "b", "files": ["x"]})).1.contains("1 file(s) never committed"));
+        assert!(
+            shown(serde_json::json!({"state": "noCommits", "assignment": "a", "branch": "b"}))
+                .1
+                .contains("no commits")
+        );
+        let failed = shown(
+            serde_json::json!({"state": "failed", "reason": "token ghp_abcdefghijklmnopqrstuvwxyz0123456789 denied"}),
+        );
+        assert_eq!(failed.1, "Integration failed");
+        assert!(text(serde_json::json!({"state": "bogus"})).is_none());
+    }
+
+    #[test]
+    fn ownership_waits_and_integration_decisions_show() {
+        let names = Names::default();
+        let wait = entry(&event("workspace.owned_notice"), &names).unwrap();
+        assert!(wait.text.contains("waits for its worktree"));
+        let need = entry(&event("task.needs_integration"), &names).unwrap();
+        assert_eq!(need.kind, TimelineKind::Decision);
+        assert!(entry(&event("workspace.owned"), &names).is_none());
     }
 }
