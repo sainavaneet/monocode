@@ -79,7 +79,8 @@ fn finish(store: &Store, launcher: &FakeLauncher, task: &str, assignment: &str, 
         .find(|s| store.persisted_session_id(s.id).unwrap() == bound)
         .unwrap()
         .id;
-    assert!(confirm_started(store, session, now).unwrap());
+    // Already confirmed when a test kept the worker running a while.
+    confirm_started(store, session, now).unwrap();
     crate::app_access::worker_action(
         store,
         session,
@@ -102,14 +103,28 @@ fn two_workers_never_own_one_mutable_workspace() {
     assert_eq!(running(&store, "t1"), ["a"]);
     let tasks = store.tasks().unwrap();
     let owned = tasks.workspaces("t1").unwrap().pop().unwrap();
+    let a = tasks
+        .attempts("t1", "a")
+        .unwrap()
+        .pop()
+        .unwrap()
+        .session_id
+        .unwrap();
+    let session = launcher.started.borrow()[0].id;
+    assert_eq!(store.persisted_session_id(session).unwrap(), a);
+    assert!(confirm_started(&store, session, NOW + 1).unwrap());
     // Another task's assignment is recorded in that same worktree (an
-    // adopted or hand-edited record): it may not start beside a's worker.
+    // adopted or hand-edited record, spelled differently): it may not start
+    // beside a's worker.
     start(&store, &repo, "t2", vec![part("b", &["src/b.rs"])]);
+    let alias = format!("{}-alias", owned.path);
+    std::os::unix::fs::symlink(&owned.path, &alias).unwrap();
     tasks
         .save_workspace(&Workspace {
             id: "t2/b".into(),
             task_id: "t2".into(),
             assignment_id: Some("b".into()),
+            path: alias,
             ..owned.clone()
         })
         .unwrap();
@@ -119,10 +134,20 @@ fn two_workers_never_own_one_mutable_workspace() {
     }
     assert!(running(&store, "t2").is_empty());
     assert!(tasks.attempts("t2", "b").unwrap().is_empty());
+    assert!(events(&store, "workspace.owned_elsewhere").is_empty());
+    // Waiting past the notice interval tells Mono once.
+    let late = NOW + 10 + crate::tasks::guard::OWNED_NOTICE_MS;
+    for n in 0..3 {
+        coordinator.tick(&store, &launcher, late + n).unwrap();
+    }
+    assert_eq!(events(&store, "workspace.owned_elsewhere").len(), 1);
+    assert!(running(&store, "t2").is_empty());
     // Once a's worker is done with the worktree, b may have it.
-    finish(&store, &launcher, "t1", "a", NOW + 20);
-    coordinator.tick(&store, &launcher, NOW + 30).unwrap();
-    assert_eq!(running(&store, "t2"), ["b"]);
+    finish(&store, &launcher, "t1", "a", late + 10);
+    coordinator.tick(&store, &launcher, late + 20).unwrap();
+    // b's launch now goes ahead (its hand-edited path spelling is then
+    // refused by the launch's own worktree check, as any unlisted path is).
+    assert_eq!(tasks.attempts("t2", "b").unwrap().len(), 1);
     assert_eq!(owned.mode, WorkspaceMode::Worktree);
 }
 
@@ -246,8 +271,26 @@ fn unblocking_rechecks_recorded_worktrees() {
     // Restored, it unblocks.
     std::fs::rename(format!("{tree}-moved"), &tree).unwrap();
     let revision = tasks.revision(t).unwrap();
+    // The app checks Git between two short store locks: anything that
+    // changed meanwhile refuses the unblock rather than trusting the check.
+    let check = tasks.unblock_check("t").unwrap();
+    let problems = check.problems();
+    assert!(problems.is_empty());
+    let mut moved = tasks.workspaces("t").unwrap().pop().unwrap();
+    moved.id = "t/extra".into();
+    moved.assignment_id = None;
+    tasks.save_workspace(&moved).unwrap();
+    let changed = tasks.unblock_checked(&check, &problems, revision, Requester::User, NOW + 3);
+    assert!(
+        matches!(&changed, Err(TaskError::Invalid(m)) if m.contains("changed")),
+        "{changed:?}"
+    );
+    let check = tasks.unblock_check("t").unwrap();
+    let problems = check.problems();
+    let stale = tasks.unblock_checked(&check, &problems, revision - 1, Requester::User, NOW + 3);
+    assert!(matches!(stale, Err(TaskError::Stale { .. })), "{stale:?}");
     tasks
-        .unblock("t", revision, Requester::User, NOW + 3)
+        .unblock_checked(&check, &problems, revision, Requester::User, NOW + 3)
         .unwrap();
     assert_eq!(
         tasks.task("t").unwrap().unwrap().lifecycle,
@@ -317,4 +360,24 @@ fn a_plan_the_user_starts_becomes_a_task_the_coordinator_schedules() {
     );
     assert!(matches!(refused, Err(TaskError::Invalid(_))), "{refused:?}");
     assert!(tasks.task("plan-2").unwrap().is_none());
+    // A start that fails part-way (here at the policy snapshot) leaves
+    // nothing behind: the task, its plan and its stages are one transaction.
+    let failed = crate::tasks::policy::start_plan(
+        &store,
+        &NewTask {
+            id: "plan-3".into(),
+            mono_id: None,
+            project: repo.root.to_string_lossy().into_owned(),
+            title: "Broken".into(),
+            request: "Broken".into(),
+            criteria: Vec::new(),
+        },
+        &plan,
+        "no-such-provider",
+        Requester::User,
+        NOW,
+    );
+    assert!(failed.is_err(), "{failed:?}");
+    assert!(tasks.task("plan-3").unwrap().is_none());
+    assert!(tasks.assignments("plan-3").unwrap().is_empty());
 }

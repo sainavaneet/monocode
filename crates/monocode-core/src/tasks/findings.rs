@@ -83,10 +83,10 @@ pub enum Finding {
         onto: String,
         files: Vec<String>,
     },
-    /// The worktree holds changes no commit has, so integration cannot
-    /// merge them.
-    UncommittedWork {
-        files: Vec<String>,
+    /// The branch has no commits since its base, so integration (which
+    /// merges branches, never worktrees) has nothing of it to merge.
+    NoCommits {
+        branch: String,
     },
 }
 
@@ -116,7 +116,7 @@ impl Finding {
                 | Self::ModifiedByCheck { .. }
                 | Self::UnauthorizedCommits { .. }
                 | Self::IntegrationConflict { .. }
-                | Self::UncommittedWork { .. }
+                | Self::NoCommits { .. }
         )
     }
 
@@ -186,9 +186,8 @@ impl Finding {
                 "Merging your branch onto the task's integration branch {branch} (at {onto}) conflicted in {}. Rebase your branch onto it (git rebase {branch}), resolve the conflicts keeping the intent of both changes, make sure the checks pass, commit, and report again.",
                 files.join(", ")
             ),
-            Self::UncommittedWork { files } => format!(
-                "Your worktree has uncommitted changes ({}); integration merges committed work only. Commit them on your branch and report again.",
-                files.join(", ")
+            Self::NoCommits { branch } => format!(
+                "Your branch {branch} has no commits since its base, and integration merges committed work only (uncommitted changes in your worktree are not merged). Commit your work on the branch and report again."
             ),
         }
     }

@@ -190,7 +190,8 @@ pub(super) fn worktree(
     };
     let existing = git::worktrees(project)?
         .into_iter()
-        .find(|tree| tree.branch.as_deref() == Some(branch) && !tree.missing);
+        // Never the user's main checkout, even on our branch.
+        .find(|tree| tree.branch.as_deref() == Some(branch) && !tree.missing && !tree.main);
     if let Some(tree) = existing {
         return Ok((tree.path, forked(&tree.head)));
     }

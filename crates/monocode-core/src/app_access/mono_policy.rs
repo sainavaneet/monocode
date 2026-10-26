@@ -51,10 +51,48 @@ pub fn mono_policy_action(
             Ok(json!({"taskId": task.id, "revision": applied.revision, "policy": applied.autonomy}))
         }
         _ => {
-            let revision = tasks
-                .unblock(&task.id, revision(input)?, Requester::Mono, now)
-                .map_err(failed)?;
-            Ok(json!({"taskId": task.id, "lifecycle": "active", "revision": revision}))
+            let prepared = (
+                tasks.unblock_check(&task.id).map_err(failed)?,
+                revision(input)?,
+            );
+            let problems = prepared.0.problems();
+            mono_unblock_finish(store, &prepared, &problems, now)
         }
     }
+}
+
+/// `tasks.unblock` in steps, so the app checks the task's worktrees with
+/// Git without holding the store lock: this step (under the store) passes
+/// the same gate as [`mono_policy_action`] and collects what to check.
+pub fn mono_unblock_prepare(
+    store: &Store,
+    mono: &str,
+    input: &Value,
+) -> Result<MonoUnblock, String> {
+    const ACTION: &str = "tasks.unblock";
+    ready(store, ACTION, input)?;
+    let tasks = store.tasks().map_err(failed)?;
+    let task = owned_task(&tasks, mono, &text(input, "taskId", 512)?)?;
+    Ok((
+        tasks.unblock_check(&task.id).map_err(failed)?,
+        revision(input)?,
+    ))
+}
+
+/// The unblock check and the task revision Mono read.
+pub type MonoUnblock = (crate::tasks::workspace_check::UnblockCheck, u64);
+
+/// The last step of `tasks.unblock`, under the store again, with the Git
+/// check's `problems`.
+pub fn mono_unblock_finish(
+    store: &Store,
+    (check, expected): &MonoUnblock,
+    problems: &[crate::tasks::workspace_check::Problem],
+    now: u64,
+) -> Result<Value, String> {
+    let tasks = store.tasks().map_err(failed)?;
+    let revision = tasks
+        .unblock_checked(check, problems, *expected, Requester::Mono, now)
+        .map_err(failed)?;
+    Ok(json!({"taskId": check.task_id(), "lifecycle": "active", "revision": revision}))
 }

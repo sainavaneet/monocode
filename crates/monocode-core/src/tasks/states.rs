@@ -415,52 +415,6 @@ impl TaskStore<'_> {
         tx.commit()?;
         Ok(revision)
     }
-
-    /// Returns a Blocked task to Active for `requester`, in one transaction
-    /// through the table (which clears the blocked reason). A task that is
-    /// not Blocked is refused, and so is one whose recorded worktrees are
-    /// missing or moved (checked as resume checks them), so it is not
-    /// unblocked into a launch that cannot start. Returns the task's new
-    /// revision.
-    pub fn unblock(
-        &self,
-        task_id: &str,
-        expected_revision: u64,
-        requester: Requester,
-        now: u64,
-    ) -> Result<u64, TaskError> {
-        if let Some(task) = self.task(task_id)? {
-            let problems = super::workspace_check::verify(self, &task)?;
-            if !problems.is_empty() {
-                let lines: Vec<String> = problems
-                    .iter()
-                    .map(|(w, why)| {
-                        format!(
-                            "assignment {}: {why}",
-                            w.assignment_id.as_deref().unwrap_or("integration")
-                        )
-                    })
-                    .collect();
-                return Err(TaskError::Invalid(format!(
-                    "Task {task_id} stays blocked: a recorded workspace is missing or moved ({}). Restore the worktree, or decide with Mono how to continue.",
-                    lines.join("; ")
-                )));
-            }
-        }
-        let tx = self.begin()?;
-        let subject = Subject::Task(task_id);
-        let lifecycle = self.state(subject, State::Lifecycle(TaskLifecycle::Active))?;
-        if lifecycle != State::Lifecycle(TaskLifecycle::Blocked) {
-            return Err(TaskError::Invalid(format!(
-                "Task {task_id} is not blocked (it is {}).",
-                lifecycle.as_str()
-            )));
-        }
-        let active = State::Lifecycle(TaskLifecycle::Active);
-        let revision = apply(&tx, subject, active, requester, expected_revision, now)?;
-        tx.commit()?;
-        Ok(revision)
-    }
 }
 
 /// The task, assignment and attempt a subject belongs to.

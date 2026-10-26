@@ -22,16 +22,16 @@ use std::process::Command;
 
 /// The live policy, changeable mid-test: two workers, merging allowed
 /// unless a test takes it away.
-struct Live(RefCell<Autonomy>);
+pub(super) struct Live(pub(super) RefCell<Autonomy>);
 impl Live {
-    fn merging() -> Self {
+    pub(super) fn merging() -> Self {
         Self(RefCell::new(Autonomy {
             worker_limit: 2,
             merge: true,
             ..Autonomy::default()
         }))
     }
-    fn without_merge() -> Self {
+    pub(super) fn without_merge() -> Self {
         let live = Self::merging();
         live.0.borrow_mut().merge = false;
         live
@@ -43,14 +43,14 @@ impl Policy for Live {
     }
 }
 
-struct Run {
-    store: Store,
-    coordinator: Coordinator<Live>,
-    launcher: FakeLauncher,
+pub(super) struct Run {
+    pub(super) store: Store,
+    pub(super) coordinator: Coordinator<Live>,
+    pub(super) launcher: FakeLauncher,
     requests: RefCell<u32>,
 }
 
-fn part(id: &str, files: &[&str], deps: &[&str], check: &str) -> Assignment {
+pub(super) fn part(id: &str, files: &[&str], deps: &[&str], check: &str) -> Assignment {
     Assignment {
         files: files.iter().map(|f| (*f).to_owned()).collect(),
         verification: vec![check.into()],
@@ -60,7 +60,7 @@ fn part(id: &str, files: &[&str], deps: &[&str], check: &str) -> Assignment {
 
 /// Task `t` in `repo` with `parts`, criterion `c1` checked by `checks` on
 /// the task's result, started by Mono.
-fn started(repo: &Repo, live: Live, parts: Vec<Assignment>, checks: &[&str]) -> Run {
+pub(super) fn started(repo: &Repo, live: Live, parts: Vec<Assignment>, checks: &[&str]) -> Run {
     let store = open(repo);
     let tasks = store.tasks().unwrap();
     tasks
@@ -103,7 +103,7 @@ fn started(repo: &Repo, live: Live, parts: Vec<Assignment>, checks: &[&str]) -> 
 }
 
 impl Run {
-    fn tick(&self, now: u64) -> crate::tasks::coordinator::Tick {
+    pub(super) fn tick(&self, now: u64) -> crate::tasks::coordinator::Tick {
         let tick = self
             .coordinator
             .tick(&self.store, &self.launcher, now)
@@ -112,16 +112,16 @@ impl Run {
         tick
     }
 
-    fn task(&self) -> Task {
+    pub(super) fn task(&self) -> Task {
         self.store.tasks().unwrap().task("t").unwrap().unwrap()
     }
 
-    fn status(&self, id: &str) -> AssignmentState {
+    pub(super) fn status(&self, id: &str) -> AssignmentState {
         let tasks = self.store.tasks().unwrap();
         tasks.assignment("t", id).unwrap().unwrap().status
     }
 
-    fn tree(&self, id: &str) -> PathBuf {
+    pub(super) fn tree(&self, id: &str) -> PathBuf {
         let tasks = self.store.tasks().unwrap();
         let workspace = tasks
             .workspaces("t")
@@ -133,7 +133,7 @@ impl Run {
     }
 
     /// The app session of `id`'s latest attempt.
-    fn session(&self, id: &str) -> i64 {
+    pub(super) fn session(&self, id: &str) -> i64 {
         let tasks = self.store.tasks().unwrap();
         let attempt = tasks.attempts("t", id).unwrap().pop().unwrap();
         let bound = attempt.session_id.unwrap();
@@ -148,7 +148,7 @@ impl Run {
 
     /// `id`'s worker starts, does `work` in its worktree and claims success;
     /// review then decides.
-    fn work(&self, id: &str, now: u64, work: impl FnOnce(&Path)) -> Vec<Review> {
+    pub(super) fn work(&self, id: &str, now: u64, work: impl FnOnce(&Path)) -> Vec<Review> {
         let session = self.session(id);
         assert!(confirm_started(&self.store, session, now).unwrap());
         work(&self.tree(id));
@@ -170,18 +170,18 @@ impl Run {
         self.coordinator.review(&self.store, now + 3).unwrap()
     }
 
-    fn integrate(&self, now: u64) -> Vec<IntegrationRecord> {
+    pub(super) fn integrate(&self, now: u64) -> Vec<IntegrationRecord> {
         self.coordinator.integrate(&self.store, now).unwrap()
     }
 }
 
-fn commit(tree: &Path, file: &str, content: &str) {
+pub(super) fn commit(tree: &Path, file: &str, content: &str) {
     std::fs::write(tree.join(file), content).unwrap();
     git(tree, &["add", "."]);
     git(tree, &["commit", "-q", "-m", file]);
 }
 
-fn ok(cwd: &Path, args: &[&str]) -> bool {
+pub(super) fn ok(cwd: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .current_dir(cwd)
         .args(args)
@@ -191,7 +191,7 @@ fn ok(cwd: &Path, args: &[&str]) -> bool {
         .success()
 }
 
-fn integration_tree(run: &Run) -> PathBuf {
+pub(super) fn integration_tree(run: &Run) -> PathBuf {
     let tasks = run.store.tasks().unwrap();
     let workspace = tasks
         .workspaces("t")
@@ -293,7 +293,7 @@ fn several_worktrees_integrate_in_dependency_order_onto_the_recorded_base_and_co
 }
 
 /// Two parts editing `src/lib.rs` differently, both accepted, a first.
-fn conflicting(repo: &Repo, live: Live) -> Run {
+pub(super) fn conflicting(repo: &Repo, live: Live) -> Run {
     let parts = vec![
         part("a", &["src/lib.rs"], &[], "test -f src/lib.rs"),
         part("b", &["src"], &[], "test -f src/lib.rs"),
@@ -526,7 +526,7 @@ fn merging_without_merge_authority_raises_a_decision_instead() {
 }
 
 #[test]
-fn dirty_worktrees_are_never_deleted_and_uncommitted_work_is_sent_back() {
+fn dirty_worktrees_are_never_deleted_and_a_branch_without_commits_is_sent_back() {
     let repo = repo();
     let parts = vec![
         part("a", &["src/a.rs"], &[], "test -f src/a.rs"),
@@ -549,8 +549,8 @@ fn dirty_worktrees_are_never_deleted_and_uncommitted_work_is_sent_back() {
         .is_empty());
     let records = run.integrate(NOW + 40);
     assert!(
-        matches!(&records[0].outcome, Outcome::Uncommitted { assignment, files }
-            if assignment == "b" && files == &["src/b.rs".to_owned()]),
+        matches!(&records[0].outcome, Outcome::NoCommits { assignment, branch }
+            if assignment == "b" && *branch == crate::tasks::workspaces::branch_for("t", "b")),
         "{records:?}"
     );
     // Sent back to commit it; the dirty worktree and its work stay.
@@ -577,5 +577,46 @@ fn dirty_worktrees_are_never_deleted_and_uncommitted_work_is_sent_back() {
     assert!(correction
         .findings
         .iter()
-        .any(|f| matches!(f, Finding::UncommittedWork { .. })));
+        .any(|f| matches!(f, Finding::NoCommits { .. })));
+}
+
+#[test]
+fn integration_reads_branches_only_so_cleaned_up_or_dirty_accepted_worktrees_do_not_matter() {
+    let repo = repo();
+    let parts = vec![
+        part("a", &["src/a.rs"], &[], "test -f src/a.rs"),
+        part("b", &["src/b.rs"], &[], "test -f src/b.rs"),
+    ];
+    let run = started(&repo, Live::merging(), parts, &["test -f src/a.rs"]);
+    assert_eq!(run.tick(NOW).launched.len(), 2);
+    run.work("a", NOW + 10, |tree| {
+        commit(tree, "src/a.rs", "pub fn a() {}\n")
+    });
+    run.work("b", NOW + 20, |tree| {
+        commit(tree, "src/b.rs", "pub fn b() {}\n")
+    });
+    assert!(run
+        .coordinator
+        .verify(&run.store, NOW + 30)
+        .unwrap()
+        .is_empty());
+    // a's accepted worktree was cleaned up; b's has a stray scratch file.
+    let a = run.tree("a");
+    std::fs::rename(&a, a.with_extension("gone")).unwrap();
+    std::fs::write(run.tree("b").join("scratch.txt"), "notes\n").unwrap();
+    let records = run.integrate(NOW + 40);
+    assert_eq!(records[0].outcome, Outcome::Clean, "{records:?}");
+    let tree = integration_tree(&run);
+    assert!(tree.join("src/a.rs").exists() && tree.join("src/b.rs").exists());
+    assert!(!tree.join("scratch.txt").exists());
+    // The stray file was neither merged nor touched.
+    assert!(run.tree("b").join("scratch.txt").exists());
+}
+
+#[test]
+fn status_entries_are_read_verbatim_from_porcelain_z() {
+    let parsed = crate::tasks::merging::parse_status_z(
+        "?? with space.rs\0R  new name.rs\0old -> name.rs\0 M src/a.rs\0",
+    );
+    assert_eq!(parsed, ["with space.rs", "new name.rs", "src/a.rs"]);
 }

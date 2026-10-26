@@ -5,7 +5,11 @@ use super::events::{append, NewEvent};
 use super::guard::task_or_missing;
 use super::notices::notify;
 use super::recovery;
-use super::{AssignmentState, Task, TaskError, TaskStore, Workspace};
+use super::states::apply;
+use super::{
+    AssignmentState, Requester, State, Subject, Task, TaskError, TaskLifecycle, TaskStore,
+    Workspace,
+};
 use crate::orchestration::WorkspaceMode;
 use rusqlite::Connection;
 use serde_json::json;
@@ -140,4 +144,112 @@ pub(super) fn record_condition(
     recovery::block(conn, task, &reason, now)?;
     notify(conn, task, None, "recovery.workspace_missing", &reason, now)?;
     Ok(reason)
+}
+
+/// What unblocking a task must check with Git, read under the store, so
+/// the Git checks ([`UnblockCheck::problems`]) run without the store lock.
+#[derive(Clone, Debug)]
+pub struct UnblockCheck {
+    task_id: String,
+    workspaces: Vec<Workspace>,
+}
+
+impl UnblockCheck {
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    /// The recorded workspaces that are missing or moved. No store access.
+    pub fn problems(&self) -> Vec<Problem> {
+        check(&self.workspaces)
+    }
+}
+
+impl TaskStore<'_> {
+    /// Step one of unblocking: refuses a task that is not Blocked and
+    /// collects the workspaces to check.
+    pub fn unblock_check(&self, task_id: &str) -> Result<UnblockCheck, TaskError> {
+        let task = task_or_missing(self, task_id)?;
+        if task.lifecycle != TaskLifecycle::Blocked {
+            return Err(TaskError::Invalid(format!(
+                "Task {task_id} is not blocked (it is {}).",
+                task.lifecycle.as_str()
+            )));
+        }
+        Ok(UnblockCheck {
+            task_id: task_id.into(),
+            workspaces: to_check(self, task_id)?,
+        })
+    }
+
+    /// Step three: returns the Blocked task to Active for `requester`, in
+    /// one transaction through the table (which clears the blocked reason),
+    /// unless the checked workspaces are missing or moved, or changed since
+    /// they were collected, or the task is no longer at `expected_revision`.
+    /// Returns the task's new revision.
+    pub fn unblock_checked(
+        &self,
+        check: &UnblockCheck,
+        problems: &[Problem],
+        expected_revision: u64,
+        requester: Requester,
+        now: u64,
+    ) -> Result<u64, TaskError> {
+        let task_id = check.task_id.as_str();
+        if !problems.is_empty() {
+            let lines: Vec<String> = problems
+                .iter()
+                .map(|(w, why)| {
+                    format!(
+                        "assignment {}: {why}",
+                        w.assignment_id.as_deref().unwrap_or("integration")
+                    )
+                })
+                .collect();
+            return Err(TaskError::Invalid(format!(
+                "Task {task_id} stays blocked: a recorded workspace is missing or moved ({}). Restore the worktree, or decide with Mono how to continue.",
+                lines.join("; ")
+            )));
+        }
+        let tx = self.begin()?;
+        let inside = TaskStore { conn: &tx };
+        let lifecycle = task_or_missing(&inside, task_id)?.lifecycle;
+        if lifecycle != TaskLifecycle::Blocked {
+            return Err(TaskError::Invalid(format!(
+                "Task {task_id} is not blocked (it is {}).",
+                lifecycle.as_str()
+            )));
+        }
+        if to_check(&inside, task_id)? != check.workspaces {
+            return Err(TaskError::Invalid(format!(
+                "Task {task_id}'s workspaces changed while they were checked; unblock it again."
+            )));
+        }
+        let active = State::Lifecycle(TaskLifecycle::Active);
+        let revision = apply(
+            &tx,
+            Subject::Task(task_id),
+            active,
+            requester,
+            expected_revision,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(revision)
+    }
+
+    /// All three steps of unblocking while holding this store throughout
+    /// (Git included). The app runs [`Self::unblock_check`], the Git check
+    /// and [`Self::unblock_checked`] with the store lock released between.
+    pub fn unblock(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+        requester: Requester,
+        now: u64,
+    ) -> Result<u64, TaskError> {
+        let check = self.unblock_check(task_id)?;
+        let problems = check.problems();
+        self.unblock_checked(&check, &problems, expected_revision, requester, now)
+    }
 }

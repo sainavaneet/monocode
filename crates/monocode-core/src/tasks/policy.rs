@@ -186,13 +186,22 @@ pub fn start_plan(
     now: u64,
 ) -> Result<Task, TaskError> {
     crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
-    let task = create_task(store, new, provider, now)?;
     let tasks = store.tasks()?;
-    tasks.save_plan(&task.id, task.revision, plan, now)?;
+    // One transaction: a start that fails part-way leaves nothing behind.
+    let tx = tasks.begin()?;
+    let inside = TaskStore { conn: &tx };
+    super::store::insert_task(&tx, new, now)?;
+    let task = inside
+        .task(&new.id)?
+        .ok_or_else(|| TaskError::NotFound(format!("task:{}", new.id)))?;
+    let live = autonomy::live(new.mono_id.as_deref(), &new.project);
+    capture_with(store, &task, provider, &live, now)?;
+    super::store::write_plan(&tx, &task.id, task.revision, plan, now)?;
     let subject = super::Subject::Task(&task.id);
     for stage in [super::TaskStage::Ready, super::TaskStage::Implementing] {
-        let revision = tasks.revision(subject)?;
-        tasks.transition(
+        let revision = inside.revision(subject)?;
+        super::states::apply(
+            &tx,
             subject,
             super::State::Stage(stage),
             requester,
@@ -200,6 +209,7 @@ pub fn start_plan(
             now,
         )?;
     }
+    tx.commit()?;
     tasks
         .task(&task.id)?
         .ok_or_else(|| TaskError::NotFound(format!("task:{}", task.id)))

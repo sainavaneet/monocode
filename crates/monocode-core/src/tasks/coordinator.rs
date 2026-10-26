@@ -294,7 +294,7 @@ impl<P: Policy> Coordinator<P> {
             }
             // Two agents never work one workspace.
             if self.held_by_stop(&tasks, &task.id, &assignment.id, now, tick)?
-                || super::guard::workspace_owner(tasks.conn, &task.id, &assignment.id)?.is_some()
+                || self.held_by_owner(&tasks, &task.id, &assignment.id, now)?
             {
                 continue;
             }

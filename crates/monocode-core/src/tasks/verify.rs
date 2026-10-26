@@ -38,6 +38,7 @@ const NEEDS_INTEGRATION: &str = "task.needs_integration";
 const WAITING: &str = "task.verification_waiting";
 const FAILED: &str = "task.verification_failed";
 const NO_CRITERIA: &str = "The task has no required acceptance criterion, so nothing mechanical can verify it; Mono decides.";
+const UNINTEGRATED: &str = "The task reached Verifying without a clean integration of its several worktrees, so there is no combined result to check. Send it back (stage Implementing) so the coordinator integrates the accepted work, or verify the criteria yourself.";
 const NO_RESULT: &str = "No assignment produced a worktree whose result can be checked, so Mono verifies the acceptance criteria.";
 const COMBINED: &str = "The acceptance criteria failed on the integrated result of several assignments, so no single assignment is sent back automatically; Mono decides which work goes back.";
 
@@ -252,9 +253,22 @@ impl<P: Policy> Coordinator<P> {
             return Ok(None);
         }
         if results.len() > 1 {
+            // Only a clean integration is a result to verify; a task moved
+            // here without one (by Mono) is refused explicitly, once.
+            let clean = tasks
+                .integration(id)?
+                .is_some_and(|r| r["outcome"]["state"] == "clean");
             let integrated = workspaces
                 .into_iter()
-                .find(|w| w.id == super::integration::workspace_id(id));
+                .find(|w| w.id == super::integration::workspace_id(id))
+                .filter(|_| clean);
+            if integrated.is_none() {
+                let waiting = [Finding::NotChecked {
+                    reason: UNINTEGRATED.into(),
+                }];
+                let key = format!("unintegrated:{id}@{}", task.revision);
+                hand_to_mono(tasks, id, &key, NEEDS_INTEGRATION, &waiting, now)?;
+            }
             return Ok(integrated.map(|w| (task, None, w)));
         }
         let (assignment, workspace) = results.into_iter().next().expect("one result");

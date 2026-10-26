@@ -391,19 +391,9 @@ impl TaskStore<'_> {
     /// A new task: Planning and Active, at revision 1.
     pub fn create_task(&self, new: &NewTask, now: u64) -> Result<Task, TaskError> {
         let tx = self.begin()?;
-        tx.execute(
-            "INSERT INTO native_tasks(id,mono_id,project,title,request,stage,lifecycle,criteria,revision,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,'planning','active',?6,1,?7,?7)",
-            params![new.id, new.mono_id, new.project, new.title, new.request,
-                serde_json::to_string(&new.criteria)?, ms(now)],
-        )?;
-        let label = Subject::Task(&new.id).key().label;
-        append(
-            &tx,
-            &event_for(&new.id, &label, 1, "task.created", json!({})),
-            now,
-        )?;
+        insert_task(&tx, new, now)?;
         tx.commit()?;
+        let label = Subject::Task(&new.id).key().label;
         self.task(&new.id)?.ok_or(TaskError::NotFound(label))
     }
 
@@ -442,49 +432,8 @@ impl TaskStore<'_> {
         plan: &Plan,
         now: u64,
     ) -> Result<u64, TaskError> {
-        crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
         let tx = self.begin()?;
-        let key = Subject::Task(id).key();
-        let stage = guard(&tx, &key, "stage", expected_revision)?;
-        if !matches!(
-            TaskStage::parse(&stage),
-            Some(TaskStage::Planning | TaskStage::Ready)
-        ) {
-            return Err(TaskError::Precondition(Precondition::NotStarted));
-        }
-        // Revisions never repeat for an assignment id, even one dropped by an
-        // earlier plan, so stale writers fail and event ids stay unique.
-        let first: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(revision),0)+1 FROM native_task_assignments WHERE task_id=?1",
-            [id],
-            |row| row.get(0),
-        )?;
-        tx.execute("DELETE FROM native_task_assignments WHERE task_id=?1", [id])?;
-        for (position, assignment) in plan.tasks.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO native_task_assignments(task_id,id,position,title,prompt,files,depends_on,workspace,verification,status,revision,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?11,?10)",
-                params![id, assignment.id, position as i64, assignment.title, assignment.prompt,
-                    serde_json::to_string(&assignment.files)?,
-                    serde_json::to_string(&assignment.depends_on)?,
-                    assignment.workspace.map(WorkspaceMode::as_str),
-                    serde_json::to_string(&assignment.verification)?, ms(now),
-                    first],
-            )?;
-        }
-        let revision = key.bump(
-            &tx,
-            expected_revision,
-            "plan_title=?,plan_summary=?,plan_revision=plan_revision+1",
-            vec![&plan.title, &plan.summary],
-            now,
-        )?;
-        let payload = json!({"assignments": plan.tasks.len()});
-        append(
-            &tx,
-            &event_for(id, &key.label, revision, "task.plan_saved", payload),
-            now,
-        )?;
+        let revision = write_plan(&tx, id, expected_revision, plan, now)?;
         tx.commit()?;
         Ok(revision)
     }
@@ -754,6 +703,78 @@ impl TaskStore<'_> {
             verification,
         )
     }
+}
+
+/// Inserts a new task (Planning, Active, revision 1) inside the caller's
+/// transaction.
+pub(super) fn insert_task(tx: &Connection, new: &NewTask, now: u64) -> Result<(), TaskError> {
+    tx.execute(
+        "INSERT INTO native_tasks(id,mono_id,project,title,request,stage,lifecycle,criteria,revision,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,'planning','active',?6,1,?7,?7)",
+        params![new.id, new.mono_id, new.project, new.title, new.request,
+            serde_json::to_string(&new.criteria)?, ms(now)],
+    )?;
+    let label = Subject::Task(&new.id).key().label;
+    append(
+        tx,
+        &event_for(&new.id, &label, 1, "task.created", json!({})),
+        now,
+    )?;
+    Ok(())
+}
+
+/// Replaces the task's plan inside the caller's transaction (see
+/// [`TaskStore::save_plan`]).
+pub(super) fn write_plan(
+    tx: &Connection,
+    id: &str,
+    expected_revision: u64,
+    plan: &Plan,
+    now: u64,
+) -> Result<u64, TaskError> {
+    crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
+    let key = Subject::Task(id).key();
+    let stage = guard(tx, &key, "stage", expected_revision)?;
+    if !matches!(
+        TaskStage::parse(&stage),
+        Some(TaskStage::Planning | TaskStage::Ready)
+    ) {
+        return Err(TaskError::Precondition(Precondition::NotStarted));
+    }
+    // Revisions never repeat for an assignment id, even one dropped by an
+    // earlier plan, so stale writers fail and event ids stay unique.
+    let first: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(revision),0)+1 FROM native_task_assignments WHERE task_id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    tx.execute("DELETE FROM native_task_assignments WHERE task_id=?1", [id])?;
+    for (position, assignment) in plan.tasks.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO native_task_assignments(task_id,id,position,title,prompt,files,depends_on,workspace,verification,status,revision,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?11,?10)",
+            params![id, assignment.id, position as i64, assignment.title, assignment.prompt,
+                serde_json::to_string(&assignment.files)?,
+                serde_json::to_string(&assignment.depends_on)?,
+                assignment.workspace.map(WorkspaceMode::as_str),
+                serde_json::to_string(&assignment.verification)?, ms(now),
+                first],
+        )?;
+    }
+    let revision = key.bump(
+        tx,
+        expected_revision,
+        "plan_title=?,plan_summary=?,plan_revision=plan_revision+1",
+        vec![&plan.title, &plan.summary],
+        now,
+    )?;
+    let payload = json!({"assignments": plan.tasks.len()});
+    append(
+        tx,
+        &event_for(id, &key.label, revision, "task.plan_saved", payload),
+        now,
+    )?;
+    Ok(revision)
 }
 
 #[cfg(test)]

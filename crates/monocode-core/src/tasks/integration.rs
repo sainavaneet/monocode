@@ -160,7 +160,7 @@ fn integration_workspace(
             .unwrap_or_else(|| job.task.project.clone()),
         path: path.into(),
         branch: Some(job.branch.clone()),
-        base_commit: Some(job.base.clone()),
+        base_commit: Some(record.base.clone()),
         owner: super::workspaces::owner_of(&job.task.id),
         revision: 0,
         created_at: now,
@@ -322,7 +322,7 @@ impl<P: Policy> Coordinator<P> {
             .map(|(a, w)| Step {
                 assignment: a.id,
                 branch: w.branch.unwrap_or_default(),
-                worktree: w.path,
+                base: w.base_commit,
             })
             .collect();
         Ok(Some(IntegrationJob {
@@ -386,10 +386,20 @@ impl<P: Policy> Coordinator<P> {
             return Ok(None);
         }
         let fix = match &record.outcome {
-            Outcome::Conflict { assignment, .. } | Outcome::Uncommitted { assignment, .. } => {
+            Outcome::Conflict { assignment, .. } | Outcome::NoCommits { assignment, .. } => {
                 Some(self.correctable(store, id, assignment)?)
             }
             _ => None,
+        };
+        // Merging ran without the store lock: authority revoked meanwhile
+        // stops the result from moving on.
+        let merge = match &record.outcome {
+            Outcome::Clean => match self.authorize(store, id, Authority::Merge) {
+                Ok(()) => Ok(()),
+                Err(TaskError::Invalid(reason)) => Err(reason),
+                Err(error) => return Err(error),
+            },
+            _ => Ok(()),
         };
         let tx = tasks.begin()?;
         let inside = TaskStore { conn: &tx };
@@ -414,6 +424,21 @@ impl<P: Policy> Coordinator<P> {
         };
         append(&tx, &event, now)?;
         match &record.outcome {
+            Outcome::Clean if merge.is_err() => {
+                let reason = merge.err().unwrap_or_default();
+                let question = format!(
+                    "Task {id}'s branches were merged onto {}, but merge authority was revoked meanwhile, so the result does not move on to verification.",
+                    job.branch
+                );
+                raise(
+                    &tx,
+                    id,
+                    None,
+                    question,
+                    format!("{reason} Or integrate the branches yourself."),
+                    now,
+                )?;
+            }
             Outcome::Clean => {
                 let verifying = State::Stage(TaskStage::Verifying);
                 apply(
@@ -442,13 +467,12 @@ impl<P: Policy> Coordinator<P> {
                 );
                 settle(&tx, job, assignment, finding, what, fix, n, now)?;
             }
-            Outcome::Uncommitted { assignment, files } => {
-                let finding = Finding::UncommittedWork {
-                    files: files.clone(),
+            Outcome::NoCommits { assignment, branch } => {
+                let finding = Finding::NoCommits {
+                    branch: branch.clone(),
                 };
                 let what = format!(
-                    "Assignment {assignment}'s worktree has uncommitted changes ({}), so its work cannot be merged onto {}.",
-                    files.join(", "),
+                    "Assignment {assignment}'s branch {branch} has no commits since its base, so nothing of it can be merged onto {}.",
                     job.branch
                 );
                 settle(&tx, job, assignment, finding, what, fix, n, now)?;
@@ -613,4 +637,8 @@ pub(super) fn rebased(
 
 #[cfg(test)]
 #[path = "integration_tests.rs"]
-mod tests;
+pub(super) mod tests;
+
+#[cfg(test)]
+#[path = "integration_guard_tests.rs"]
+mod guard_tests;

@@ -54,6 +54,10 @@ pub(super) fn describe(kind: &str, task: &str, assignment: Option<&str>) -> Opti
             "This app took over the task from another app or process that may still be running its workers, so they are held and nothing was relaunched",
             format!("Make sure that app has stopped its workers (or has quit), then continue with {resume}; it also continues on its own once that process is gone."),
         ),
+        "workspace.owned_elsewhere" => (
+            "An assignment keeps waiting for its worktree, which another live worker still works in",
+            "It starts on its own once that worker ends. If that worker is stuck, stop it (tasks.pause, or tasks.cancel for its task), or steer this assignment with tasks.steer.".into(),
+        ),
         "task.steer_assess" => (
             "The requirements changed and the affected assignments are not known",
             format!("Decide which assignments the new requirements affect and call tasks.steer {{\"taskId\":\"{task}\",\"revision\":<plan revision>,\"requirements\":\"...\",\"assignmentIds\":[...]}} (or pass the revised plan). Nothing was stopped."),

@@ -24,11 +24,10 @@ pub enum Outcome {
         branch: String,
         files: Vec<String>,
     },
-    /// The assignment's worktree has changes no commit holds.
-    Uncommitted {
-        assignment: String,
-        files: Vec<String>,
-    },
+    /// The assignment's branch has no commits since its recorded base, so
+    /// there is nothing of it to merge (work left uncommitted in its
+    /// worktree is never merged).
+    NoCommits { assignment: String, branch: String },
     /// Git refused for another reason; retried, then Mono decides.
     Failed { reason: String },
 }
@@ -63,6 +62,14 @@ pub struct IntegrationRecord {
     pub upstream_head: Option<String>,
     /// The user's branch moved past the recorded base.
     pub base_moved: bool,
+    /// A leftover integration branch was adopted (a crash before it was
+    /// recorded); `base` is then its merge-base with the planned base.
+    #[serde(default)]
+    pub adopted: bool,
+    /// Commits the integration branch already had beyond `base` before this
+    /// pass (earlier merges), oldest first.
+    #[serde(default)]
+    pub existing: Vec<String>,
     /// Assignments in the order they are merged.
     pub order: Vec<String>,
     pub merges: Vec<Merge>,
@@ -75,7 +82,9 @@ pub struct IntegrationRecord {
 pub(super) struct Step {
     pub(super) assignment: String,
     pub(super) branch: String,
-    pub(super) worktree: String,
+    /// The base recorded for the assignment's worktree; only its branch is
+    /// read (an accepted worktree may have been cleaned up).
+    pub(super) base: Option<String>,
 }
 
 /// A task ready to integrate, read from the store.
@@ -99,14 +108,29 @@ fn rev(cwd: &Path, reference: &str) -> Option<String> {
     trimmed(git(cwd, &["rev-parse", "--verify", "-q", reference]))
 }
 
-/// Changed and untracked paths in a worktree.
+/// Changed and untracked paths in a worktree, from `status --porcelain -z`
+/// (paths verbatim; a rename's second entry is its original path).
 fn dirty_files(tree: &Path) -> Result<Vec<String>, String> {
-    let status = git(tree, &["status", "--porcelain", "--untracked-files=all"])?;
-    Ok(status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).to_owned())
-        .collect())
+    let status = git(
+        tree,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )?;
+    Ok(parse_status_z(&status))
+}
+
+pub(super) fn parse_status_z(status: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut entries = status.split('\0').filter(|e| !e.is_empty());
+    while let Some(entry) = entries.next() {
+        let (code, path) = (entry.get(..2).unwrap_or_default(), entry.get(3..));
+        if let Some(path) = path {
+            files.push(path.to_owned());
+        }
+        if code.contains(['R', 'C']) {
+            entries.next();
+        }
+    }
+    files
 }
 
 impl IntegrationJob {
@@ -126,21 +150,39 @@ impl IntegrationJob {
             path: None,
             base: self.base.clone(),
             base_branch: trimmed(git(project, &["symbolic-ref", "--short", "-q", "HEAD"])),
-            base_moved: upstream_head.as_deref() != Some(self.base.as_str()),
+            base_moved: false,
+            adopted: false,
+            existing: Vec::new(),
             upstream_head,
             order: self.steps.iter().map(|s| s.assignment.clone()).collect(),
             merges: Vec::new(),
             head: None,
             outcome: Outcome::Clean,
         };
+        let leftover = self.recorded.is_none()
+            && rev(project, &format!("refs/heads/{}^{{commit}}", self.branch)).is_some();
         let path = match self.worktree() {
-            Ok(path) => path,
+            Ok((path, base)) => {
+                // An adopted leftover branch is recorded as it is: from
+                // where it actually forked, with the merges it already has.
+                record.adopted = leftover;
+                record.base = base;
+                path
+            }
             Err(reason) => {
                 record.outcome = Outcome::Failed { reason };
+                record.base_moved = record.upstream_head.as_deref() != Some(record.base.as_str());
                 return record;
             }
         };
+        record.base_moved = record.upstream_head.as_deref() != Some(record.base.as_str());
         let tree = Path::new(&path);
+        record.existing = git(
+            tree,
+            &["rev-list", "--reverse", &format!("{}..HEAD", record.base)],
+        )
+        .map(|out| out.lines().map(str::to_owned).collect())
+        .unwrap_or_default();
         record.outcome = self.merge_all(tree, &mut record.merges);
         record.head = rev(tree, "HEAD");
         record.path = Some(path);
@@ -148,18 +190,19 @@ impl IntegrationJob {
     }
 
     /// The recorded integration worktree as recorded, or a new (or adopted)
-    /// one on the integration branch from the base.
-    fn worktree(&self) -> Result<String, String> {
+    /// one on the integration branch from the base; with the base it
+    /// actually starts from.
+    fn worktree(&self) -> Result<(String, String), String> {
         if let Some(recorded) = &self.recorded {
             return match super::workspace_check::problem(recorded) {
-                None => Ok(recorded.path.clone()),
+                None => Ok((recorded.path.clone(), self.base.clone())),
                 Some(why) => Err(format!(
                     "The integration worktree cannot be used as recorded: {why}."
                 )),
             };
         }
         let project = Path::new(&self.task.project);
-        super::workspaces::worktree(project, &self.branch, &self.base).map(|(path, _)| path)
+        super::workspaces::worktree(project, &self.branch, &self.base)
     }
 
     fn merge_all(&self, tree: &Path, merges: &mut Vec<Merge>) -> Outcome {
@@ -176,20 +219,18 @@ impl IntegrationJob {
             Err(error) => return failed(error),
         }
         for step in &self.steps {
-            match dirty_files(Path::new(&step.worktree)) {
-                Ok(files) if !files.is_empty() => {
-                    return Outcome::Uncommitted {
-                        assignment: step.assignment.clone(),
-                        files,
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => return failed(error),
-            }
             let reference = format!("refs/heads/{}^{{commit}}", step.branch);
             let Some(tip) = rev(tree, &reference) else {
                 return failed(format!("The branch {} cannot be read.", step.branch));
             };
+            // Only the branch is integrated; one with nothing committed
+            // since its base has nothing to merge.
+            if step.base.as_deref() == Some(tip.as_str()) {
+                return Outcome::NoCommits {
+                    assignment: step.assignment.clone(),
+                    branch: step.branch.clone(),
+                };
+            }
             let mut merge = Merge {
                 assignment: step.assignment.clone(),
                 branch: step.branch.clone(),

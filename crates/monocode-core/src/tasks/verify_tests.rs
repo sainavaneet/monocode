@@ -214,6 +214,52 @@ fn several_worktrees_wait_at_integrating_for_integration_not_mono() {
     assert!(events(&store, "task.needs_integration").is_empty());
 }
 
+#[test]
+fn verifying_several_worktrees_without_an_integration_is_refused_to_mono_once() {
+    let store = memory();
+    let tasks = store.tasks().unwrap();
+    tasks.create_task(&new_task("t"), 1).unwrap();
+    let both = plan(vec![assignment("a", &[]), assignment("b", &[])]);
+    tasks.save_plan("t", 1, &both, 1).unwrap();
+    force(
+        &store,
+        Subject::Task("t"),
+        State::Stage(TaskStage::Verifying),
+    );
+    for id in ["a", "b"] {
+        let accepted = State::Assignment(AssignmentState::Accepted);
+        force(&store, Subject::Assignment { task: "t", id }, accepted);
+        tasks
+            .save_workspace(&Workspace {
+                id: format!("t/{id}"),
+                task_id: "t".into(),
+                assignment_id: Some(id.into()),
+                mode: crate::orchestration::WorkspaceMode::Worktree,
+                repository: "/repo".into(),
+                path: format!("/repo-worktrees/{id}"),
+                branch: Some(format!("mono/t/{id}")),
+                base_commit: Some("abc".into()),
+                owner: "task:t".into(),
+                revision: 0,
+                created_at: 1,
+            })
+            .unwrap();
+    }
+    // Mono moved the task to Verifying itself: there is no integration.
+    let coordinator = Coordinator::new("gpui-1", ExplicitStart);
+    assert!(coordinator.verify(&store, 10).unwrap().is_empty());
+    assert_eq!(task(&store).stage, TaskStage::Verifying);
+    let refused = events(&store, "task.needs_integration");
+    assert_eq!(refused.len(), 1);
+    assert!(refused[0]
+        .payload
+        .to_string()
+        .contains("without a clean integration"));
+    assert_eq!(tasks.pending_deliveries(MONO_REVIEW).unwrap().len(), 1);
+    coordinator.verify(&store, 11).unwrap();
+    assert_eq!(tasks.pending_deliveries(MONO_REVIEW).unwrap().len(), 1);
+}
+
 fn verification_rows(store: &Store) -> usize {
     store.tasks().unwrap().verifications("t").unwrap().len()
 }
