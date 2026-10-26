@@ -18,7 +18,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::coordinator::stop_sessions;
+    use crate::runtime::coordinator::{STOP_ABSENT_GRACE_MS, stop_sessions};
     use monocode_core::tasks::recovery::{self, TurnEnd};
 
     /// A task worker's session open in this window, whose turn just failed;
@@ -82,29 +82,35 @@ mod tests {
         let (second, _, _) = super::super::tests::window(cx);
         let shell2 = second.update(cx, |_, _, cx| cx.entity()).unwrap();
         let requests = vec![request.clone()];
+        let mut absent = std::collections::HashMap::new();
+        let now = 1_000_000;
         cx.update(|cx| {
             // No window to look in proves nothing; an unknown session neither.
-            assert!(stop_sessions(&[], &requests, cx).is_empty());
-            assert!(
-                stop_sessions(
-                    std::slice::from_ref(&shell2),
-                    &[(request.0.clone(), None)],
-                    cx
-                )
-                .is_empty()
+            assert!(stop_sessions(&[], &requests, &mut absent, now, cx).is_empty());
+            let unknown = [(request.0.clone(), None)];
+            let only_second = std::slice::from_ref(&shell2);
+            assert!(stop_sessions(only_second, &unknown, &mut absent, now, cx).is_empty());
+            // Open in no live window: done only after the grace period.
+            assert!(stop_sessions(only_second, &requests, &mut absent, now, cx).is_empty());
+            let later = now + STOP_ABSENT_GRACE_MS - 1;
+            assert!(stop_sessions(only_second, &requests, &mut absent, later, cx).is_empty());
+            let after = now + STOP_ABSENT_GRACE_MS;
+            assert_eq!(
+                stop_sessions(only_second, &requests, &mut absent, after, cx),
+                vec![request.0.clone()]
             );
             // Found in the first window and stopped, but not yet ended.
             let shells = [shell2.clone(), shell1.clone()];
-            assert!(stop_sessions(&shells, &requests, cx).is_empty());
+            assert!(stop_sessions(&shells, &requests, &mut absent, now, cx).is_empty());
             assert!(
                 view.read(cx).follow_ups_paused(),
                 "stopped like sessions.stop"
             );
             assert!(view.read(cx).turn_running());
-            // The turn ends: now the stop is done.
+            // The turn ends: now the stop is done, with no grace needed.
             view.update(cx, |view, _| view.end_turn_for_test());
             assert_eq!(
-                stop_sessions(&shells, &requests, cx),
+                stop_sessions(&shells, &requests, &mut absent, now, cx),
                 vec![request.0.clone()]
             );
         });

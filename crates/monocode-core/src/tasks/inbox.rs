@@ -458,6 +458,7 @@ fn review(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskErr
         "task.verification_waiting" => "Verification needs your judgement",
         "recovery.blocked" => "Recovery is blocked",
         "recovery.exhausted" => "Recovery ran out of retries",
+        "recovery.stop_stalled" => "A failed worker has not stopped",
         "recovery.ended_without_result" => {
             "A worker ended without reporting a result; never assume it succeeded"
         }

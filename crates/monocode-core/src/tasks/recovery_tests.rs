@@ -568,3 +568,44 @@ fn a_paused_task_blocked_by_configuration_is_blocked_when_it_resumes() {
     assert_eq!(launcher.count(), 2);
     assert_eq!(launcher.last().1.account.id, "default");
 }
+
+#[test]
+fn a_stop_that_never_completes_is_reported_once_and_blocks_the_replacement() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    let session = launched(&store, &repo, &launcher);
+    let Outcome::Retry { at, .. } = fail(&store, session, "503", NOW + 1) else {
+        panic!("expected a retry");
+    };
+    // The app never confirms the stop.
+    let late = (NOW + 1 + STOP_STALL_MS).max(at);
+    let tick = coordinator().tick(&store, &launcher, late - 1).unwrap();
+    assert!(tick.stalled.is_empty());
+    let tick = coordinator().tick(&store, &launcher, late).unwrap();
+    assert_eq!(tick.stalled.len(), 1, "{tick:?}");
+    let tick = coordinator()
+        .tick(&store, &launcher, late + 10_000)
+        .unwrap();
+    assert!(tick.stalled.is_empty(), "reported once");
+    assert_eq!(
+        launcher.count(),
+        1,
+        "no replacement over an unstopped worker"
+    );
+    assert_eq!(kinds(&store, "recovery.stop_stalled").len(), 1);
+    let batch = crate::tasks::inbox::next_batch(&store, "mono-1", late + 10_001)
+        .unwrap()
+        .unwrap();
+    assert!(
+        batch.message.contains("A failed worker has not stopped"),
+        "{}",
+        batch.message
+    );
+    // Once the app confirms the stop, recovery continues.
+    stop_all(&store, late + 10_002);
+    coordinator()
+        .tick(&store, &launcher, late + 10_003)
+        .unwrap();
+    assert_eq!(launcher.count(), 2);
+}

@@ -83,6 +83,8 @@ pub struct Tick {
     pub failed: Vec<String>,
     /// Replacement attempts recovery created for interrupted ones.
     pub recovered: Vec<String>,
+    /// Interrupted attempts whose stop stalled (reported once each).
+    pub stalled: Vec<String>,
     /// Attempts whose succeeded claim was queued for review.
     pub reviews: Vec<String>,
     pub leased_elsewhere: Vec<String>,

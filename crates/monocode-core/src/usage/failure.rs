@@ -75,7 +75,7 @@ impl Failure {
         }
         if matches(
             &UNAVAILABLE,
-            r"(?i)not installed|command not found|no such file or directory|\benoent\b|\(os error \d+\)|failed to (?:spawn|start|launch)|could not (?:start|launch|find) (?:the )?(?:provider|codex|claude|cli)|(?:exited|crashed) (?:unexpectedly|with (?:code|status|signal))",
+            r"(?i)not installed|command not found|no such file or directory|\benoent\b|(?:failed to (?:spawn|start|launch|execute)|permission denied|no such file)[^\n]*\(os error \d+\)|failed to (?:spawn|start|launch)|could not (?:start|launch|find) (?:the )?(?:provider|codex|claude|cli)|(?:exited|crashed) (?:unexpectedly|with (?:code|status|signal))",
             text,
         ) {
             return Self::ProviderUnavailable;
@@ -184,6 +184,14 @@ mod tests {
             ),
             // An OS spawn error is the provider, not a policy refusal.
             ("Permission denied (os error 13)", ProviderUnavailable),
+            // Network failures carry OS error numbers too; they stay retryable.
+            (
+                "stream disconnected before completion: error sending request: Connection reset by peer (os error 54)",
+                Temporary,
+            ),
+            ("Connection reset by peer (os error 54)", Temporary),
+            ("Operation timed out (os error 60)", Temporary),
+            ("failed to spawn codex: Permission denied (os error 13)", ProviderUnavailable),
             ("403 Forbidden", Policy),
             ("HTTP status 403", Policy),
             ("status code: 500", Temporary),

@@ -10,6 +10,7 @@ use monocode_core::agent::Settings;
 use monocode_core::store::Session;
 use monocode_core::tasks;
 use monocode_core::tasks::coordinator::{Coordinator, ExplicitStart, Launcher, TICK_INTERVAL_MS};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Where coordinator launches are installed (the latest Shell to start its
@@ -17,6 +18,8 @@ use std::time::Duration;
 struct Service {
     shell: WeakEntity<Shell>,
     shells: Vec<WeakEntity<Shell>>,
+    /// Stop requests whose session was open in no window, since when.
+    absent: HashMap<String, u64>,
 }
 
 impl Service {
@@ -99,6 +102,10 @@ fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> R
     Ok(())
 }
 
+/// How long a stop request's session must be open in no window before the
+/// stop counts as done (a torn-down window's provider may still be exiting).
+pub(crate) const STOP_ABSENT_GRACE_MS: u64 = 10_000;
+
 /// Stops each requested session in every window that has it and returns the
 /// requests that are done: the session's turn has ended everywhere it is
 /// open, or it is open in none of the (at least one) live windows. A session
@@ -107,6 +114,8 @@ fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> R
 pub(crate) fn stop_sessions(
     shells: &[Entity<Shell>],
     requests: &[(String, Option<i64>)],
+    absent: &mut HashMap<String, u64>,
+    now: u64,
     cx: &mut App,
 ) -> Vec<String> {
     if shells.is_empty() {
@@ -121,8 +130,19 @@ pub(crate) fn stop_sessions(
             .iter()
             .filter_map(|shell| shell.update(cx, |shell, cx| shell.stop_task_worker(*handle, cx)))
             .collect();
-        if !running.iter().any(|still| *still) {
-            done.push(delivery.clone());
+        if running.is_empty() {
+            // Open nowhere: its window may have just been torn down while
+            // the provider still exits, so wait out a grace period first.
+            let since = *absent.entry(delivery.clone()).or_insert(now);
+            if now >= since.saturating_add(STOP_ABSENT_GRACE_MS) {
+                absent.remove(delivery);
+                done.push(delivery.clone());
+            }
+        } else {
+            absent.remove(delivery);
+            if !running.iter().any(|still| *still) {
+                done.push(delivery.clone());
+            }
         }
     }
     done
@@ -165,11 +185,15 @@ async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
         }
     };
     let done = cx.update(|cx| {
-        let shells = cx
-            .try_global::<Service>()
-            .map(Service::live_shells)
-            .unwrap_or_default();
-        stop_sessions(&shells, &requests, cx)
+        let Some(service) = cx.try_global::<Service>() else {
+            return Vec::new();
+        };
+        let shells = service.live_shells();
+        let mut absent = std::mem::take(&mut cx.global_mut::<Service>().absent);
+        let now = monocode_core::time::now_ms();
+        let done = stop_sessions(&shells, &requests, &mut absent, now, cx);
+        cx.global_mut::<Service>().absent = absent;
+        done
     });
     if done.is_empty() {
         return;
@@ -211,12 +235,18 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
             .cloned()
             .collect();
         shells.push(shell.clone());
-        cx.set_global(Service { shell, shells });
+        let absent = std::mem::take(&mut cx.global_mut::<Service>().absent);
+        cx.set_global(Service {
+            shell,
+            shells,
+            absent,
+        });
         return;
     }
     cx.set_global(Service {
         shell: shell.clone(),
         shells: vec![shell],
+        absent: HashMap::new(),
     });
     let (launches, receive) = async_channel::unbounded::<(Session, Settings)>();
     // Wakes the stop pump: after each tick and after each confirmation.
@@ -310,8 +340,16 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                         .map_err(|e| e.to_string())
                 });
                 match tick {
-                    Ok(tick) if !tick.errors.is_empty() => {
-                        eprintln!("Task coordinator: {}", tick.errors.join("; "))
+                    Ok(tick) if !tick.errors.is_empty() || !tick.stalled.is_empty() => {
+                        if !tick.errors.is_empty() {
+                            eprintln!("Task coordinator: {}", tick.errors.join("; "));
+                        }
+                        if !tick.stalled.is_empty() {
+                            eprintln!(
+                                "Task recovery: the stop of {} has not been confirmed; no replacement starts until it is.",
+                                tick.stalled.join(", ")
+                            );
+                        }
                     }
                     Err(error) => eprintln!("Task coordinator: {error}"),
                     Ok(_) => {}

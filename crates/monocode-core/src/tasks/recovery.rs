@@ -41,6 +41,9 @@ pub const RETRY_BUDGET: u32 = 3;
 pub const BACKOFF_BASE_MS: u64 = 15_000;
 /// ...up to this.
 pub const BACKOFF_MAX_MS: u64 = 10 * 60 * 1000;
+/// How long a stop request may stay unconfirmed before recovery reports it
+/// (it still never launches a replacement over an unstopped worker).
+pub const STOP_STALL_MS: u64 = 2 * 60 * 1000;
 /// Where requests to stop a failed worker's session wait for the app.
 pub const WORKER_STOP: &str = "worker_stop";
 /// The category of a session that ended with no result and no error.

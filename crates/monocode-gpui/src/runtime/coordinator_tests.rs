@@ -347,10 +347,20 @@ fn a_worker_that_hits_its_usage_limit_continues_on_the_next_allowed_account() {
             |_| Some(binary),
         );
     });
+    // A misbehaving fixture fails the test instead of hanging it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let finished = loop {
-        let update = receive.recv_blocking().expect("runtime closed early");
-        if update.finished {
-            break update;
+        match receive.try_recv() {
+            Ok(update) if update.finished => break update,
+            Ok(_) => {}
+            Err(async_channel::TryRecvError::Empty) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the fixture turn did not finish within 60 s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(async_channel::TryRecvError::Closed) => panic!("runtime closed early"),
         }
     };
     worker.join().unwrap();
