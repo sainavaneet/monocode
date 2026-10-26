@@ -74,6 +74,9 @@ impl Conversation {
                     if let Some(revision) = value["revision"].as_u64() {
                         row.revision = revision;
                     }
+                    if let Some(plan) = value["planRevision"].as_u64() {
+                        row.plan_revision = plan;
+                    }
                     if let Some(display) = value["display"]
                         .as_str()
                         .and_then(|d| serde_json::from_value(serde_json::json!(d)).ok())
@@ -119,7 +122,12 @@ impl Conversation {
             let buttons = offered(row).into_iter().map(|(action, label)| {
                 let control = TaskControl {
                     task_id: row.task_id.clone(),
-                    revision: row.revision,
+                    // A steer is checked against the plan it was written for.
+                    revision: if action == "tasks.steer" {
+                        row.plan_revision
+                    } else {
+                        row.revision
+                    },
                     action,
                     requirements: None,
                     confirmed_stopped: action == "tasks.resume" && row.confirm_stopped,
@@ -187,6 +195,7 @@ mod tests {
             task_id: "t".into(),
             title: "T".into(),
             revision: 1,
+            plan_revision: 1,
             display,
             reason: None,
             resumable,

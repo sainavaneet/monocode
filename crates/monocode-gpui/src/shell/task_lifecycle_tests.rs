@@ -21,10 +21,15 @@ fn task(shell: &Shell) -> monocode_core::tasks::Task {
 fn control(view: &Entity<Conversation>, action: &'static str, cx: &mut Context<Shell>) {
     view.update(cx, |view, cx| {
         let row = view.task_controls[0].clone();
+        let revision = if action == "tasks.steer" {
+            row.plan_revision
+        } else {
+            row.revision
+        };
         view.request_task_control(
             TaskControl {
                 task_id: row.task_id,
-                revision: row.revision,
+                revision,
                 action,
                 requirements: None,
                 confirmed_stopped: false,
@@ -178,10 +183,16 @@ fn a_steer_from_the_card_is_refused_when_the_plan_changed_since_it_was_shown(
             let rows = lifecycle::controls(&locked(&shell.store).unwrap(), "mono-1").unwrap();
             let view = shell.sessions[&lead].clone();
             view.update(cx, |view, cx| view.set_task_controls(rows, cx));
-            // Mono changes the task after the card showed it.
-            let revision = task(shell).revision;
+            // Mono steers the plan after the card showed it.
+            let plan = task(shell).plan_revision;
             let store = locked(&shell.store).unwrap();
-            lifecycle::pause(&store, "t", revision, Requester::Mono, 5).unwrap();
+            let earlier = monocode_core::tasks::steer::Steer {
+                requirements: "Use the new API".into(),
+                assignments: vec!["a".into()],
+                plan: None,
+            };
+            monocode_core::tasks::steer::steer(&store, "t", plan, Requester::Mono, &earlier, 5)
+                .unwrap();
             drop(store);
             view.update(cx, |view, cx| {
                 view.input
@@ -202,7 +213,8 @@ fn a_steer_from_the_card_is_refused_when_the_plan_changed_since_it_was_shown(
             assert!(error.contains("plan changed"), "{error}");
             let store = locked(&shell.store).unwrap();
             let events = store.tasks().unwrap().events_after(0, 1_000).unwrap();
-            assert!(events.iter().all(|e| e.kind != "task.steered"));
+            let steered = events.iter().filter(|e| e.kind == "task.steered").count();
+            assert_eq!(steered, 1, "only Mono's steer");
         })
         .unwrap();
 }

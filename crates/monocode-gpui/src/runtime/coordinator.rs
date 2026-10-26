@@ -323,10 +323,23 @@ pub(crate) fn reconcile_startup(store: Database) -> Option<std::thread::JoinHand
 /// Git checks of recorded workspaces run unlocked, so the first window can
 /// open meanwhile.
 pub(crate) fn run_startup(store: &Database) -> Result<tasks::restart::Startup, String> {
+    reconcile(store, true)
+}
+
+/// Startup's sequence over every unfinished task (`every`, at launch) or
+/// only those with work or workers (each tick, so idle tasks stay free for
+/// another app). The store is locked only to read and write, never for Git.
+fn reconcile(store: &Database, every: bool) -> Result<tasks::restart::Startup, String> {
     let now = monocode_core::time::now_ms;
-    let (mut startup, pending) = coordinator()
-        .startup_prepare(&*locked(store)?, now())
-        .map_err(|e| e.to_string())?;
+    let prepared = {
+        let store = locked(store)?;
+        if every {
+            coordinator().startup_prepare(&store, now())
+        } else {
+            coordinator().takeover_prepare(&store, now())
+        }
+    };
+    let (mut startup, pending) = prepared.map_err(|e| e.to_string())?;
     let problems = tasks::restart::check_pending(&pending);
     coordinator()
         .startup_finish(&*locked(store)?, &mut startup, problems, now())
@@ -453,7 +466,7 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                 }
                 // Tasks taken over since startup are reconciled the same way:
                 // the store is locked only to read and write, never for Git.
-                match run_startup(&store) {
+                match reconcile(&store, false) {
                     Ok(taken) if !taken.errors.is_empty() => {
                         eprintln!("Task coordinator takeover: {}", taken.errors.join("; "))
                     }
