@@ -29,6 +29,29 @@ impl Launcher for ShellLauncher {
     }
 }
 
+/// Reviews workers' success claims. Only collecting the requests and
+/// recording the outcomes hold the store lock; snapshotting the workspace and
+/// running the plan's checks (which may take minutes) do not.
+fn review_claims(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> Result<(), String> {
+    let jobs = {
+        let store = locked(store)?;
+        if !tasks::coordinator::enabled(&store) {
+            return Ok(());
+        }
+        coordinator
+            .review_jobs(&store, monocode_core::time::now_ms())
+            .map_err(|e| e.to_string())?
+    };
+    for job in jobs {
+        let inspection = job.inspect();
+        let store = locked(store)?;
+        coordinator
+            .record_review(&store, &job, inspection, monocode_core::time::now_ms())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// A name for this process in task leases; never shared with another process.
 fn holder() -> String {
     format!(
@@ -104,6 +127,9 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                     }
                     Err(error) => eprintln!("Task coordinator: {error}"),
                     Ok(_) => {}
+                }
+                if let Err(error) = review_claims(&coordinator, &store) {
+                    eprintln!("Task coordinator review: {error}");
                 }
             }
         })
