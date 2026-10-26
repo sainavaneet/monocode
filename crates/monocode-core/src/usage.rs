@@ -2,8 +2,11 @@
 //! Blocking probes belong on a worker. Credentials are read only, never rotated.
 pub(crate) mod claude;
 mod devin;
+mod failure;
 mod opencode;
 mod pi;
+
+pub use failure::Failure;
 
 use crate::{catalog, provider::Kind};
 use serde_json::Value;

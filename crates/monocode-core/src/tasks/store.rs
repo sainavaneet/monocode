@@ -49,7 +49,13 @@ CREATE TABLE IF NOT EXISTS native_task_deliveries(id TEXT PRIMARY KEY,
   payload_ref TEXT NOT NULL, state TEXT NOT NULL, retries INTEGER NOT NULL, last_error TEXT,
   revision INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS native_task_leases(resource TEXT PRIMARY KEY, holder TEXT NOT NULL,
-  expires_at INTEGER NOT NULL, generation INTEGER NOT NULL);";
+  expires_at INTEGER NOT NULL, generation INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS native_task_recoveries(attempt_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES native_tasks(id), assignment_id TEXT NOT NULL,
+  root_attempt TEXT NOT NULL, retries_used INTEGER NOT NULL, category TEXT NOT NULL,
+  reason TEXT NOT NULL, provider TEXT NOT NULL, failed_account TEXT, next_provider TEXT,
+  next_account TEXT, state TEXT NOT NULL, due_at INTEGER NOT NULL, replacement TEXT,
+  revision INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);";
 
 pub(crate) fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)

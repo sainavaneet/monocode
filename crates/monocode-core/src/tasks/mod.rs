@@ -12,9 +12,13 @@ pub mod events;
 pub mod findings;
 #[doc(hidden)]
 pub mod fixtures;
+pub mod handoff;
 pub mod inbox;
 mod launch;
 pub mod model;
+pub mod policy;
+pub mod recovery;
+mod replace;
 pub mod review;
 pub mod states;
 pub mod store;

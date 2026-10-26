@@ -456,6 +456,11 @@ fn review(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskErr
     let what = match event.kind.as_str() {
         "task.needs_integration" => "Integration needs your judgement",
         "task.verification_waiting" => "Verification needs your judgement",
+        "recovery.blocked" => "Recovery is blocked",
+        "recovery.exhausted" => "Recovery ran out of retries",
+        "recovery.ended_without_result" => {
+            "A worker ended without reporting a result; never assume it succeeded"
+        }
         _ => "Review needs your judgement",
     };
     let mut text = format!(
@@ -463,6 +468,9 @@ fn review(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskErr
         event.id,
         context(tasks, &event.task_id, event.assignment_id.as_deref())?
     );
+    if let Some(reason) = event.payload["reason"].as_str() {
+        text.push_str(&format!("\nReason: {reason}"));
+    }
     if let Some(claim) = event
         .attempt_id
         .as_deref()

@@ -1,5 +1,6 @@
 //! Provider-owned sign-ins. Metadata never contains credentials.
 mod desktop;
+pub mod eligibility;
 mod identity;
 pub(crate) use desktop::DesktopOverrides;
 pub(crate) mod login;

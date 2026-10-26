@@ -12,6 +12,8 @@ use super::coordinator::{
     REVIEW,
 };
 use super::events::append;
+use super::policy::{self, LaunchAccount};
+use super::recovery;
 use super::states::{apply, is_latest_attempt};
 use super::store::read_ms;
 use super::worker::{claim_event, event, payload_of, settle};
@@ -20,11 +22,13 @@ use super::{
     Assignment, AssignmentState, Attempt, AttemptState, ClaimOutcome, DecisionState, NewAttempt,
     NewEvent, Requester, State, Subject, Task, TaskError, TaskLifecycle, TaskStore, Workspace,
 };
+use crate::accounts::Profile;
 use crate::agent::Settings;
 use crate::app_access;
 use crate::orchestration::WorkspaceMode;
 use crate::provider::Kind;
 use crate::store::{Session, Store};
+use crate::usage::Failure;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 
@@ -37,6 +41,8 @@ const DISPATCH_FAILED: &str = "attempt.dispatch_failed";
 const START_FAILED: &str = "attempt.start_failed";
 /// A recovery condition: reserved, never confirmed started.
 const UNCONFIRMED: &str = "launch.unconfirmed";
+/// A session the app started after its attempt stopped waiting for it.
+const ORPHANED: &str = "launch.orphaned";
 
 fn storage(error: String) -> TaskError {
     TaskError::Storage(error)
@@ -66,6 +72,16 @@ impl<P: Policy> Coordinator<P> {
         let attempt = match latest_attempt(&tasks, &task.id, &assignment.id)? {
             Some(attempt) if in_flight(&attempt) => attempt,
             _ => {
+                // The task's snapshot decides the account (account ids only).
+                let policy = policy::capture(store, task, &self.policy.worker_provider(task), now)?;
+                let account = match policy::launch_choice(store, &policy, now)? {
+                    LaunchAccount::Use(account) => account,
+                    LaunchAccount::Wait => return Ok(None),
+                    LaunchAccount::Block(reason) => {
+                        unavailable(&tasks, task, assignment, &reason, now)?;
+                        return Ok(None);
+                    }
+                };
                 let id = crate::mono::new_id();
                 tasks.create_attempt(
                     &NewAttempt {
@@ -73,8 +89,8 @@ impl<P: Policy> Coordinator<P> {
                         task_id: task.id.clone(),
                         assignment_id: assignment.id.clone(),
                         operation_id: format!("task-launch-{id}"),
-                        provider: self.policy.worker_provider(task),
-                        account_id: None,
+                        provider: account.provider,
+                        account_id: Some(account.account_id),
                     },
                     now,
                 )?
@@ -166,10 +182,13 @@ impl<P: Policy> Coordinator<P> {
         };
         match attempt.status {
             AttemptState::Created | AttemptState::Starting => {
+                // A replacement created while its assignment still waited for
+                // a decision resumes too.
                 let resumable = matches!(
                     assignment.status,
                     AssignmentState::Ready | AssignmentState::Running
-                );
+                ) || (attempt.status == AttemptState::Created
+                    && assignment.status == AssignmentState::WaitingForDecision);
                 if !resumable {
                     return Ok(());
                 }
@@ -187,9 +206,11 @@ impl<P: Policy> Coordinator<P> {
                 if attempt.session_id.is_none() {
                     self.dispatch(store, task, &attempt, launcher, now, tick)?;
                 } else if unconfirmed(&tasks, &attempt, now)? {
+                    // A crash after the reservation: recovered like any
+                    // other failure to start.
                     let reason =
                         "The worker session was reserved but the app never confirmed it started.";
-                    fail(&tasks, &attempt, Some((UNCONFIRMED, reason)), now)?;
+                    launch_failed(store, &attempt, UNCONFIRMED, reason, now)?;
                     tick.failed.push(attempt.id);
                 }
             }
@@ -199,6 +220,9 @@ impl<P: Policy> Coordinator<P> {
                     fail(&tasks, &attempt, None, now)?;
                     tick.failed.push(attempt.id);
                 }
+            }
+            AttemptState::Interrupted => {
+                self.recover(store, task, assignment, &attempt, launcher, now, tick)?;
             }
             AttemptState::Succeeded => {
                 let queued = assignment.status == AssignmentState::NeedsReview
@@ -281,6 +305,12 @@ pub(super) fn reserve(
         Some(reason) => format!("{prompt}\n\nMono sent the previous attempt back: {reason}"),
         None => prompt,
     };
+    // A replacement continues from its durable hand-off.
+    let handoff = super::handoff::of(&tasks, &attempt.id).map_err(|e| e.to_string())?;
+    let prompt = match &handoff {
+        Some(handoff) => format!("{prompt}\n\n{}", super::handoff::text(handoff)),
+        None => prompt,
+    };
     let title: String = format!("{}: {}", task.title, assignment.title)
         .chars()
         .take(TITLE_CHARS)
@@ -289,9 +319,30 @@ pub(super) fn reserve(
     if workspace.mode == WorkspaceMode::Worktree {
         input["worktreeCwd"] = json!(workspace.path);
     }
-    let models = crate::catalog::cached_models_for(kind, &Default::default()).unwrap_or_default();
-    let mut settings =
-        app_access::launch_settings(&input, kind.id(), Settings::default(), kind, &models)?;
+    // The account recovery or the allowlist chose, and the billing choice
+    // snapshotted when the task was created; never the live preference.
+    let snapshot = policy::of(&tasks, &task.id).map_err(|e| e.to_string())?;
+    let account = attempt
+        .account_id
+        .clone()
+        .or_else(|| snapshot.as_ref().map(|p| p.start_account.clone()))
+        .unwrap_or_else(|| crate::accounts::DEFAULT.into());
+    let profile = match store.data_dir() {
+        Some(root) => Profile::new(&account, root),
+        None => Profile {
+            id: account,
+            root: None,
+        },
+    };
+    let billing = snapshot.as_ref().is_some_and(|p| p.use_api_key);
+    let base = Settings {
+        account: profile.clone(),
+        use_api_key: billing,
+        api_key_pin: Some(billing),
+        ..Settings::default()
+    };
+    let models = crate::catalog::cached_models_for(kind, &profile).unwrap_or_default();
+    let mut settings = app_access::launch_settings(&input, kind.id(), base, kind, &models)?;
     settings.revision = 0;
     // Validates and selects the recorded worktree before anything is
     // reserved; the session id only names worktrees this never creates.
@@ -304,12 +355,24 @@ pub(super) fn reserve(
         kind.id(),
         &task.project,
     )?;
+    let mut resumed = false;
     if fresh {
         store.title(session.id, &title)?;
         session.title = title;
         store.configure_agent(session.id, kind.id(), &settings)?;
         store.prepare_app_prompt(session.id, &attempt.operation_id, &prompt)?;
         session.has_messages = true;
+        // Resume the failed worker's provider thread when it can move to
+        // this account; otherwise the hand-off alone carries the work.
+        if let Some(handoff) = &handoff {
+            if let Some(thread) =
+                resumable_thread(store, &tasks, &handoff.from_attempt, &profile, kind)
+            {
+                store.provider_id(session.id, &thread)?;
+                session.provider_id = Some(thread);
+                resumed = true;
+            }
+        }
     }
     // The answers this brief carries; confirming the start hands them over.
     let carried: Vec<_> = decisions
@@ -321,12 +384,50 @@ pub(super) fn reserve(
         attempt,
         briefed_event(&attempt.id),
         "attempt.briefed",
-        json!({"decisions": carried}),
+        json!({"decisions": carried, "resumedThread": resumed}),
     );
     tasks
         .append_event(&briefed, attempt.updated_at)
         .map_err(|e| e.to_string())?;
     Ok((session, settings, fresh))
+}
+
+/// The provider thread of the attempt `from`, carried to `to`'s account
+/// home when it differs. None when it had no thread, the provider cannot
+/// resume, or the transfer fails.
+fn resumable_thread(
+    store: &Store,
+    tasks: &TaskStore<'_>,
+    from: &str,
+    to: &Profile,
+    kind: Kind,
+) -> Option<String> {
+    if !matches!(kind, Kind::Codex | Kind::Claude) {
+        return None;
+    }
+    let previous = tasks.attempt(from).ok()??;
+    if previous.provider != kind.id() {
+        return None;
+    }
+    let handle = store
+        .resolve_session_id(previous.session_id.as_deref()?)
+        .ok()?;
+    let thread = store
+        .sessions()
+        .ok()?
+        .into_iter()
+        .find(|s| s.id == handle)?
+        .provider_id?;
+    let account = previous
+        .account_id
+        .unwrap_or_else(|| crate::accounts::DEFAULT.into());
+    if account != to.id {
+        let root = store.data_dir()?;
+        Profile::new(&account, root)
+            .transfer(to, kind, &thread)
+            .ok()?;
+    }
+    Some(thread)
 }
 
 fn workspace_of(tasks: &TaskStore<'_>, task: &str, assignment: &str) -> Result<Workspace, String> {
@@ -426,6 +527,7 @@ pub fn confirm_started(store: &Store, session: i64, now: u64) -> Result<bool, Ta
         return Ok(false);
     };
     if attempt.status != AttemptState::Starting {
+        orphaned(store, &attempt, now)?;
         return Ok(false);
     }
     let tasks = store.tasks()?;
@@ -450,7 +552,79 @@ pub fn start_failed(store: &Store, session: i64, reason: &str, now: u64) -> Resu
     if attempt.status != AttemptState::Starting {
         return Ok(());
     }
-    fail(&store.tasks()?, &attempt, Some((START_FAILED, reason)), now)
+    launch_failed(store, &attempt, START_FAILED, reason, now)
+}
+
+/// A launch that never started: the failure event, then recovery as a
+/// temporary failure (backoff, the retry budget, a replacement).
+fn launch_failed(
+    store: &Store,
+    attempt: &Attempt,
+    kind: &str,
+    reason: &str,
+    now: u64,
+) -> Result<(), TaskError> {
+    let tasks = store.tasks()?;
+    let id = format!("{kind}:{}", attempt.id);
+    let payload = json!({"reason": reason});
+    tasks.append_event(&event(attempt, id, kind, payload), now)?;
+    recovery::interrupt(store, &attempt.id, Failure::Temporary, reason, None, now)?;
+    Ok(())
+}
+
+/// The app started a session after its attempt stopped waiting for it (it
+/// timed out, failed or was cancelled): a running worker nobody owns. It is
+/// recorded once and stopped through the stop path, so two agents never
+/// write one worktree.
+fn orphaned(store: &Store, attempt: &Attempt, now: u64) -> Result<(), TaskError> {
+    let finished = matches!(
+        attempt.status,
+        AttemptState::Interrupted | AttemptState::Failed | AttemptState::Cancelled
+    );
+    let Some(session) = attempt.session_id.as_deref().filter(|_| finished) else {
+        return Ok(());
+    };
+    let tasks = store.tasks()?;
+    let id = format!("orphaned:{}", attempt.id);
+    let payload = json!({"sessionId": session, "status": attempt.status});
+    let tx = tasks.begin()?;
+    let inside = TaskStore { conn: &tx };
+    let stored = append(&tx, &event(attempt, id, ORPHANED, payload), now)?;
+    let reference = format!("session:{session}");
+    inside.enqueue_delivery(
+        &format!("stop-orphan:{}", attempt.id),
+        &stored.id,
+        recovery::WORKER_STOP,
+        &reference,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// No allowed account can run a fresh launch: the task is Blocked with why.
+fn unavailable(
+    tasks: &TaskStore<'_>,
+    task: &Task,
+    assignment: &Assignment,
+    reason: &str,
+    now: u64,
+) -> Result<(), TaskError> {
+    let tx = tasks.begin()?;
+    recovery::block(&tx, &task.id, reason, now)?;
+    let revision = TaskStore { conn: &tx }.revision(Subject::Task(&task.id))?;
+    let payload = json!({"assignmentId": assignment.id, "reason": reason});
+    let unavailable = NewEvent {
+        id: format!("account_unavailable:{}@{revision}", task.id),
+        task_id: task.id.clone(),
+        assignment_id: Some(assignment.id.clone()),
+        attempt_id: None,
+        kind: "task.account_unavailable".into(),
+        payload,
+    };
+    append(&tx, &unavailable, now)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// The coordinator's own classification: the attempt Failed, and its
@@ -485,7 +659,11 @@ fn fail(
     Ok(())
 }
 
-fn fail_assignment(conn: &Connection, attempt: &Attempt, now: u64) -> Result<(), TaskError> {
+pub(super) fn fail_assignment(
+    conn: &Connection,
+    attempt: &Attempt,
+    now: u64,
+) -> Result<(), TaskError> {
     let tasks = TaskStore { conn };
     let parent = Subject::Assignment {
         task: &attempt.task_id,

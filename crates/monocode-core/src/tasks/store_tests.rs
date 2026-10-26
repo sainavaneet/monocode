@@ -105,6 +105,7 @@ fn schema_is_additive_and_idempotent_on_the_shared_desktop_database() {
             "native_task_deliveries",
             "native_task_events",
             "native_task_leases",
+            "native_task_recoveries",
             "native_task_verifications",
             "native_task_workspaces",
             "native_tasks",
@@ -600,7 +601,7 @@ fn writable_desktop_stores_create_task_tables_on_first_use_and_readers_never_do(
         .unwrap()
         .create_task(&new_task("t"), 1)
         .unwrap();
-    assert_eq!(task_tables(&store), 9);
+    assert_eq!(task_tables(&store), 10);
     drop(store);
     let reader = Store::read_monocode(&path).unwrap();
     assert!(reader.tasks().unwrap().task("t").unwrap().is_some());
@@ -610,5 +611,5 @@ fn writable_desktop_stores_create_task_tables_on_first_use_and_readers_never_do(
         .unwrap()
         .create_task(&new_task("t"), 1)
         .unwrap();
-    assert_eq!(task_tables(&memory), 9);
+    assert_eq!(task_tables(&memory), 10);
 }

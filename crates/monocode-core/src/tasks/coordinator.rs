@@ -81,6 +81,8 @@ pub struct Tick {
     /// Attempts whose already-started session was bound without a relaunch.
     pub bound: Vec<String>,
     pub failed: Vec<String>,
+    /// Replacement attempts recovery created for interrupted ones.
+    pub recovered: Vec<String>,
     /// Attempts whose succeeded claim was queued for review.
     pub reviews: Vec<String>,
     pub leased_elsewhere: Vec<String>,

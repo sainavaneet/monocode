@@ -410,7 +410,7 @@ fn a_confirmed_start_moves_the_attempt_to_running_exactly_once() {
 }
 
 #[test]
-fn a_launch_the_app_cannot_start_fails_the_attempt_with_an_event() {
+fn a_launch_the_app_cannot_start_is_recovered_with_an_event() {
     let repo = repo();
     let store = open(&repo);
     started(&store, &repo, vec![scoped("a", &["src"], &[])]);
@@ -419,16 +419,15 @@ fn a_launch_the_app_cannot_start_fails_the_attempt_with_an_event() {
     ours.tick(&store, &launcher, NOW).unwrap();
     // No window to start it in.
     start_failed(&store, session_id(&launcher), "No window", NOW + 1).unwrap();
+    // Recovery (task-7) interrupts it and keeps its slot for a retry.
     let attempt = &attempts(&store, "a")[0];
-    assert_eq!(attempt.status, AttemptState::Failed);
-    assert_eq!(status(&store, "a"), AssignmentState::Failed);
+    assert_eq!(attempt.status, AttemptState::Interrupted);
+    assert_eq!(status(&store, "a"), AssignmentState::Running);
     let failed = events(&store, "attempt.start_failed");
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].payload["reason"], "No window");
-    assert_eq!(
-        events(&store, "attempt.failed")[0].payload["requester"],
-        "coordinator"
-    );
+    let interrupted = events(&store, "attempt.interrupted");
+    assert_eq!(interrupted[0].payload["requester"], "coordinator");
     ours.tick(&store, &launcher, NOW + 10).unwrap();
     assert_eq!(attempts(&store, "a").len(), 1);
 
@@ -445,7 +444,7 @@ fn a_launch_the_app_cannot_start_fails_the_attempt_with_an_event() {
 }
 
 #[test]
-fn an_unconfirmed_reservation_is_failed_after_the_timeout() {
+fn an_unconfirmed_reservation_is_recovered_after_the_timeout() {
     let repo = repo();
     let store = open(&repo);
     started(&store, &repo, vec![scoped("a", &["src"], &[])]);
@@ -474,8 +473,8 @@ fn an_unconfirmed_reservation_is_failed_after_the_timeout() {
     let expired = NOW + LAUNCH_CONFIRM_TIMEOUT_MS;
     let tick = second.tick(&store, &launcher, expired).unwrap();
     assert_eq!(tick.failed, vec![reserved.id.clone()]);
-    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Failed);
-    assert_eq!(status(&store, "a"), AssignmentState::Failed);
+    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Interrupted);
+    assert_eq!(status(&store, "a"), AssignmentState::Running);
     assert_eq!(events(&store, "launch.unconfirmed").len(), 1);
     assert!(launcher.started.borrow().is_empty());
     second.tick(&store, &launcher, expired + 1).unwrap();

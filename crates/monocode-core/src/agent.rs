@@ -109,6 +109,10 @@ pub struct Settings {
     /// the app preference; never saved with the conversation.
     #[serde(skip)]
     pub use_api_key: bool,
+    /// A task worker's billing choice, snapshotted into its task's policy:
+    /// it overrides the app preference for every turn of the worker.
+    #[serde(skip)]
+    pub api_key_pin: Option<bool>,
     #[serde(skip)]
     pub environment: std::collections::HashMap<String, String>,
     #[serde(skip)]
