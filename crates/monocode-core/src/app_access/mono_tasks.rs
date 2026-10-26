@@ -158,7 +158,11 @@ pub fn control(
         "tasks.cancel" => lifecycle::cancel(store, task, revision, requester, now),
         "tasks.resume" => {
             let ids = assignment_ids(input);
-            lifecycle::resume(store, task, revision, requester, &ids, now)
+            let request = lifecycle::Resume {
+                assignments: ids,
+                confirmed_stopped: input["confirmedStopped"] == true,
+            };
+            lifecycle::resume(store, task, revision, requester, &request, now)
         }
         "tasks.steer" => {
             let plan = match input.get("plan") {
@@ -174,7 +178,12 @@ pub fn control(
                 plan,
             };
             return steer::steer(store, task, revision, requester, &steer, now)
-                .map_err(failed)
+                .map_err(|error| match error {
+                    TaskError::Stale { .. } => format!(
+                        "The plan changed since you read it ({error}) Review the task and steer again."
+                    ),
+                    error => failed(error),
+                })
                 .and_then(|steered| serde_json::to_value(steered).map_err(|e| e.to_string()));
         }
         _ => return Err("Unknown task action. Run app help".into()),

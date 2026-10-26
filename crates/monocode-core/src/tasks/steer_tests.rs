@@ -4,7 +4,7 @@ use super::*;
 use crate::app_access::worker_action;
 use crate::tasks::coordinator::{Coordinator, Policy};
 use crate::tasks::decisions::tests::{independent, task_with};
-use crate::tasks::lifecycle::{pause, resume};
+use crate::tasks::lifecycle::{pause, resume, Resume};
 use crate::tasks::recovery::tests::{kinds, stop_all};
 use crate::tasks::recovery::{turn_ended, TurnEnd};
 use crate::tasks::review::tests::{open, repo, FakeLauncher, NOW};
@@ -318,7 +318,15 @@ fn pause_steer_and_resume_launch_nothing_until_the_stops_are_confirmed() {
         NOW + 3,
     )
     .unwrap();
-    resume(&store, "t", revision(&store), Requester::User, &[], NOW + 4).unwrap();
+    resume(
+        &store,
+        "t",
+        revision(&store),
+        Requester::User,
+        &Resume::default(),
+        NOW + 4,
+    )
+    .unwrap();
     for later in 5..8 {
         coordinator().tick(&store, &launcher, NOW + later).unwrap();
     }
@@ -344,9 +352,31 @@ fn every_resume_of_held_workers_is_recorded() {
     }
     stop_all(&store, NOW + 3);
     let at = revision(&store);
-    resume(&store, "t", at, Requester::Mono, &["a".into()], NOW + 4).unwrap();
+    resume(
+        &store,
+        "t",
+        at,
+        Requester::Mono,
+        &Resume {
+            assignments: vec!["a".into()],
+            ..Resume::default()
+        },
+        NOW + 4,
+    )
+    .unwrap();
     assert_eq!(revision(&store), at);
-    resume(&store, "t", at, Requester::Mono, &["b".into()], NOW + 5).unwrap();
+    resume(
+        &store,
+        "t",
+        at,
+        Requester::Mono,
+        &Resume {
+            assignments: vec!["b".into()],
+            ..Resume::default()
+        },
+        NOW + 5,
+    )
+    .unwrap();
     let resumes = kinds(&store, "task.resume_requested");
     assert_eq!(resumes.len(), 2);
     assert_eq!(resumes[1].payload["released"].as_array().unwrap().len(), 1);

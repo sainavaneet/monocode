@@ -42,7 +42,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "tasks.review.sendBack"=>"taskId assignmentId revision reason",
         "tasks.criteria.verify"=>"taskId criterionId check assignmentId",
         "tasks.pause"|"tasks.cancel"=>"taskId revision",
-        "tasks.resume"=>"taskId revision assignmentIds",
+        "tasks.resume"=>"taskId revision assignmentIds confirmedStopped",
         "tasks.steer"=>"taskId revision requirements assignmentIds plan",
         _=>return Err("Unknown app action. Run app help".into()),
     };
@@ -50,7 +50,15 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         if !fields.split_whitespace().any(|f| f == key) {
             return Err(format!("{action} does not take {key}"));
         }
-        if ["draft", "reveal", "notifyOnComplete", "existing", "enabled"].contains(&key.as_str())
+        if [
+            "draft",
+            "reveal",
+            "notifyOnComplete",
+            "existing",
+            "enabled",
+            "confirmedStopped",
+        ]
+        .contains(&key.as_str())
             && !value.is_boolean()
         {
             return Err(format!("{key} must be true or false"));
@@ -75,6 +83,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "notifyOnComplete",
             "existing",
             "enabled",
+            "confirmedStopped",
             "before",
             "limit",
             "offset",
@@ -247,6 +256,8 @@ mod tests {
         )
         .is_ok());
         assert!(validate("tasks.resume", &json!({"assignmentIds":"a"})).is_err());
+        assert!(validate("tasks.resume", &json!({"confirmedStopped":true})).is_ok());
+        assert!(validate("tasks.resume", &json!({"confirmedStopped":"yes"})).is_err());
         assert!(validate("tasks.resume", &json!({"assignmentIds":[" "]})).is_err());
         let steer = json!({"taskId":"t","revision":3,"requirements":"r","assignmentIds":["a"],
             "plan":{"title":"P","summary":"","tasks":[]}});

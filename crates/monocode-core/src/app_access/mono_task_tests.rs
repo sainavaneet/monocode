@@ -146,3 +146,44 @@ fn mono_pauses_resumes_steers_and_cancels_only_its_own_tasks() {
     )
     .is_err());
 }
+
+#[test]
+fn a_steer_against_an_older_revision_says_the_plan_changed() {
+    let (store, _) = fixture();
+    let read = store.tasks().unwrap().task("t").unwrap().unwrap().revision;
+    // Something else changes the task after it was read.
+    mono_task_action(
+        &store,
+        "mono-1",
+        "tasks.pause",
+        &json!({"taskId": "t", "revision": read}),
+        NOW + 1,
+    )
+    .unwrap();
+    let steer = json!({"taskId": "t", "revision": read, "requirements": "Also log errors",
+        "assignmentIds": ["a"]});
+    let refused = mono_task_action(&store, "mono-1", "tasks.steer", &steer, NOW + 2).unwrap_err();
+    assert!(refused.contains("plan changed"), "{refused}");
+    let events = store.tasks().unwrap().events_after(0, 1_000).unwrap();
+    assert!(events.iter().all(|e| e.kind != "task.steered"));
+}
+
+#[test]
+fn stops_for_sessions_no_longer_in_the_store_are_marked_gone() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    store
+        .save_setting(crate::tasks::coordinator::FLAG, "enabled")
+        .unwrap();
+    let worker = crate::tasks::fixtures::running_worker(&store, "mono-1", "/project").unwrap();
+    let revision = store.tasks().unwrap().task("t").unwrap().unwrap().revision;
+    crate::tasks::lifecycle::pause(&store, "t", revision, crate::tasks::Requester::User, NOW)
+        .unwrap();
+    let stops = crate::tasks::recovery::pending_stops(&store).unwrap();
+    assert_eq!(stops.len(), 1);
+    assert!(!stops[0].gone);
+    let mut store = store;
+    store.delete(worker).unwrap();
+    let stops = crate::tasks::recovery::pending_stops(&store).unwrap();
+    assert_eq!(stops.len(), 1);
+    assert!(stops[0].gone, "a deleted session cannot run");
+}

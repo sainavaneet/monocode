@@ -17,6 +17,9 @@ use super::events::{append, NewEvent};
 use super::guard::{may_be_running, request_stop, task_or_missing, task_stopping};
 use super::park::{move_rows, park, WAITING_ROWS};
 use super::recovery::{stop_delivery, HELD, SCHEDULED, SUPERSEDED};
+use super::restart::{
+    last_previous_holder, native_liveness, release_takeover_rows, takeover_held, Liveness,
+};
 use super::states::apply;
 use super::waiting::{waiting_cause, RESTART, TAKEOVER};
 use super::worker::settle;
@@ -76,6 +79,9 @@ pub struct ControlRow {
     /// Whether `tasks.resume` applies: paused, or held after a restart or a
     /// takeover (not a wait on a question, not a block).
     pub resumable: bool,
+    /// Resuming needs the user's confirmation that another app's workers
+    /// of this task have stopped (they could not be checked).
+    pub confirm_stopped: bool,
 }
 
 /// What a pause, resume or cancel did.
@@ -215,6 +221,24 @@ pub(super) fn cancel_attempt(
     request_stop(conn, attempt, id, &stop_delivery(&attempt.id), now)
 }
 
+/// What a resume asks for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resume {
+    /// Only these assignments' held workers (an Active task's workers the
+    /// user stopped by hand); empty for the whole task.
+    pub assignments: Vec<String>,
+    /// The caller confirmed that another app's workers of this task, which
+    /// this app cannot check, have stopped.
+    pub confirmed_stopped: bool,
+}
+
+/// Whether resuming takeover-held workers needs the caller's confirmation:
+/// the holder they were taken from is not provably gone.
+fn needs_confirmation(conn: &Connection, task: &str) -> Result<bool, TaskError> {
+    let previous = last_previous_holder(conn, task)?.unwrap_or_default();
+    Ok(native_liveness(&previous) != Liveness::Dead)
+}
+
 /// Whether resuming applies to the task as it is: paused, or waiting
 /// because a restart or a takeover held its workers.
 fn reopens(conn: &Connection, task: &Task) -> Result<bool, TaskError> {
@@ -241,10 +265,11 @@ pub fn resume(
     id: &str,
     revision: u64,
     requester: Requester,
-    assignments: &[String],
+    request: &Resume,
     now: u64,
 ) -> Result<Controlled, TaskError> {
     only_user_or_mono(requester)?;
+    let assignments = request.assignments.as_slice();
     let tasks = store.tasks()?;
     let current = task_or_missing(&tasks, id)?;
     if current.revision != revision {
@@ -255,7 +280,13 @@ pub fn resume(
         });
     }
     let reopen = reopens(tasks.conn, &current)?;
-    if !reopen && current.lifecycle != TaskLifecycle::Active {
+    let takeover = takeover_held(tasks.conn, id)?;
+    if takeover && !request.confirmed_stopped && needs_confirmation(tasks.conn, id)? {
+        return Err(TaskError::Invalid(
+            "Another app or process held this task and may still be running its workers. Make sure they are stopped, then resume with confirmedStopped: true.".into(),
+        ));
+    }
+    if !reopen && !takeover && current.lifecycle != TaskLifecycle::Active {
         return Err(TaskError::InvalidState {
             subject: format!("task:{id}"),
             state: current.lifecycle.as_str().into(),
@@ -279,6 +310,9 @@ pub fn resume(
         )?;
     }
     let mut released = Vec::new();
+    if takeover {
+        released.extend(release_takeover_rows(&tx, id, now)?);
+    }
     if assignments.is_empty() {
         released.extend(move_rows(&tx, id, None, &[HELD], SCHEDULED, now)?);
     }
@@ -292,7 +326,7 @@ pub fn resume(
             now,
         )?);
     }
-    if !reopen && released.is_empty() {
+    if !reopen && !takeover && released.is_empty() {
         return Err(TaskError::Invalid(
             "The task is not paused and has no held worker to resume.".into(),
         ));
@@ -396,8 +430,10 @@ pub fn controls(store: &Store, mono: &str) -> Result<Vec<ControlRow>, TaskError>
             Display::Blocked | Display::Waiting => task.blocked_reason.clone(),
             _ => None,
         };
+        let takeover = takeover_held(tasks.conn, &task.id)?;
         rows.push(ControlRow {
-            resumable: reopens(tasks.conn, &task)?,
+            resumable: takeover || reopens(tasks.conn, &task)?,
+            confirm_stopped: takeover && needs_confirmation(tasks.conn, &task.id)?,
             task_id: task.id,
             title: task.title,
             revision: task.revision,

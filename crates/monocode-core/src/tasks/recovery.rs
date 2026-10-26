@@ -620,6 +620,9 @@ pub struct StopRequest {
     pub delivery: String,
     /// The persisted session id (`Store::resolve_session_id` gives its handle).
     pub session_id: String,
+    /// The session is no longer in the store (deleted): it cannot run, so
+    /// the stop counts as done once the absent grace has passed.
+    pub gone: bool,
 }
 
 /// Stop requests the app has not carried out.
@@ -635,9 +638,12 @@ pub fn pending_stops(store: &Store) -> Result<Vec<StopRequest>, TaskError> {
         .into_iter()
         .filter_map(|d| {
             let session = d.payload_ref.strip_prefix("session:")?.to_owned();
+            // A store error proves nothing: the stop then stays pending.
+            let gone = store.session_persisted(&session) == Ok(false);
             Some(StopRequest {
                 delivery: d.id,
                 session_id: session,
+                gone,
             })
         })
         .collect())

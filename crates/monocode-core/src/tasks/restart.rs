@@ -59,26 +59,29 @@ pub fn native_liveness(holder: &str) -> Liveness {
     else {
         return Liveness::Unknown;
     };
-    if pid == std::process::id() || running(pid) {
-        Liveness::Alive
-    } else {
-        Liveness::Dead
+    if pid == std::process::id() {
+        return Liveness::Alive;
+    }
+    match running(pid) {
+        Some(true) => Liveness::Alive,
+        Some(false) => Liveness::Dead,
+        None => Liveness::Unknown,
     }
 }
 
+/// Whether process `pid` exists; None when it cannot be told (a pid out of
+/// range, or no cheap check on this platform).
 #[cfg(unix)]
-fn running(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
+fn running(pid: u32) -> Option<bool> {
+    let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
     // Signal 0 only checks that the process exists.
     let found = unsafe { libc::kill(pid, 0) } == 0;
-    found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    Some(found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 #[cfg(not(unix))]
-fn running(_pid: u32) -> bool {
-    true
+fn running(_pid: u32) -> Option<bool> {
+    None
 }
 
 /// What startup reconciliation did, by task, attempt, workspace or decision.
@@ -172,7 +175,8 @@ impl<P: Policy> Coordinator<P> {
     }
 
     /// Startup's last store part: records the recovery condition for the
-    /// workspaces the checks found missing or moved.
+    /// workspaces the checks found missing or moved, and marks each task
+    /// reconciled (a task whose finish failed is retried by the next tick).
     pub fn startup_finish(
         &self,
         store: &Store,
@@ -185,7 +189,7 @@ impl<P: Policy> Coordinator<P> {
         }
         let tasks = store.tasks()?;
         for (task, found) in problems {
-            if let Err(error) = record(&tasks, &task, &found, now, out) {
+            if let Err(error) = self.finish_one(&tasks, &task, &found, now, out) {
                 out.errors.push(format!("{task}: {error}"));
             }
         }
@@ -242,7 +246,7 @@ impl<P: Policy> Coordinator<P> {
     ) -> Result<(), TaskError> {
         if let Some(workspaces) = self.reconcile_store(store, id, now, out)? {
             let found = workspace_check::check(&workspaces);
-            record(&store.tasks()?, id, &found, now, out)?;
+            self.finish_one(&store.tasks()?, id, &found, now, out)?;
         }
         Ok(())
     }
@@ -268,14 +272,29 @@ impl<P: Policy> Coordinator<P> {
             task.lifecycle,
             TaskLifecycle::Cancelled | TaskLifecycle::Completed
         );
-        let mut workspaces = None;
-        if !finished {
-            let dead = (self.liveness)(&previous) == Liveness::Dead;
-            self.interrupt_running(&tasks, &task, dead, now, out)?;
-            workspaces = Some(workspace_check::to_check(&tasks, id)?);
-            out.restored.extend(restore_decisions(&tasks, id, now)?);
-            sync_waiting(&tasks, id, now)?;
+        if finished {
+            return Ok(Some(Vec::new()));
         }
+        let dead = (self.liveness)(&previous) == Liveness::Dead;
+        self.interrupt_running(&tasks, &task, dead, now, out)?;
+        out.restored.extend(restore_decisions(&tasks, id, now)?);
+        sync_waiting(&tasks, id, now)?;
+        Ok(Some(workspace_check::to_check(&tasks, id)?))
+    }
+
+    /// Records the workspace problems found for a task this holder took
+    /// over, then marks it reconciled. Only then: a failure before the mark
+    /// is retried by the next tick (every step is idempotent).
+    fn finish_one(
+        &self,
+        tasks: &TaskStore<'_>,
+        id: &str,
+        found: &[Problem],
+        now: u64,
+        out: &mut Startup,
+    ) -> Result<(), TaskError> {
+        record(tasks, id, found, now, out)?;
+        let previous = self.previous_holder(tasks, id)?;
         let payload = json!({"holder": self.holder, "previous": previous});
         let done = marker(
             restarted_event(id, &self.holder),
@@ -285,7 +304,7 @@ impl<P: Policy> Coordinator<P> {
         );
         tasks.append_event(&done, now)?;
         out.reconciled.push(id.into());
-        Ok(workspaces)
+        Ok(())
     }
 
     /// Moves every attempt whose worker ran under the previous holder to
@@ -336,9 +355,10 @@ impl<P: Policy> Coordinator<P> {
         Ok(())
     }
 
-    /// A task held because its previous holder might still run its workers
-    /// continues once that holder's process is gone (and the policy
-    /// continues after a restart).
+    /// Workers held because the previous holder might still run them
+    /// continue once that holder's process is gone (and the policy continues
+    /// after a restart), whatever the task's lifecycle; a task waiting only
+    /// for them is Active again.
     pub(super) fn release_takeover(
         &self,
         store: &Store,
@@ -346,7 +366,7 @@ impl<P: Policy> Coordinator<P> {
         now: u64,
     ) -> Result<(), TaskError> {
         let tasks = store.tasks()?;
-        if waiting_cause(tasks.conn, id)?.as_deref() != Some(TAKEOVER) {
+        if !takeover_held(tasks.conn, id)? {
             return Ok(());
         }
         let Some(previous) = self.previous_holder(&tasks, id)? else {
@@ -358,15 +378,61 @@ impl<P: Policy> Coordinator<P> {
             return Ok(());
         }
         let tx = tasks.begin()?;
-        tx.execute(
-            "UPDATE native_task_recoveries SET state=?2,due_at=?3,revision=revision+1,updated_at=?3
-             WHERE task_id=?1 AND category=?4 AND state=?5",
-            rusqlite::params![id, SCHEDULED, super::store::ms(now), TAKEOVER, HELD],
-        )?;
-        activate(&tx, id, now)?;
+        release_takeover_rows(&tx, id, now)?;
+        if waiting_cause(&tx, id)?.as_deref() == Some(TAKEOVER) {
+            activate(&tx, id, now)?;
+        }
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Whether workers of the task are held because a previous holder might
+/// still run them (independent of the task's lifecycle).
+pub(super) fn takeover_held(conn: &rusqlite::Connection, task: &str) -> Result<bool, TaskError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM native_task_recoveries WHERE task_id=?1 AND category=?2 AND state=?3)",
+        rusqlite::params![task, TAKEOVER, HELD],
+        |row| row.get(0),
+    )?)
+}
+
+/// Schedules the task's takeover-held workers now.
+pub(super) fn release_takeover_rows(
+    conn: &rusqlite::Connection,
+    task: &str,
+    now: u64,
+) -> Result<Vec<String>, TaskError> {
+    let held: Vec<String> = {
+        let mut statement = conn.prepare(
+            "SELECT attempt_id FROM native_task_recoveries WHERE task_id=?1 AND category=?2 AND state=?3",
+        )?;
+        let rows =
+            statement.query_map(rusqlite::params![task, TAKEOVER, HELD], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    conn.execute(
+        "UPDATE native_task_recoveries SET state=?2,due_at=?3,revision=revision+1,updated_at=?3
+         WHERE task_id=?1 AND category=?4 AND state=?5",
+        rusqlite::params![task, SCHEDULED, super::store::ms(now), TAKEOVER, HELD],
+    )?;
+    Ok(held)
+}
+
+/// The holder the task was last taken over from, by any holder.
+pub(super) fn last_previous_holder(
+    conn: &rusqlite::Connection,
+    task: &str,
+) -> Result<Option<String>, TaskError> {
+    Ok(conn
+        .query_row(
+            "SELECT json_extract(payload,'$.previous') FROM native_task_events
+             WHERE task_id=?1 AND kind='task.lease_taken_over' ORDER BY seq DESC LIMIT 1",
+            [task],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Runs the Git checks for what [`Coordinator::startup_prepare`] returned;
@@ -375,7 +441,6 @@ pub fn check_pending(pending: &Pending) -> Vec<(String, Vec<Problem>)> {
     pending
         .iter()
         .map(|(task, workspaces)| (task.clone(), workspace_check::check(workspaces)))
-        .filter(|(_, found)| !found.is_empty())
         .collect()
 }
 

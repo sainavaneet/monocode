@@ -67,7 +67,15 @@ fn pausing_interrupts_workers_before_stopping_them_and_shows_pausing_until_confi
 
     // Resuming continues on the same lineage and account, spending no retry.
     let revision = current(&store).revision;
-    let resumed = resume(&store, "t", revision, Requester::User, &[], NOW + 100).unwrap();
+    let resumed = resume(
+        &store,
+        "t",
+        revision,
+        Requester::User,
+        &Resume::default(),
+        NOW + 100,
+    )
+    .unwrap();
     assert_eq!(resumed.display, Display::Active);
     assert!(resumed.blocked.is_none());
     // The paused worker's session is stopped again (the user may have typed
@@ -129,7 +137,15 @@ fn late_results_do_not_revive_cancelled_tasks() {
     assert_eq!(assignment_status(&store), AssignmentState::Cancelled);
     // Neither a resume nor a review reopens it.
     let revision = current(&store).revision;
-    assert!(resume(&store, "t", revision, Requester::User, &[], NOW + 90).is_err());
+    assert!(resume(
+        &store,
+        "t",
+        revision,
+        Requester::User,
+        &Resume::default(),
+        NOW + 90
+    )
+    .is_err());
     let tasks = store.tasks().unwrap();
     let a = Subject::Assignment { task: "t", id: "a" };
     let rev = tasks.revision(a).unwrap();
@@ -182,7 +198,10 @@ fn a_user_stop_holds_the_worker_and_tells_mono_instead_of_failing_it() {
         "t",
         revision,
         Requester::Mono,
-        &["a".into()],
+        &Resume {
+            assignments: vec!["a".into()],
+            ..Resume::default()
+        },
         NOW + 90,
     )
     .unwrap();

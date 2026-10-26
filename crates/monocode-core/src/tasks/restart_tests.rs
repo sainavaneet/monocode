@@ -3,7 +3,7 @@
 use super::*;
 use crate::tasks::coordinator::{ExplicitStart, LEASE_TTL_MS};
 use crate::tasks::decisions::tests::ask;
-use crate::tasks::lifecycle::{display, pause, resume, Display};
+use crate::tasks::lifecycle::{display, pause, resume, Display, Resume};
 use crate::tasks::recovery::tests::{
     attempts, coordinator, fail, kinds, launched, launched_unconfirmed, stop_all, Recorded,
 };
@@ -189,7 +189,15 @@ fn paused_tasks_stay_paused_across_restart() {
         Display::Paused
     );
     // Resuming after the restart continues the paused work.
-    resume(&store, "t", task.revision, Requester::User, &[], LATER + 10).unwrap();
+    resume(
+        &store,
+        "t",
+        task.revision,
+        Requester::User,
+        &Resume::default(),
+        LATER + 10,
+    )
+    .unwrap();
     stop_all(&store, LATER + 10);
     restarted().tick(&store, &launcher, LATER + 11).unwrap();
     assert_eq!(launcher.count(), 2);
@@ -211,7 +219,15 @@ fn without_restart_continuation_the_task_waits_with_a_reason() {
     next.tick(&store, &launcher, LATER + 1).unwrap();
     assert_eq!(launcher.count(), 1);
     let revision = current(&store).revision;
-    resume(&store, "t", revision, Requester::User, &[], LATER + 2).unwrap();
+    resume(
+        &store,
+        "t",
+        revision,
+        Requester::User,
+        &Resume::default(),
+        LATER + 2,
+    )
+    .unwrap();
     stop_all(&store, LATER + 2);
     assert_eq!(current(&store).lifecycle, TaskLifecycle::Active);
     next.tick(&store, &launcher, LATER + 3).unwrap();
@@ -369,4 +385,125 @@ fn an_accepted_assignments_worktree_may_be_gone() {
     let startup = restarted().startup(&store, LATER).unwrap();
     assert!(startup.missing.is_empty(), "{startup:?}");
     assert_ne!(current(&store).lifecycle, TaskLifecycle::Blocked);
+}
+
+#[test]
+fn holders_that_cannot_be_checked_are_not_taken_for_dead() {
+    assert_eq!(native_liveness("monocode-desktop"), Liveness::Unknown);
+    assert_eq!(native_liveness("monocode-native:x:y"), Liveness::Unknown);
+    let huge = format!("monocode-native:{}:y", u32::MAX);
+    assert_eq!(native_liveness(&huge), Liveness::Unknown);
+    assert_eq!(native_liveness("monocode-native:0:y"), Liveness::Unknown);
+    let mine = format!("monocode-native:{}:y", std::process::id());
+    assert_eq!(native_liveness(&mine), Liveness::Alive);
+    let quit = format!("monocode-native:{}:y", dead_pid());
+    assert_eq!(native_liveness(&quit), Liveness::Dead);
+}
+
+#[test]
+fn a_takeover_of_a_task_that_already_waits_still_holds_and_releases_its_workers() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    let session = launched(&store, &repo, &launcher);
+    ask(&store, session, "q1", "Rename the crate?", "task");
+    coordinator().tick(&store, &launcher, NOW + 1).unwrap();
+    assert_eq!(current(&store).lifecycle, TaskLifecycle::Waiting);
+    // Taken over from the desktop app, which cannot be checked.
+    let tasks = store.tasks().unwrap();
+    tasks
+        .acquire_lease(
+            &lease_resource("t"),
+            "monocode-desktop",
+            1,
+            NOW + LEASE_TTL_MS + 1,
+        )
+        .unwrap();
+    let ours = Coordinator::new("monocode-native:0:new", ExplicitStart);
+    let startup = ours.startup(&store, LATER).unwrap();
+    assert_eq!(startup.held.len(), 1);
+    let rows = crate::tasks::lifecycle::controls(&store, "mono-1").unwrap();
+    assert!(rows[0].resumable && rows[0].confirm_stopped, "{rows:?}");
+    // Resuming needs the confirmation that the other app's worker stopped.
+    let revision = current(&store).revision;
+    let refused = resume(
+        &store,
+        "t",
+        revision,
+        Requester::User,
+        &Resume::default(),
+        LATER + 1,
+    );
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("confirmedStopped"));
+    let confirmed = Resume {
+        confirmed_stopped: true,
+        ..Resume::default()
+    };
+    let resumed = resume(
+        &store,
+        "t",
+        revision,
+        Requester::User,
+        &confirmed,
+        LATER + 2,
+    )
+    .unwrap();
+    assert_eq!(resumed.attempts.len(), 1);
+    let row = recovery::recovery(&tasks, &resumed.attempts[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "scheduled");
+}
+
+#[test]
+fn takeover_held_workers_continue_once_the_holder_is_gone_whatever_the_lifecycle() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    let session = launched(&store, &repo, &launcher);
+    ask(&store, session, "q1", "Rename the crate?", "task");
+    coordinator().tick(&store, &launcher, NOW + 1).unwrap();
+    let alive = format!("monocode-native:{}:stalled", std::process::id());
+    let tasks = store.tasks().unwrap();
+    tasks
+        .acquire_lease(&lease_resource("t"), &alive, 1, NOW + LEASE_TTL_MS + 1)
+        .unwrap();
+    let ours = Coordinator::new("monocode-native:0:new", ExplicitStart);
+    ours.startup(&store, LATER).unwrap();
+    let held = attempts(&store)[0].id.clone();
+    assert_eq!(
+        recovery::recovery(&tasks, &held).unwrap().unwrap().state,
+        "held"
+    );
+    let gone =
+        Coordinator::new("monocode-native:0:new", ExplicitStart).with_liveness(|_| Liveness::Dead);
+    gone.tick(&store, &launcher, LATER + 1).unwrap();
+    assert_eq!(
+        recovery::recovery(&tasks, &held).unwrap().unwrap().state,
+        "scheduled"
+    );
+    // Still waiting for the question, which is not the takeover's to end.
+    assert_eq!(current(&store).lifecycle, TaskLifecycle::Waiting);
+}
+
+#[test]
+fn a_startup_that_fails_before_finishing_is_finished_by_the_next_tick() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    launched(&store, &repo, &launcher);
+    let workspace = store.tasks().unwrap().workspaces("t").unwrap().remove(0);
+    std::fs::remove_dir_all(&workspace.path).unwrap();
+    // Prepare ran; the app died before the Git checks were recorded.
+    let (startup, pending) = restarted().startup_prepare(&store, LATER).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(startup.reconciled.is_empty());
+    assert!(kinds(&store, "task.restart_reconciled").is_empty());
+    restarted().tick(&store, &launcher, LATER + 1).unwrap();
+    assert_eq!(kinds(&store, "task.restart_reconciled").len(), 1);
+    assert_eq!(current(&store).lifecycle, TaskLifecycle::Blocked);
+    assert_eq!(launcher.count(), 1);
 }

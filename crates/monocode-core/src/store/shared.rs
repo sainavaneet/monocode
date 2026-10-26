@@ -362,6 +362,25 @@ impl Store {
             Ok(id.to_string())
         }
     }
+    /// Whether the session with this persisted id is still in the store (a
+    /// deleted one is not, even while its handle is remembered).
+    pub fn session_persisted(&self, id: &str) -> Result<bool, String> {
+        if self.shared.is_some() {
+            return sql(self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                [id],
+                |r| r.get::<_, bool>(0),
+            ));
+        }
+        let Ok(handle) = id.parse::<i64>() else {
+            return Ok(false);
+        };
+        sql(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_sessions WHERE id=?1)",
+            [handle],
+            |r| r.get::<_, bool>(0),
+        ))
+    }
     pub fn resolve_session_id(&self, id: &str) -> Result<i64, String> {
         if let Some(shared) = &self.shared {
             if let Some((key, _)) = shared
