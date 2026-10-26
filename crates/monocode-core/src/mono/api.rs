@@ -28,6 +28,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "memory.add"=>"fact topic until","memory.replace"=>"find fact topic until","memory.remove"=>"find topic",
         "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"=>"id",
         "chat.card"=>"type repo number note sessionId options name instructions schedule",
+        "tasks.policy.show"=>"taskId",
+        "tasks.policy.apply"|"tasks.unblock"=>"taskId revision",
         "tasks.worker.status"=>"",
         "tasks.worker.ask"=>"question context scope",
         "tasks.worker.result"=>"outcome summary workspace commits validation evidence remainingWork limitations",

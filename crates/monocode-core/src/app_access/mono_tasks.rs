@@ -41,7 +41,7 @@ fn revision(input: &Value) -> Result<u64, String> {
 }
 
 /// The task if `mono` owns it.
-fn owned_task(tasks: &TaskStore<'_>, mono: &str, id: &str) -> Result<Task, String> {
+pub(super) fn owned_task(tasks: &TaskStore<'_>, mono: &str, id: &str) -> Result<Task, String> {
     tasks
         .task(id)
         .map_err(failed)?

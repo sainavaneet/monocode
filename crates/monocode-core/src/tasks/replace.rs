@@ -7,7 +7,7 @@ use super::launch::fail_assignment;
 use super::policy::Candidates;
 use super::recovery::{
     self, block, block_reason, notify_mono, stop_delivery, Recovery, BLOCKED, BLOCK_PENDING,
-    EXHAUSTED, REPLACED, RETRY_BUDGET, SCHEDULED, STOP_STALL_MS,
+    EXHAUSTED, REPLACED, SCHEDULED, STOP_STALL_MS,
 };
 use super::store::{ms, Key};
 use super::{
@@ -53,7 +53,7 @@ fn choose(store: &Store, row: &Recovery, now: u64) -> Result<Choice, TaskError> 
     let policy = policy::capture(store, &task, &row.provider, now)?;
     // A blocked lineage that was unblocked spends a retry now.
     let retries = if row.state == BLOCKED {
-        if row.retries_used >= RETRY_BUDGET {
+        if row.retries_used >= policy.autonomy.retry_limit {
             return Ok(Choice::Exhausted);
         }
         row.retries_used + 1
@@ -210,7 +210,7 @@ impl<P: Policy> Coordinator<P> {
                 )?;
                 fail_assignment(&tx, attempt, now)?;
                 let why = format!(
-                    "The worker's retries are spent (budget {RETRY_BUDGET}); its last failure was {}: {}.",
+                    "The worker's retries are spent (the task's retry limit); its last failure was {}: {}.",
                     row.failure, row.reason
                 );
                 notify_mono(&tx, attempt, "recovery.exhausted", &why, revision, now)?;

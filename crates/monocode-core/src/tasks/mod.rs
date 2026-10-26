@@ -3,6 +3,7 @@
 //! Records live in `native_task*` tables beside the native sessions. Every
 //! mutation names the revision it read and fails on a stale one, so a stale
 //! writer cannot overwrite newer requirements or resolve a superseded decision.
+pub mod autonomy;
 pub mod brief;
 pub mod checks;
 pub mod completion;
