@@ -9,9 +9,10 @@
 use super::orchestration_card::OpenOrchestrationWorker;
 use super::*;
 use crate::right_panel::{DIFF_ADD, RED_400};
+use monocode_core::tasks::TaskStage;
+use monocode_core::tasks::lifecycle::Display;
 use monocode_core::tasks::timeline::{TimelineEntry, TimelineKind};
-use monocode_core::tasks::view::{TaskMonitor, WorkerView};
-use monocode_core::tasks::{AssignmentState, TaskStage};
+use monocode_core::tasks::view::{Live, TaskMonitor, WorkerState, WorkerView};
 use std::collections::{HashMap, HashSet};
 
 const TIMELINE_MAX_HEIGHT: f32 = 220.;
@@ -41,58 +42,52 @@ pub(crate) struct OpenTaskChanges {
 }
 impl EventEmitter<OpenTaskChanges> for Conversation {}
 
-/// A worker's state label: the assignment's, with the live session's
-/// approval wait shown as needing input.
-pub(crate) fn worker_label(worker: &WorkerView, live: Option<&LiveWorker>) -> &'static str {
-    let needs_input = worker.needs_input || live.is_some_and(|l| l.needs_input);
-    match worker.status {
-        AssignmentState::Running | AssignmentState::WaitingForDecision if needs_input => {
-            "Needs input"
+impl LiveWorker {
+    fn core(self) -> Live {
+        Live {
+            busy: self.busy,
+            needs_input: self.needs_input,
         }
-        AssignmentState::Running => "Working",
-        AssignmentState::WaitingForDecision => "Needs input",
-        AssignmentState::Queued => "Queued",
-        AssignmentState::Ready => "Ready",
-        AssignmentState::NeedsReview => "Needs review",
-        AssignmentState::Accepted => "Accepted",
-        AssignmentState::Failed => "Failed",
-        AssignmentState::Cancelled => "Cancelled",
     }
 }
 
-fn label_color(label: &str) -> gpui::Hsla {
-    match label {
-        "Working" | "Active" => tint(FUCHSIA_300, 0.9),
-        "Accepted" | "Completed" => tint(DIFF_ADD, 0.9),
-        "Failed" | "Blocked" | "Cancelled" | "Cancelling" => tint(RED_400, 0.9),
-        "Needs input" | "Needs review" | "Waiting" | "Pausing" | "Paused" => tint(AMBER_400, 0.9),
-        _ => content(0.5),
+/// A worker's state: the store's, refined by its live session (an approval
+/// wait is Needs input; a busy session that is still starting is Working).
+pub(crate) fn worker_state(worker: &WorkerView, live: &HashMap<i64, LiveWorker>) -> WorkerState {
+    let live = worker.session.and_then(|s| live.get(&s)).map(|l| l.core());
+    worker.state(live)
+}
+
+fn worker_color(state: WorkerState) -> gpui::Hsla {
+    match state {
+        WorkerState::Working => tint(FUCHSIA_300, 0.9),
+        WorkerState::Accepted => tint(DIFF_ADD, 0.9),
+        WorkerState::Failed | WorkerState::Cancelled => tint(RED_400, 0.9),
+        WorkerState::NeedsInput | WorkerState::NeedsReview | WorkerState::Stopped => {
+            tint(AMBER_400, 0.9)
+        }
+        WorkerState::Starting | WorkerState::Ready | WorkerState::Queued => content(0.5),
+    }
+}
+
+fn display_color(display: Display) -> gpui::Hsla {
+    match display {
+        Display::Active => tint(FUCHSIA_300, 0.9),
+        Display::Completed => tint(DIFF_ADD, 0.9),
+        Display::Blocked | Display::Cancelling | Display::Cancelled => tint(RED_400, 0.9),
+        Display::Waiting | Display::Pausing | Display::Paused => tint(AMBER_400, 0.9),
     }
 }
 
 /// "2 working · 1 needs review · 1 queued": workers by state, in a fixed
 /// order, never a percentage.
 pub(crate) fn counts_line(task: &TaskMonitor, live: &HashMap<i64, LiveWorker>) -> String {
-    let labels: Vec<&str> = task
-        .workers
+    let states: Vec<WorkerState> = task.workers.iter().map(|w| worker_state(w, live)).collect();
+    WorkerState::ALL
         .iter()
-        .map(|w| worker_label(w, w.session.and_then(|s| live.get(&s))))
-        .collect();
-    let order = [
-        "Working",
-        "Needs input",
-        "Needs review",
-        "Ready",
-        "Queued",
-        "Accepted",
-        "Failed",
-        "Cancelled",
-    ];
-    order
-        .iter()
-        .filter_map(|label| {
-            let n = labels.iter().filter(|l| *l == label).count();
-            (n > 0).then(|| format!("{n} {}", label.to_lowercase()))
+        .filter_map(|state| {
+            let n = states.iter().filter(|s| *s == state).count();
+            (n > 0).then(|| format!("{n} {}", state.label().to_lowercase()))
         })
         .collect::<Vec<_>>()
         .join(" · ")
@@ -141,7 +136,8 @@ pub(crate) fn times_line(task: &TaskMonitor, live: &HashMap<i64, LiveWorker>, no
     format!(
         "Worker activity {} · Status sync {} · Mono review {}",
         ago(worker, now),
-        ago(task.last_status_sync, now),
+        task.last_status_sync
+            .map_or_else(|| "not synced".into(), |at| ago(Some(at), now)),
         ago(task.last_mono_review, now)
     )
 }
@@ -191,8 +187,7 @@ fn line(selector: String, text: String, color: gpui::Hsla) -> gpui::Div {
         .child(text)
 }
 
-fn chip(selector: String, label: &'static str) -> gpui::Div {
-    let color = label_color(label);
+fn chip(selector: String, label: &'static str, color: gpui::Hsla) -> gpui::Div {
     div()
         .debug_selector(move || selector.clone())
         .flex_shrink_0()
@@ -304,7 +299,11 @@ impl Conversation {
                     .text_color(content(0.9))
                     .child(format!("{} · {project}", task.control.title)),
             )
-            .child(chip(format!("task-monitor-{id}-state-{display}"), display));
+            .child(chip(
+                format!("task-monitor-{id}-state-{display}"),
+                display,
+                display_color(task.control.display),
+            ));
         let stage = format!(
             "Stage: {} · Mono: {}",
             stage_label(task.stage),
@@ -401,8 +400,8 @@ impl Conversation {
         worker: &WorkerView,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let live = worker.session.and_then(|s| self.task_monitor.live.get(&s));
-        let label = worker_label(worker, live);
+        let state = worker_state(worker, &self.task_monitor.live);
+        let label = state.label();
         let key = format!("task-worker-{task}-{}", worker.assignment_id);
         let place = match (&worker.workspace, &worker.branch) {
             (Some(path), Some(branch)) => format!("{path} · {branch}"),
@@ -447,7 +446,11 @@ impl Conversation {
                             .text_color(content(0.85))
                             .child(worker.title.clone()),
                     )
-                    .child(chip(format!("{key}-state-{label}"), label))
+                    .child(chip(
+                        format!("{key}-state-{label}"),
+                        label,
+                        worker_color(state),
+                    ))
                     .children(open)
                     .children(changes),
             )

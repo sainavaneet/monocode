@@ -36,7 +36,7 @@ pub(super) fn decision(s: &Setup, id: &str) -> monocode_core::tasks::DecisionReq
 }
 
 /// Mono is mid-turn: queued task events wait, and no provider turn starts.
-fn mono_busy(s: &Setup, cx: &mut TestAppContext) {
+pub(super) fn mono_busy(s: &Setup, cx: &mut TestAppContext) {
     cx.update(|cx| s.manager.update(cx, |m, cx| m.ensure_chat(&s.id, cx)));
     cx.run_until_parked();
     cx.update(|cx| {
@@ -62,7 +62,7 @@ pub(super) fn pump(s: &Setup, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-fn inbox_messages(s: &Setup, cx: &mut TestAppContext) -> Vec<Message> {
+pub(super) fn inbox_messages(s: &Setup, cx: &mut TestAppContext) -> Vec<Message> {
     cx.update(|cx| {
         let m = s.manager.read(cx);
         let mono = m.roster.get(&s.id).unwrap();

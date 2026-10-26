@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 const SECRET: &str = "sk-ant-api03-Zx81kQ2vB7nP0wLmT4yR";
+const TOKEN: &str = "ghp_q8W2e4R6t8Y0u2I4o6P8a0S2d4F6g8H0j2K4";
 
 /// The fixture's running worker (task `t`, owned by `mono-1`) with the
 /// coordinator on and a recorded worktree; returns its session handle.
@@ -44,7 +45,8 @@ fn running_worker(shell: &Shell) -> i64 {
 }
 
 fn monitors(shell: &Shell) -> Vec<TaskMonitor> {
-    view::monitor(&locked(&shell.store).unwrap(), "mono-1").unwrap()
+    let now = monocode_core::time::now_ms();
+    view::monitor(&locked(&shell.store).unwrap(), "mono-1", now).unwrap()
 }
 
 /// Reads the store into the lead's card, as the Mono task pump does.
@@ -145,45 +147,83 @@ fn each_task_state_renders_its_label_on_the_monitoring_card(cx: &mut gpui::TestA
 
 #[gpui::test]
 fn open_decisions_and_quiet_reminders_show_on_the_card(cx: &mut gpui::TestAppContext) {
-    let (window, lead, _, mut visual) = setup(cx);
+    use monocode_core::tasks::inbox;
+    let (window, lead, worker, mut visual) = setup(cx);
     let cx = &mut visual;
-    window
-        .update(cx, |shell, _, cx| {
-            let mut tasks = monitors(shell);
-            tasks[0].decisions = vec![
-                view::DecisionView {
-                    id: "d1".into(),
-                    assignment_id: Some("a".into()),
-                    escalated: true,
-                    quiet: false,
-                },
-                view::DecisionView {
-                    id: "d2".into(),
-                    assignment_id: Some("a".into()),
-                    escalated: false,
-                    quiet: true,
-                },
-            ];
-            tasks[0].control.reason = Some("Waiting for decision d1".into());
-            tasks[0].waiting_cause = Some("decision".into());
-            assert_eq!(
-                waiting_line(&tasks[0]).as_deref(),
-                Some("Waiting on a decision: Waiting for decision d1")
-            );
-            shell.sessions[&lead].update(cx, |v, cx| v.set_task_monitor(tasks, cx));
+    // The worker asks; Mono receives it and every reminder without
+    // answering, as the store records it.
+    let decision = window
+        .update(cx, |shell, _, _| {
+            let store = locked(&shell.store).unwrap();
+            let asked = monocode_core::app_access::worker_action(
+                &store,
+                worker,
+                "q1",
+                "tasks.worker.ask",
+                &serde_json::json!({"question": "Which parser?"}),
+                2,
+            )
+            .unwrap();
+            let decision = asked["decision"]["id"].as_str().unwrap().to_owned();
+            let chat = store.create("codex", "/work/monocode").unwrap().id;
+            let mut now = 3;
+            while let Some(batch) = inbox::next_batch(&store, "mono-1", now).unwrap() {
+                store
+                    .save_setting(&format!("mono-delivered:{chat}:{}", batch.id), "1")
+                    .unwrap();
+                inbox::acknowledge_delivered(&store, "mono-1", chat, now).unwrap();
+                now += inbox::REMIND_AFTER_MS;
+            }
+            decision
         })
         .unwrap();
-    cx.run_until_parked();
-    cx.refresh().unwrap();
+    show(&window, lead, cx);
+    assert!(shown(cx, &format!("task-decision-{decision}-quiet")));
+    assert!(!shown(cx, "task-monitor-t-needs-you"));
+    assert!(shown(cx, "task-worker-t-a-state-Needs input"));
+
+    // Mono escalates it: it waits for the user, and is no longer quiet.
+    window
+        .update(cx, |shell, _, _| {
+            let store = locked(&shell.store).unwrap();
+            let revision = store
+                .tasks()
+                .unwrap()
+                .decision(&decision)
+                .unwrap()
+                .unwrap()
+                .revision;
+            monocode_core::app_access::mono_task_action(
+                &store,
+                "mono-1",
+                "tasks.decisions.escalate",
+                &serde_json::json!({"decisionId": decision, "revision": revision,
+                    "why": "It changes the API", "recommendation": "Keep it"}),
+                5,
+            )
+            .unwrap();
+        })
+        .unwrap();
+    show(&window, lead, cx);
     assert!(shown(cx, "task-monitor-t-needs-you"));
-    assert!(shown(cx, "task-decision-d2-quiet"));
-    assert!(!shown(cx, "task-decision-d1-quiet"));
-    assert!(shown(cx, "task-monitor-t-waiting"));
+    assert!(!shown(cx, &format!("task-decision-{decision}-quiet")));
+
+    // A task-wide wait shows its recorded cause with the reason.
+    let mut waiting = window
+        .update(cx, |shell, _, _| monitors(shell))
+        .unwrap()
+        .remove(0);
+    waiting.control.reason = Some("Waiting for decision d1".into());
+    waiting.waiting_cause = Some("decision".into());
+    assert_eq!(
+        waiting_line(&waiting).as_deref(),
+        Some("Waiting on a decision: Waiting for decision d1")
+    );
 }
 
 #[gpui::test]
 fn card_controls_dispatch_the_lifecycle_actions(cx: &mut gpui::TestAppContext) {
-    let (window, lead, worker, mut visual) = setup(cx);
+    let (window, lead, _, mut visual) = setup(cx);
     let cx = &mut visual;
     show(&window, lead, cx);
     click(cx, "task-control-t-tasks.pause");
@@ -211,7 +251,6 @@ fn card_controls_dispatch_the_lifecycle_actions(cx: &mut gpui::TestAppContext) {
             }
         })
         .unwrap();
-    let _ = worker;
 }
 
 #[gpui::test]
@@ -248,6 +287,24 @@ fn no_secret_from_a_worker_error_appears_in_the_timeline(cx: &mut gpui::TestAppC
     window
         .update(cx, |shell, _, _| {
             let store = locked(&shell.store).unwrap();
+            let tasks = store.tasks().unwrap();
+            // Free text that is not an error: a title and who answered.
+            let mut assignment = tasks.assignment("t", "a").unwrap().unwrap();
+            assignment.title = format!("Assignment {TOKEN}");
+            tasks.update_assignment("t", &assignment, 15).unwrap();
+            tasks
+                .append_event(
+                    &monocode_core::tasks::NewEvent {
+                        id: "answered-by-secret".into(),
+                        task_id: "t".into(),
+                        assignment_id: Some("a".into()),
+                        attempt_id: None,
+                        kind: "decision.answered".into(),
+                        payload: serde_json::json!({"by": format!("mono {SECRET}")}),
+                    },
+                    16,
+                )
+                .unwrap();
             let error = format!("503 overloaded; retry with Bearer {SECRET}");
             recovery::interrupt(
                 &store,
@@ -274,6 +331,8 @@ fn no_secret_from_a_worker_error_appears_in_the_timeline(cx: &mut gpui::TestAppC
     let live = Default::default();
     let mut printed: Vec<String> = task.timeline.iter().map(|e| timeline_line(e, 30)).collect();
     printed.extend(task.recovery.iter().cloned());
+    printed.extend(task.workers.iter().map(|w| w.title.clone()));
+    printed.push(task.control.title.clone());
     printed.extend(waiting_line(task));
     printed.push(counts_line(task, &live));
     printed.push(times_line(task, &live, 30));
@@ -281,6 +340,8 @@ fn no_secret_from_a_worker_error_appears_in_the_timeline(cx: &mut gpui::TestAppC
     assert!(text.contains("temporary"), "{text}");
     assert!(!text.contains(SECRET), "{text}");
     assert!(!text.contains("Zx81kQ2vB7nP0wLmT4yR"), "{text}");
+    assert!(!text.contains(TOKEN), "{text}");
+    assert!(text.contains("Answered by mono [redacted]"), "{text}");
 }
 
 #[gpui::test]

@@ -1,7 +1,7 @@
 //! The Mono task pump feeds the monitoring card and the sidebar badge from
 //! persisted task state; live worker sessions and the card's worker button
 //! reach the Mono panel. No provider runs.
-use super::task_tests::{ask, decision, pump, worker};
+use super::task_tests::{ask, decision, inbox_messages, mono_busy, pump, worker};
 use super::tests::{Setup, call, setup};
 use super::*;
 use crate::conversation::orchestration_card::OpenOrchestrationWorker;
@@ -128,4 +128,23 @@ fn the_mono_overview_lists_its_tasks_from_persisted_state(cx: &mut TestAppContex
         super::task_overview::overview_line(&s.manager.read(cx).task_monitors[&s.id][0])
     });
     assert_eq!(line, "Ship it · Active · Implementing · Mono: Supervising");
+}
+
+#[gpui::test]
+fn a_monitor_that_cannot_be_read_never_holds_back_task_events(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let session = worker(&s);
+    let id = ask(&s, session, "Which parser should I use?");
+    monocode_core::tasks::fixtures::break_monitor(&locked(&s.store).unwrap()).unwrap();
+    let now = monocode_core::time::now_ms();
+    assert!(monocode_core::tasks::view::monitor(&locked(&s.store).unwrap(), &s.id, now).is_err());
+    mono_busy(&s, cx);
+    pump(&s, cx);
+    let queued = inbox_messages(&s, cx);
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert!(queued[0].text.contains(&id));
+    cx.update(|cx| {
+        let chat = s.manager.read(cx).chats[&s.id].clone();
+        assert!(chat.read(cx).task_monitor.tasks.is_empty());
+    });
 }

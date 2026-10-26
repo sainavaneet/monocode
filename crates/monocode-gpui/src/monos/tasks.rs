@@ -84,10 +84,8 @@ impl Monos {
             }
             let now = now_ms();
             let mut batches = Vec::new();
-            let mut monitors = Vec::new();
+            let ids: Vec<String> = monos.iter().map(|(mono, _)| mono.clone()).collect();
             for (mono, session) in monos {
-                let tasks = view::monitor(&db, &mono).map_err(|e| e.to_string())?;
-                monitors.push((mono.clone(), tasks));
                 if let Some(session) = session {
                     inbox::acknowledge_delivered(&db, &mono, session, now)
                         .map_err(|e| e.to_string())?;
@@ -109,6 +107,18 @@ impl Monos {
                     handoffs.push((handle, handoff));
                 }
             }
+            // Display last, and per Mono: a view that cannot be read never
+            // holds back deliveries or another Mono's card.
+            let monitors = ids
+                .into_iter()
+                .filter_map(|mono| match view::monitor(&db, &mono, now) {
+                    Ok(tasks) => Some((mono, tasks)),
+                    Err(error) => {
+                        eprintln!("Mono task monitor for {mono}: {error}");
+                        None
+                    }
+                })
+                .collect();
             Ok(Some((batches, handoffs, monitors)))
         });
         cx.spawn(async move |this, cx| {
