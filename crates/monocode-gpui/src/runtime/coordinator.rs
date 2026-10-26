@@ -104,6 +104,38 @@ fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> R
     Ok(())
 }
 
+/// Integrates tasks whose accepted work spans several worktrees: merging
+/// onto each task's integration branch runs without the store lock;
+/// preparing (with the merge-authority check) and recording hold it.
+fn integrate_tasks(
+    coordinator: &Coordinator<ExplicitStart>,
+    store: &Database,
+) -> Result<(), String> {
+    let now = monocode_core::time::now_ms;
+    let (jobs, errors) = {
+        let store = locked(store)?;
+        if !tasks::coordinator::enabled(&store) {
+            return Ok(());
+        }
+        coordinator
+            .integration_jobs(&store, now())
+            .map_err(|e| e.to_string())?
+    };
+    for error in errors {
+        eprintln!("Task coordinator integration {error}");
+    }
+    // A failed record is retried by the next pass; Git work is idempotent
+    // (merged branches are skipped).
+    for job in jobs {
+        let record = job.run();
+        let store = locked(store)?;
+        if let Err(error) = coordinator.record_integration(&store, &job, record, now()) {
+            eprintln!("Task coordinator integration {}: {error}", job.task_id());
+        }
+    }
+    Ok(())
+}
+
 /// How long a stop request's session must be open in no window before the
 /// stop counts as done (a torn-down window's provider may still be exiting).
 pub(crate) const STOP_ABSENT_GRACE_MS: u64 = 10_000;
@@ -498,6 +530,9 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                 }
                 if let Err(error) = verify_tasks(coordinator, &store) {
                     eprintln!("Task coordinator verification: {error}");
+                }
+                if let Err(error) = integrate_tasks(coordinator, &store) {
+                    eprintln!("Task coordinator integration: {error}");
                 }
                 let _ = pumps.try_send(());
             }

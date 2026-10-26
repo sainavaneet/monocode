@@ -1,5 +1,7 @@
 //! Orchestrator's reviewed plans create real native sessions. Dependencies and
 //! overlapping file scopes gate dispatch; approvals stay in each worker's chat.
+//! With the task coordinator on (`native-task-coordinator`), Start instead
+//! persists the plan as a task and the coordinator schedules it.
 use super::*;
 use crate::conversation::orchestration_card::TaskProgress;
 use crate::conversation::task_controls::TaskControl;
@@ -144,6 +146,15 @@ impl Shell {
             cx.notify();
             return;
         }
+        // With the task coordinator on, the plan becomes a persisted task
+        // and the coordinator schedules it (dependencies, file scopes,
+        // workspace ownership and the Mono's worker limit).
+        if locked(&self.store).is_ok_and(|store| monocode_core::tasks::coordinator::enabled(&store))
+        {
+            let provider = conversation.summary.provider.clone();
+            self.start_native_orchestration(lead, plan, cwd, provider, cx);
+            return;
+        }
         let mut settings = conversation.settings.clone();
         settings.plan = false;
         settings.orchestrator = false;
@@ -175,6 +186,77 @@ impl Shell {
             },
         );
         self.schedule_orchestration(lead, cx);
+    }
+    /// The Mono that owns `lead` (its chat or one of its launches), whose
+    /// policy the task takes; None for a session no Mono started.
+    fn owning_mono(&self, lead: i64, cx: &App) -> Option<String> {
+        let monos = self.monos.as_ref()?.read(cx);
+        monos
+            .roster
+            .monos
+            .iter()
+            .find(|m| m.session_id == Some(lead) || m.launches.iter().any(|l| l.session_id == lead))
+            .map(|m| m.id.clone())
+    }
+    /// Persists the reviewed plan as a task started by the user, off the
+    /// main thread; the plan card closes once it is saved.
+    fn start_native_orchestration(
+        &mut self,
+        lead: i64,
+        plan: Plan,
+        cwd: String,
+        provider: String,
+        cx: &mut Context<Self>,
+    ) {
+        use monocode_core::tasks::{NewTask, Requester, policy};
+        let store = self.store.clone();
+        let new = NewTask {
+            id: format!(
+                "{}{}",
+                policy::plan_task_prefix(lead),
+                monocode_core::mono::new_id()
+            ),
+            mono_id: self.owning_mono(lead, cx),
+            project: cwd,
+            title: plan.title.clone(),
+            request: if plan.summary.trim().is_empty() {
+                plan.title.clone()
+            } else {
+                plan.summary.clone()
+            },
+            criteria: policy::plan_criteria(&plan),
+        };
+        let work = cx.background_executor().spawn(async move {
+            let store = locked(&store)?;
+            if !policy::started_plans(&store, lead)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            {
+                return Err("A task from this chat's plan is still running.".to_owned());
+            }
+            let now = monocode_core::time::now_ms();
+            policy::start_plan(&store, &new, &plan, &provider, Requester::User, now)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Some(view) = this.sessions.get(&lead) {
+                            view.update(cx, |v, cx| {
+                                v.orchestration_plan = None;
+                                cx.notify();
+                            });
+                        }
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn stop_orchestration(&mut self, lead: i64, cx: &mut Context<Self>) {
         if let Some(run) = self.orchestrations.get_mut(&lead) {
@@ -465,6 +547,76 @@ impl Shell {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    use monocode_core::tasks::{AssignmentState, TaskLifecycle, TaskStage};
+
+    #[gpui::test]
+    fn with_the_coordinator_on_start_persists_a_task_the_coordinator_schedules(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, lead) = crate::shell::tests::window(cx);
+        let sessions = window
+            .update(cx, |shell, _, cx| {
+                locked(&shell.store)
+                    .unwrap()
+                    .save_setting(monocode_core::tasks::coordinator::FLAG, "enabled")
+                    .unwrap();
+                shell.sessions[&lead].update(cx, |v, cx| {
+                    v.install_transfer(Settings::default(), None, cx)
+                });
+                let part = |id: &str, file: &str, deps: &[&str]| Task {
+                    id: id.into(),
+                    title: format!("Part {id}"),
+                    prompt: "Implement it".into(),
+                    files: vec![file.into()],
+                    depends_on: deps.iter().map(|d| (*d).to_owned()).collect(),
+                    verification: vec![format!("test -f {file}")],
+                    ..Task::default()
+                };
+                let plan = Plan {
+                    title: "Two parts".into(),
+                    summary: "Build both parts".into(),
+                    tasks: vec![part("a", "src/a.rs", &[]), part("b", "src/b.rs", &["a"])],
+                };
+                shell.sessions[&lead].update(cx, |v, _| v.orchestration_plan = Some(plan.clone()));
+                shell.start_orchestration(lead, plan, cx);
+                // The in-app scheduler does not run it.
+                assert!(!shell.orchestrations.contains_key(&lead));
+                shell.sessions.len()
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let store = locked(&shell.store).unwrap();
+                let started = monocode_core::tasks::policy::started_plans(&store, lead).unwrap();
+                assert_eq!(started.len(), 1);
+                let task = &started[0];
+                assert_eq!(
+                    (task.stage, task.lifecycle),
+                    (TaskStage::Implementing, TaskLifecycle::Active)
+                );
+                assert_eq!(task.project, "/work/monocode");
+                assert_eq!(task.criteria.len(), 2, "each part's checks are a criterion");
+                let tasks = store.tasks().unwrap();
+                let assignments = tasks.assignments(&task.id).unwrap();
+                assert_eq!(assignments.len(), 2);
+                assert!(
+                    assignments
+                        .iter()
+                        .all(|a| a.status == AssignmentState::Queued)
+                );
+                assert!(
+                    monocode_core::tasks::policy::of(&tasks, &task.id)
+                        .unwrap()
+                        .is_some()
+                );
+                // Nothing was launched by the app itself; the plan card closed.
+                assert_eq!(shell.sessions.len(), sessions);
+                assert!(shell.sessions[&lead].read(cx).orchestration_plan.is_none());
+                assert!(shell.error.is_none(), "{:?}", shell.error);
+            })
+            .unwrap();
+    }
     #[gpui::test]
     fn reviewed_dispatch_caps_workers_serializes_scopes_and_stops_before_launch(
         cx: &mut TestAppContext,
