@@ -68,6 +68,10 @@ fn unacknowledged(tasks: &TaskStore<'_>, mono: &str) -> Result<Vec<Batch>, TaskE
         let Some(batch) = batch_of(&serde_json::from_str(&payload)?) else {
             continue;
         };
+        // A failed batch is closed; its events now belong to a later one.
+        if super::worker::payload_of(tasks.conn, &closed_event(&batch.id))?.is_some() {
+            continue;
+        }
         let mut waiting = false;
         for id in &batch.deliveries {
             let state: Option<String> = tasks
@@ -85,6 +89,10 @@ fn unacknowledged(tasks: &TaskStore<'_>, mono: &str) -> Result<Vec<Batch>, TaskE
         }
     }
     Ok(open)
+}
+
+fn closed_event(batch: &str) -> String {
+    format!("inbox_failed:{batch}")
 }
 
 /// Pending deliveries owed to `mono`, oldest first.
@@ -223,6 +231,23 @@ pub fn batch_failed(
         return Ok(Vec::new());
     };
     let mut abandoned = Vec::new();
+    if let Some(first) = batch.deliveries.iter().find_map(|id| {
+        tasks
+            .delivery(id)
+            .ok()
+            .flatten()
+            .and_then(|d| event(&tasks, &d.event_id).ok().flatten())
+    }) {
+        let closed = NewEvent {
+            id: closed_event(&batch.id),
+            task_id: first.task_id,
+            assignment_id: None,
+            attempt_id: None,
+            kind: "mono.inbox_failed".into(),
+            payload: json!({"batchId": batch.id, "monoId": mono, "error": error}),
+        };
+        tasks.append_event(&closed, now)?;
+    }
     for id in &batch.deliveries {
         let Some(delivery) = tasks
             .delivery(id)?

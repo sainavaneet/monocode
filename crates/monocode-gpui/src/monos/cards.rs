@@ -401,6 +401,17 @@ impl Monos {
                     value["harness"] = json!(session.summary.provider);
                     value["cwd"] = json!(session.summary.cwd);
                 }
+            } else if value["type"] == "decision" && value["state"] != "answered" {
+                // Once answered, the card shows the answer and no choices.
+                let answered = value["decisionId"]
+                    .as_str()
+                    .and_then(|d| self.decision_now(d))
+                    .filter(|d| d.state != monocode_core::tasks::DecisionState::Open);
+                if let Some(decision) = answered {
+                    value["state"] = json!("answered");
+                    value["answer"] = json!(decision.answer);
+                    value["answeredBy"] = json!(decision.answered_by);
+                }
             } else if value["type"] == "habit" {
                 value["started"] = json!(self.habits.iter().any(|h| h.id == format!("card-{id}")));
             } else if value["type"] == "document" {

@@ -33,6 +33,7 @@ pub(super) fn render(
     let decision = text("decisionId");
     let revision = value["revision"].as_u64().unwrap_or_default();
     let recommendation = text("recommendation");
+    let answered = value["state"] == "answered";
     let choices: Vec<String> = std::iter::once(recommendation.clone())
         .chain(
             value["alternatives"]
@@ -41,7 +42,7 @@ pub(super) fn render(
                 .flatten()
                 .filter_map(|a| a.as_str().map(str::to_owned)),
         )
-        .filter(|c| !c.is_empty())
+        .filter(|c| !c.is_empty() && !answered)
         .collect();
     div()
         .rounded_lg()
@@ -61,13 +62,18 @@ pub(super) fn render(
                 .text_size(px(13.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child(icon("message-square", 16.))
-                .child("Needs your decision"),
+                .child(if answered {
+                    "Decision answered"
+                } else {
+                    "Needs your decision"
+                }),
         )
         .child(div().text_size(px(13.)).child(text("question")))
         .child(row("Why it matters", text("why")))
         .child(row("Recommendation", recommendation))
         .child(row("Paused", text("paused")))
         .child(row("Continues", text("continues")))
+        .when(answered, |d| d.child(row("Answer", text("answer"))))
         .children(choices.into_iter().enumerate().map(|(ix, choice)| {
             let card = json!({"type": "decision-answer", "decisionId": decision,
                 "revision": revision, "text": choice});

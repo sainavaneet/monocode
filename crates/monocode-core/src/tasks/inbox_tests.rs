@@ -14,8 +14,19 @@ fn a_failing_inbox_message_is_retried_then_surfaced_without_blocking_later_event
     let worker = running(&store, "a", "x");
     let first = ask(&store, worker, "q1", "First question?", "assignment");
     let mut now = NOW + 2;
+    let mut seen = Vec::new();
     for attempt in 1..=inbox::INBOX_RETRY_LIMIT {
         let batch = inbox::next_batch(&store, "mono-1", now).unwrap().unwrap();
+        // Each retry is a new batch; a failed one never comes back.
+        assert!(
+            !seen.contains(&batch.id),
+            "attempt {attempt} reused {}",
+            batch.id
+        );
+        seen.push(batch.id.clone());
+        // While it is out, asking again returns it, not an earlier batch.
+        let again = inbox::next_batch(&store, "mono-1", now).unwrap().unwrap();
+        assert_eq!(again.id, batch.id, "attempt {attempt}");
         assert!(batch.message.contains("First question?"));
         let abandoned =
             inbox::batch_failed(&store, "mono-1", &batch.id, "Usage limit", now).unwrap();

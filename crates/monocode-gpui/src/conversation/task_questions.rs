@@ -26,7 +26,17 @@ impl Conversation {
                 now,
             );
             match routed {
-                Ok(Some(decision)) => self.task_questions.push((decision.id, question.id)),
+                Ok(Some(decision)) => {
+                    // No timeout and no inferred answer: a routed question
+                    // never auto-resolves; it waits for Mono or the user.
+                    if let Some(controls) = &self.controls {
+                        let _ = controls.send(Control {
+                            id: question.id.clone(),
+                            decision: Decision::KeepOpen,
+                        });
+                    }
+                    self.task_questions.push((decision.id, question.id));
+                }
                 Ok(None) => remaining.push(question),
                 Err(error) => {
                     eprintln!("Task question for session {}: {error}", self.summary.id);
@@ -89,8 +99,18 @@ impl Conversation {
     }
 
     /// A question the provider withdrew (or that expired) is not pending.
-    pub(super) fn forget_task_question(&mut self, question: &str) {
+    pub(crate) fn forget_task_question(&mut self, question: &str) {
+        let before = self.task_questions.len();
         self.task_questions.retain(|(_, id)| id != question);
+        let forgot = self.task_questions.len() != before;
+        if forgot && self.task_questions.is_empty() && self.status == "Waiting for Mono's answer" {
+            self.status = if self.busy { "Working…" } else { "Ready" }.into();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_status(&self) -> &str {
+        &self.status
     }
 
     /// Test support: a provider turn waiting on its questions, whose replies

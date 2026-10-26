@@ -157,6 +157,8 @@ pub(crate) struct Monos {
     pumping_tasks: bool,
     /// Answers handed to workers (`decision@revision`), never sent twice.
     task_sent: HashSet<String>,
+    /// Decisions whose "did not answer" note was already shown.
+    task_noted: HashSet<String>,
 }
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
@@ -382,6 +384,7 @@ impl Monos {
             app_pending: HashSet::new(),
             pumping_tasks: false,
             task_sent: HashSet::new(),
+            task_noted: HashSet::new(),
         };
         if let Some(rx) = rx {
             this._bridge_task = Some(cx.spawn(async move |this, cx| {

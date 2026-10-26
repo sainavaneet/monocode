@@ -32,13 +32,22 @@ impl Monos {
             call,
             mono.id,
             move |store| {
-                let db = locked(&store)?;
-                let value = app::mono_task_action(&db, &id, &action, &input, now_ms())?;
-                // An escalation's card goes into the Mono's chat.
-                let effect = value
-                    .get("card")
-                    .cloned()
-                    .map_or(Effect::None, Effect::Card);
+                // A criterion check can run for minutes: hold the store only
+                // to prepare it and to record it, as the coordinator does.
+                if action == "tasks.criteria.verify" {
+                    let run = app::prepare_mono_verify(&*locked(&store)?, &id, &input)?;
+                    let outcome = run.run(now_ms());
+                    let value = app::finish_mono_verify(&*locked(&store)?, &run, outcome)?;
+                    return Ok((value, Effect::None));
+                }
+                let value =
+                    app::mono_task_action(&*locked(&store)?, &id, &action, &input, now_ms())?;
+                // An escalation's card goes into the Mono's chat, with its own
+                // id so it can be marked answered later.
+                let effect = value.get("card").cloned().map_or(Effect::None, |mut card| {
+                    card["id"] = serde_json::json!(mono::new_id());
+                    Effect::Card(card)
+                });
                 Ok((value, effect))
             },
             cx,
@@ -121,6 +130,15 @@ impl Monos {
             .chats
             .get(mono)
             .is_some_and(|v| v.read(cx).mono_delivered().contains(&batch.id));
+        let failed = self
+            .roster
+            .get(mono)
+            .and_then(|m| m.outbox.iter().find(|q| q.id == batch.id))
+            .and_then(|q| q.error.clone());
+        if let Some(error) = failed {
+            self.batch_failed(mono, &batch.id, &error, cx);
+            return;
+        }
         let Some(owner) = self.roster.get_mut(mono) else {
             return;
         };
@@ -139,6 +157,42 @@ impl Monos {
         self.configure_chat(mono, cx);
         self.ensure_chat(mono, cx);
         self.dispatch(mono, cx);
+    }
+
+    /// Mono's turn for a batch failed (usage limit, provider error): the batch
+    /// leaves the outbox and its events are retried in a new one, until one
+    /// has failed too often; that is shown in Mono's chat and stops holding
+    /// later events.
+    fn batch_failed(&mut self, mono: &str, batch: &str, error: &str, cx: &mut Context<Self>) {
+        if let Some(owner) = self.roster.get_mut(mono) {
+            owner.outbox.retain(|q| q.id != batch);
+        }
+        let abandoned = locked(&self.store).and_then(|db| {
+            inbox::batch_failed(&db, mono, batch, error, now_ms()).map_err(|e| e.to_string())
+        });
+        match abandoned {
+            Ok(abandoned) if !abandoned.is_empty() => {
+                let note = format!(
+                    "Task events could not reach this chat after {} attempts ({}): {error}. They stay recorded; run tasks.decisions.list to see open questions.",
+                    inbox::INBOX_RETRY_LIMIT,
+                    abandoned.join(", ")
+                );
+                if let Some(owner) = self.roster.get_mut(mono) {
+                    owner.pending_reports.push(note);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("Mono task inbox: {error}"),
+        }
+        self.save(cx);
+        self.configure_chat(mono, cx);
+    }
+
+    /// The decision's current record, for its card.
+    pub(super) fn decision_now(&self, id: &str) -> Option<monocode_core::tasks::DecisionRequest> {
+        let db = locked(&self.store).ok()?;
+        let tasks = db.existing_tasks().ok()??;
+        tasks.decision(id).ok()?
     }
 
     /// Hands an answer to its worker: through the provider's reply when the
@@ -160,10 +214,11 @@ impl Monos {
         let answer = decision.answer.clone().unwrap_or_default();
         let via = match &handoff.question {
             Some(question) if view.read(cx).task_question_waiting(&decision.id) => {
-                let answers = monocode_core::provider::answers_from_text(question, &answer);
                 let id = decision.id.clone();
-                view.update(cx, |v, cx| v.answer_task_question(&id, answers, cx))
-                    .map(|_| "provider_reply")
+                monocode_core::provider::answers_from_text(question, &answer).and_then(|answers| {
+                    view.update(cx, |v, cx| v.answer_task_question(&id, answers, cx))
+                        .map(|_| "provider_reply")
+                })
             }
             _ => {
                 let idle = {
@@ -225,7 +280,16 @@ impl Monos {
             }) => {
                 self.record_user_answer(mono, &decision, revision, &answer, cx);
             }
+            // Asked once per decision: the first reply after its card that
+            // does not answer it, not every later message to Mono.
             Ok(ReplyMatch::Unclear(open)) => {
+                let open: Vec<String> = open
+                    .into_iter()
+                    .filter(|id| self.task_noted.insert(id.clone()))
+                    .collect();
+                if open.is_empty() {
+                    return;
+                }
                 let note = format!(
                     "This message did not answer {}. Choose an option on the decision card, or start your reply with the decision id and a colon (for example `{}: …`).",
                     if open.len() == 1 {
@@ -280,7 +344,10 @@ impl Monos {
                 .map_err(|e| e.to_string())
         });
         match result {
-            Ok(_) => true,
+            Ok(_) => {
+                self.refresh_cards(cx);
+                true
+            }
             Err(error) => {
                 self.error = Some(error);
                 self.changed(cx);

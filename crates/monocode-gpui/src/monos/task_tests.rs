@@ -5,83 +5,15 @@ use super::tests::{Setup, call, setup};
 use super::*;
 use gpui::TestAppContext;
 use monocode_core::agent::{Control, Decision, Question, QuestionItem, QuestionOption};
-use monocode_core::orchestration::{Plan, Task as Assignment};
-use monocode_core::tasks::{
-    AssignmentState, AttemptState, DecisionState, DeliveryState, NewAttempt, NewTask, Requester,
-    State, Subject, TaskStage, coordinator::FLAG,
-};
+use monocode_core::tasks::{DecisionState, DeliveryState, Requester, coordinator::FLAG};
 use serde_json::json;
 
-/// Task `t` owned by the setup's Mono, assignment `a` Running and attempt `x`
-/// bound to a new worker session in the project. Returns the worker session.
+/// The shared running-worker fixture (`monocode_core::tasks::fixtures`),
+/// owned by the setup's Mono, with the coordinator flag on.
 fn worker(s: &Setup) -> i64 {
     let db = locked(&s.store).unwrap();
     db.save_setting(FLAG, "enabled").unwrap();
-    let session = db.create("codex", &s.project).unwrap().id;
-    let tasks = db.tasks().unwrap();
-    tasks
-        .create_task(
-            &NewTask {
-                id: "t".into(),
-                mono_id: Some(s.id.clone()),
-                project: s.project.clone(),
-                title: "Ship it".into(),
-                request: "Implement the feature".into(),
-                criteria: vec![],
-            },
-            1,
-        )
-        .unwrap();
-    let plan = Plan {
-        title: "Plan".into(),
-        summary: "Approach".into(),
-        tasks: vec![Assignment {
-            id: "a".into(),
-            title: "Assignment a".into(),
-            prompt: "Do the work".into(),
-            files: vec!["src".into()],
-            ..Assignment::default()
-        }],
-    };
-    tasks.save_plan("t", 1, &plan, 1).unwrap();
-    let t = Subject::Task("t");
-    for stage in [TaskStage::Ready, TaskStage::Implementing] {
-        let rev = tasks.revision(t).unwrap();
-        tasks
-            .transition(t, State::Stage(stage), Requester::Mono, rev, 1)
-            .unwrap();
-    }
-    let a = Subject::Assignment { task: "t", id: "a" };
-    for to in [AssignmentState::Ready, AssignmentState::Running] {
-        let rev = tasks.revision(a).unwrap();
-        tasks
-            .transition(a, State::Assignment(to), Requester::Coordinator, rev, 1)
-            .unwrap();
-    }
-    tasks
-        .create_attempt(
-            &NewAttempt {
-                id: "x".into(),
-                task_id: "t".into(),
-                assignment_id: "a".into(),
-                operation_id: "launch-x".into(),
-                provider: "codex".into(),
-                account_id: None,
-            },
-            1,
-        )
-        .unwrap();
-    let x = Subject::Attempt("x");
-    for to in [AttemptState::Starting, AttemptState::Running] {
-        let rev = tasks.revision(x).unwrap();
-        tasks
-            .transition(x, State::Attempt(to), Requester::Coordinator, rev, 1)
-            .unwrap();
-    }
-    let rev = tasks.revision(x).unwrap();
-    let bound = db.persisted_session_id(session).unwrap();
-    tasks.bind_attempt_session("x", rev, &bound, 1).unwrap();
-    session
+    monocode_core::tasks::fixtures::running_worker(&db, &s.id, &s.project).unwrap()
 }
 
 fn ask(s: &Setup, session: i64, question: &str) -> String {
@@ -103,6 +35,28 @@ fn decision(s: &Setup, id: &str) -> monocode_core::tasks::DecisionRequest {
     db.tasks().unwrap().decision(id).unwrap().unwrap()
 }
 
+/// Mono is mid-turn: queued task events wait, and no provider turn starts.
+fn mono_busy(s: &Setup, cx: &mut TestAppContext) {
+    cx.update(|cx| s.manager.update(cx, |m, cx| m.ensure_chat(&s.id, cx)));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let chat = s.manager.read(cx).chats[&s.id].clone();
+        chat.update(cx, |v, _| v.busy = true);
+    });
+}
+
+/// No test may start a real provider: the core guard refused nothing here.
+fn assert_no_provider_started(before: usize) {
+    use monocode_core::provider::test_guard;
+    assert!(test_guard::under_test());
+    assert!(monocode_core::provider::resolve(monocode_core::provider::Kind::Codex).is_none());
+    assert_eq!(
+        test_guard::refused(),
+        before,
+        "a real provider launch was attempted"
+    );
+}
+
 fn pump(s: &Setup, cx: &mut TestAppContext) {
     cx.update(|cx| s.manager.update(cx, |m, cx| m.pump_tasks(cx)));
     cx.run_until_parked();
@@ -122,20 +76,12 @@ fn inbox_messages(s: &Setup, cx: &mut TestAppContext) -> Vec<Message> {
 
 #[gpui::test]
 fn task_events_wait_for_an_idle_mono_and_reach_its_chat_once(cx: &mut TestAppContext) {
+    let before = monocode_core::provider::test_guard::refused();
     let s = setup(cx);
     let session = worker(&s);
     let id = ask(&s, session, "Which parser should I use?");
     // Mono is mid-turn: the event waits in the outbox, never a second turn.
-    cx.update(|cx| {
-        s.manager.update(cx, |m, cx| {
-            m.ensure_chat(&s.id, cx);
-        })
-    });
-    cx.run_until_parked();
-    cx.update(|cx| {
-        let chat = s.manager.read(cx).chats[&s.id].clone();
-        chat.update(cx, |v, _| v.busy = true);
-    });
+    mono_busy(&s, cx);
     let rows_before = locked(&s.store)
         .unwrap()
         .load(s.session)
@@ -183,6 +129,50 @@ fn task_events_wait_for_an_idle_mono_and_reach_its_chat_once(cx: &mut TestAppCon
         .unwrap()
         .unwrap();
     assert_eq!(delivery.state, DeliveryState::Acknowledged);
+    drop(db);
+    assert_no_provider_started(before);
+}
+
+#[gpui::test]
+fn a_failing_task_message_is_retried_then_shown_in_monos_chat(cx: &mut TestAppContext) {
+    let before = monocode_core::provider::test_guard::refused();
+    let s = setup(cx);
+    let session = worker(&s);
+    ask(&s, session, "Which parser should I use?");
+    mono_busy(&s, cx);
+    let mut batches = Vec::new();
+    for _ in 0..monocode_core::tasks::inbox::INBOX_RETRY_LIMIT {
+        pump(&s, cx);
+        let queued = inbox_messages(&s, cx);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        batches.push(queued[0].id.clone());
+        // Mono's turn for it failed.
+        cx.update(|cx| {
+            s.manager.update(cx, |m, _| {
+                let mono = m.roster.get_mut(&s.id).unwrap();
+                mono.outbox[0].error = Some("Usage limit reached".into());
+            })
+        });
+        pump(&s, cx);
+        let left = inbox_messages(&s, cx);
+        assert!(left.is_empty(), "after failure {}: {left:?}", batches.len());
+    }
+    batches.dedup();
+    assert_eq!(batches.len(), 3, "each retry is a new batch");
+    let shown = cx.update(|cx| {
+        let m = s.manager.read(cx);
+        m.roster.get(&s.id).unwrap().pending_reports.clone()
+    });
+    assert!(
+        shown
+            .iter()
+            .any(|r| r.contains("could not reach") && r.contains("Usage limit")),
+        "{shown:?}"
+    );
+    // Nothing more is queued for the abandoned event.
+    pump(&s, cx);
+    assert!(inbox_messages(&s, cx).is_empty());
+    assert_no_provider_started(before);
 }
 
 fn storage_question() -> Question {
@@ -209,8 +199,10 @@ fn storage_question() -> Question {
 
 #[gpui::test]
 fn a_routed_provider_question_gets_monos_answer_through_its_reply_once(cx: &mut TestAppContext) {
+    let before = monocode_core::provider::test_guard::refused();
     let s = setup(cx);
     let session = worker(&s);
+    mono_busy(&s, cx);
     let other = locked(&s.store)
         .unwrap()
         .create("codex", &s.project)
@@ -236,18 +228,28 @@ fn a_routed_provider_question_gets_monos_answer_through_its_reply_once(cx: &mut 
     };
     let (worker_view, other_view) = (view(session, cx), view(other, cx));
     cx.run_until_parked();
-    // Another session's question stays with the user.
-    let kept = cx.update(|cx| {
-        other_view.update(cx, |v, _| v.route_task_questions(vec![storage_question()]))
+    // Another session's question stays with the user, with today's
+    // behaviour: the provider is not told to keep it open.
+    let ordinary = cx.update(|cx| {
+        other_view.update(cx, |v, _| {
+            let replies = v.test_provider_waiting();
+            assert_eq!(v.route_task_questions(vec![storage_question()]).len(), 1);
+            replies
+        })
     });
-    assert_eq!(kept.len(), 1);
+    assert!(ordinary.try_recv().is_err());
     let replies = cx.update(|cx| {
         worker_view.update(cx, |v, _| {
             let replies = v.test_provider_waiting();
             assert!(v.route_task_questions(vec![storage_question()]).is_empty());
+            assert_eq!(v.test_status(), "Waiting for Mono's answer");
             replies
         })
     });
+    // The routed question never expires into a denial: kept open at once.
+    let kept = replies.try_recv().unwrap();
+    assert_eq!(kept.id, storage_question().id);
+    assert!(matches!(kept.decision, Decision::KeepOpen));
     let id = {
         let db = locked(&s.store).unwrap();
         let tasks = db.tasks().unwrap();
@@ -279,10 +281,23 @@ fn a_routed_provider_question_gets_monos_answer_through_its_reply_once(cx: &mut 
     assert_eq!(decision(&s, &id).state, DecisionState::Resolved);
     pump(&s, cx);
     assert!(replies.try_recv().is_err());
+    // A routed question the provider withdraws stops showing as waiting.
+    let mut withdrawn = storage_question();
+    withdrawn.id = "\"wire-2\"".into();
+    cx.update(|cx| {
+        worker_view.update(cx, |v, _| {
+            assert!(v.route_task_questions(vec![withdrawn.clone()]).is_empty());
+            assert_eq!(v.test_status(), "Waiting for Mono's answer");
+            v.forget_task_question(&withdrawn.id);
+            assert_eq!(v.test_status(), "Working…");
+        })
+    });
+    assert_no_provider_started(before);
 }
 
 #[gpui::test]
 fn an_escalated_decision_is_a_card_in_monos_chat_that_the_user_answers(cx: &mut TestAppContext) {
+    let before = monocode_core::provider::test_guard::refused();
     let s = setup(cx);
     let session = worker(&s);
     let id = ask(&s, session, "Change the public API?");
@@ -317,30 +332,24 @@ fn an_escalated_decision_is_a_card_in_monos_chat_that_the_user_answers(cx: &mut 
         let chat = s.manager.read(cx).chats[&s.id].clone();
         chat.update(cx, |v, _| v.busy = true);
     });
-    // An unclear reply answers nothing and asks; the card's choice answers.
-    cx.update(|cx| {
-        s.manager
-            .update(cx, |m, cx| m.user_reply(&s.id, "what do you think?", cx))
-    });
-    assert_eq!(decision(&s, &id).state, DecisionState::Open);
-    let asked = cx.update(|cx| {
-        s.manager
-            .read(cx)
-            .roster
-            .get(&s.id)
-            .unwrap()
-            .pending_reports
-            .iter()
-            .any(|r| r.contains(&id))
-    });
-    let posted = locked(&s.store)
-        .unwrap()
-        .load(s.session)
-        .unwrap()
-        .rows
-        .iter()
-        .any(|r| r.text.contains("did not answer"));
-    assert!(asked || posted);
+    // An unclear reply answers nothing and asks, once per decision.
+    let notes = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let m = s.manager.read(cx);
+            m.roster
+                .get(&s.id)
+                .unwrap()
+                .pending_reports
+                .iter()
+                .filter(|r| r.contains("did not answer") && r.contains(&id))
+                .count()
+        })
+    };
+    for reply in ["what do you think?", "and the tests?"] {
+        cx.update(|cx| s.manager.update(cx, |m, cx| m.user_reply(&s.id, reply, cx)));
+        assert_eq!(decision(&s, &id).state, DecisionState::Open);
+        assert_eq!(notes(cx), 1, "after {reply:?}");
+    }
     let choice = json!({"type": "decision-answer", "decisionId": id,
         "revision": card["revision"], "text": "Keep the old API"});
     cx.update(|cx| {
@@ -352,11 +361,20 @@ fn an_escalated_decision_is_a_card_in_monos_chat_that_the_user_answers(cx: &mut 
     assert_eq!(answered.state, DecisionState::Answered);
     assert_eq!(answered.answered_by, Some(Requester::User));
     assert_eq!(answered.answer.as_deref(), Some("Keep the old API"));
-    // Another Mono's session could not have answered it: the bridge binds
-    // the Mono from the session, and a stale card choice is refused.
+    // The card now shows the answer and offers no choices.
+    let rows = locked(&s.store).unwrap().load(s.session).unwrap().rows;
+    let card = rows
+        .iter()
+        .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.text).ok())
+        .find(|c| c["type"] == "decision")
+        .unwrap();
+    assert_eq!(card["state"], "answered");
+    assert_eq!(card["answer"], "Keep the old API");
+    // Choosing again on the stale card is refused.
     cx.update(|cx| {
         s.manager
             .update(cx, |m, cx| m.card_action(&s.id, &choice, cx))
     });
     assert!(cx.update(|cx| s.manager.read(cx).error.is_some()));
+    assert_no_provider_started(before);
 }
