@@ -5,10 +5,11 @@
 use super::{optional_text, text};
 use crate::orchestration::WorkspaceMode;
 use crate::store::Store;
+use crate::tasks::completion::CriterionRun;
 use crate::tasks::decisions::Escalation;
 use crate::tasks::{
     AssignmentState, DecisionRequest, NewEvent, Requester, State, Subject, Task, TaskError,
-    TaskStore,
+    TaskStore, Verification,
 };
 use serde_json::{json, Value};
 
@@ -112,7 +113,10 @@ pub fn mono_task_action(
             )
         }
         "tasks.review.accept" | "tasks.review.sendBack" => review(&tasks, mono, action, input, now),
-        _ => verify(store, &tasks, mono, input, now),
+        _ => {
+            let run = prepare_mono_verify(store, mono, input)?;
+            finish_mono_verify(store, &run, run.run(now))
+        }
     }
 }
 
@@ -199,16 +203,21 @@ fn review(
     Ok(json!({"assignment": {"id": id, "status": to, "revision": revision}}))
 }
 
-/// Runs a check that demonstrates a criterion in the task's result
-/// workspace (or the named assignment's), recording the verification.
-fn verify(
+/// The first step of `tasks.criteria.verify`, under the store: checks the
+/// action, the flag and ownership and picks the workspace. The app runs the
+/// check ([`CriterionRun::run`]) without the store lock, then records it
+/// with [`finish_mono_verify`].
+pub fn prepare_mono_verify(
     store: &Store,
-    tasks: &TaskStore<'_>,
     mono: &str,
     input: &Value,
-    now: u64,
-) -> Result<Value, String> {
-    let task = owned_task(tasks, mono, &text(input, "taskId", 512)?)?;
+) -> Result<CriterionRun, String> {
+    crate::mono::api::validate("tasks.criteria.verify", input)?;
+    if !crate::tasks::coordinator::enabled(store) {
+        return Err(OFF.into());
+    }
+    let tasks = store.tasks().map_err(failed)?;
+    let task = owned_task(&tasks, mono, &text(input, "taskId", 512)?)?;
     let criterion = text(input, "criterionId", 512)?;
     let check = text(input, "check", MAX_CHECK)?;
     let named = optional_text(input, "assignmentId", 512)?;
@@ -227,12 +236,21 @@ fn verify(
                 .into(),
         );
     };
-    let verification = crate::tasks::completion::verify_criterion(
-        store, &task.id, &criterion, workspace, &check, now,
-    )
-    .map_err(failed)?;
+    CriterionRun::prepare(store, &task.id, &criterion, workspace, &check).map_err(failed)
+}
+
+/// The last step of `tasks.criteria.verify`, under the store: records the
+/// check's verification unless the task changed while it ran.
+pub fn finish_mono_verify(
+    store: &Store,
+    run: &CriterionRun,
+    outcome: Result<Verification, TaskError>,
+) -> Result<Value, String> {
+    let verification = outcome.map_err(failed)?;
+    run.record(store, &verification).map_err(failed)?;
     Ok(json!({
-        "verificationId": verification.id, "criterionId": criterion, "passed": verification.passed,
-        "checkpoint": verification.checkpoint_commit, "workspace": workspace.path,
+        "verificationId": verification.id, "criterionId": run.criterion_id,
+        "passed": verification.passed, "checkpoint": verification.checkpoint_commit,
+        "workspace": run.workspace.path,
     }))
 }

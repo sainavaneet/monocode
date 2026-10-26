@@ -50,6 +50,7 @@ pub fn forget_session(kind: Kind, provider_id: &str, account_id: &str, cwd: &Pat
     }
 }
 mod questions;
+pub mod test_guard;
 pub use questions::{answers_from_text, describe, question_from_json, question_json};
 mod rewind;
 mod tasks;
@@ -139,11 +140,14 @@ fn codex_error(error: &Value, fallback: &str) -> String {
 /// An explicit override wins and errors at launch rather than silently falling back.
 pub fn resolve(kind: Kind) -> Option<PathBuf> {
     if let Some(path) = crate::cli::configured(kind) {
-        return Some(path);
+        return test_guard::allow(Some(path));
     }
     resolve_auto(kind)
 }
 pub fn resolve_auto(kind: Kind) -> Option<PathBuf> {
+    test_guard::allow(resolve_unguarded(kind))
+}
+fn resolve_unguarded(kind: Kind) -> Option<PathBuf> {
     let key = format!("MONOCODE_{}_BINARY", kind.id().to_uppercase());
     if let Some(path) = std::env::var_os(key).filter(|s| !s.is_empty()) {
         return Some(path.into());
@@ -209,6 +213,8 @@ pub fn resolve_auto(kind: Kind) -> Option<PathBuf> {
             .collect();
         candidates.extend(paths);
     }
+    // Under a test, real installations are never probed or chosen.
+    candidates.retain(|p| test_guard::permitted(p));
     candidates.into_iter().find_map(|p| {
         #[cfg(windows)]
         for ext in ["exe", "cmd", "bat", "com"] {
@@ -1420,6 +1426,7 @@ fn run_operation(
             );
         }
     }
+    test_guard::check(&request.binary)?;
     let mut command = Command::new(&request.binary);
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);

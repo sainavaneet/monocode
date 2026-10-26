@@ -261,17 +261,32 @@ impl Protocol {
 }
 
 /// A provider question as plain text, for someone who answers it elsewhere
-/// (Mono, for a task worker): each prompt with its options.
+/// (Mono, for a task worker): each prompt with its options. Several parts
+/// are numbered, and are answered one line per part.
 pub fn describe(question: &Question) -> String {
+    let several = question.items.len() > 1;
     let mut text = Vec::new();
-    for item in &question.items {
-        text.push(item.prompt.clone());
+    if several {
+        text.push(format!(
+            "This question has {} parts; answer with one line per part, in order.",
+            question.items.len()
+        ));
+    }
+    for (index, item) in question.items.iter().enumerate() {
+        if several {
+            text.push(format!("{}. {}", index + 1, item.prompt));
+        } else {
+            text.push(item.prompt.clone());
+        }
         for option in &item.options {
             if option.description.is_empty() {
                 text.push(format!("- {}", option.label));
             } else {
                 text.push(format!("- {}: {}", option.label, option.description));
             }
+        }
+        if item.multiple {
+            text.push("- (choose several, separated by commas)".into());
         }
         if !item.options.is_empty() && item.allow_custom {
             text.push("- (or a written answer)".into());
@@ -280,20 +295,57 @@ pub fn describe(question: &Question) -> String {
     text.join("\n")
 }
 
-/// One written answer as the per-item answers a provider reply takes: the
-/// option whose label or id matches it, otherwise the text itself.
-pub fn answers_from_text(question: &Question, text: &str) -> Vec<Vec<String>> {
+/// One part's answer: the option whose label or id matches, otherwise the
+/// text itself; a multiple-choice part takes comma-separated options.
+fn item_answer(item: &QuestionItem, text: &str) -> Vec<String> {
+    let option = |text: &str| {
+        item.options
+            .iter()
+            .find(|o| o.label.eq_ignore_ascii_case(text) || o.id.eq_ignore_ascii_case(text))
+            .map(|o| o.label.clone())
+    };
+    if item.multiple {
+        let chosen: Option<Vec<String>> = text.split(',').map(|t| option(t.trim())).collect();
+        if let Some(chosen) = chosen.filter(|c| !c.is_empty()) {
+            return chosen;
+        }
+    }
+    vec![option(text).unwrap_or_else(|| text.to_owned())]
+}
+
+/// A written answer as the per-part answers a provider reply takes. A
+/// one-part question takes the whole text; a question of several parts
+/// takes one line per part, in order (a leading `1.` or `1)` is ignored),
+/// and any other shape is refused rather than guessed.
+pub fn answers_from_text(question: &Question, text: &str) -> Result<Vec<Vec<String>>, String> {
     let text = text.trim();
-    question
+    if let [item] = question.items.as_slice() {
+        return Ok(vec![item_answer(item, text)]);
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let digits = line.chars().take_while(char::is_ascii_digit).count();
+            match line[digits..].chars().next() {
+                Some('.' | ')' | ':') if digits > 0 => line[digits + 1..].trim(),
+                _ => line,
+            }
+        })
+        .collect();
+    if lines.len() != question.items.len() {
+        return Err(format!(
+            "This question has {} parts; answer with one line per part, in order.",
+            question.items.len()
+        ));
+    }
+    Ok(question
         .items
         .iter()
-        .map(|item| {
-            let chosen = item.options.iter().find(|option| {
-                option.label.eq_ignore_ascii_case(text) || option.id.eq_ignore_ascii_case(text)
-            });
-            vec![chosen.map_or_else(|| text.to_owned(), |option| option.label.clone())]
-        })
-        .collect()
+        .zip(lines)
+        .map(|(item, line)| item_answer(item, line))
+        .collect())
 }
 
 /// The question as JSON, so a routed question survives in the task record.
@@ -488,6 +540,67 @@ mod tests {
             response,
             json!({"type":"extension_ui_response","id":"r","value":"Second"})
         );
+    }
+    #[test]
+    fn written_answers_map_to_each_part_of_a_question() {
+        let mut p = protocol(Kind::Codex);
+        let events = p.frame(json!({"id":"r","method":"item/tool/requestUserInput","params":{"questions":[
+            {"id":"engine","question":"Which engine?","options":[{"label":"SQLite"},{"label":"Postgres"}]},
+            {"id":"name","question":"Table name?"}]}}), &mut Vec::new()).unwrap();
+        let Event::Question(question) = &events[0] else {
+            panic!("expected question")
+        };
+        let described = describe(question);
+        assert!(described.contains("2 parts") && described.contains("2. Table name?"));
+        assert_eq!(
+            answers_from_text(question, "1. postgres\n2) users").unwrap(),
+            vec![vec!["Postgres".to_owned()], vec!["users".to_owned()]]
+        );
+        // One line for two parts is refused, never copied into both.
+        assert!(answers_from_text(question, "postgres").is_err());
+        let mut multiple = question.clone();
+        multiple.items.truncate(1);
+        multiple.items[0].multiple = true;
+        assert_eq!(
+            answers_from_text(&multiple, "sqlite, Postgres").unwrap(),
+            vec![vec!["SQLite".to_owned(), "Postgres".to_owned()]]
+        );
+    }
+    #[test]
+    fn a_question_kept_open_never_expires_into_a_denial() {
+        for keep in [true, false] {
+            let mut p = protocol(Kind::Codex);
+            let events = p.frame(json!({"id":"r","method":"item/tool/requestUserInput","params":{
+                "isBlocking":false,"questions":[{"id":"q","question":"Choose","options":[{"label":"A"}]}]}}),
+                &mut Vec::new()).unwrap();
+            let Event::Question(question) = &events[0] else {
+                panic!("expected question")
+            };
+            assert!(question.auto_resolve_at.is_some());
+            if keep {
+                p.respond(
+                    Control {
+                        id: question.id.clone(),
+                        decision: Decision::KeepOpen,
+                    },
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            }
+            // Its deadline has passed.
+            if let Some((_, _, _, q)) = p.questions.get_mut(&question.id) {
+                q.auto_resolve_at = q.auto_resolve_at.map(|_| 0);
+            }
+            let mut out = Vec::new();
+            let expired = p.expire_questions(&mut out).unwrap();
+            if keep {
+                assert!(expired.is_empty() && out.is_empty());
+                assert!(p.questions.contains_key(&question.id));
+            } else {
+                assert!(matches!(expired.first(), Some(Event::QuestionResolved(_))));
+                assert!(!out.is_empty());
+            }
+        }
     }
     #[test]
     fn secret_and_duplicate_questions_are_rejected() {

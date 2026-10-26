@@ -78,10 +78,109 @@ pub(super) fn invalidate_on_send_back(
     Ok(())
 }
 
+/// One criterion check, split so the check itself runs without the store:
+/// [`CriterionRun::prepare`] reads under the store, [`CriterionRun::run`]
+/// snapshots and runs the check alone, [`CriterionRun::record`] re-checks the
+/// task and records the verification.
+#[derive(Clone, Debug)]
+pub struct CriterionRun {
+    pub task_id: String,
+    pub criterion_id: String,
+    pub workspace: Workspace,
+    pub check: String,
+    /// The task revision read when preparing; a change refuses the record.
+    pub task_revision: u64,
+    run_id: String,
+}
+
+impl CriterionRun {
+    pub fn prepare(
+        store: &Store,
+        task_id: &str,
+        criterion_id: &str,
+        workspace: &Workspace,
+        check: &str,
+    ) -> Result<Self, TaskError> {
+        let task = store
+            .tasks()?
+            .task(task_id)?
+            .ok_or_else(|| TaskError::NotFound(format!("task:{task_id}")))?;
+        if !task.criteria.iter().any(|c| c.id == criterion_id) {
+            return Err(TaskError::Invalid(format!(
+                "Task {task_id} has no criterion {criterion_id}."
+            )));
+        }
+        Ok(Self {
+            task_id: task_id.into(),
+            criterion_id: criterion_id.into(),
+            workspace: workspace.clone(),
+            check: check.into(),
+            task_revision: task.revision,
+            run_id: crate::mono::new_id(),
+        })
+    }
+
+    /// Snapshots the workspace and runs the check; touches no store.
+    pub fn run(&self, now: u64) -> Result<Verification, TaskError> {
+        let (task_id, criterion_id) = (&self.task_id, &self.criterion_id);
+        let reference =
+            |side: &str| task_ref(task_id, &["criteria", criterion_id, &self.run_id, side]);
+        let checkpoint = checkpoint::snapshot_workspace(&self.workspace.path, &reference("before"))
+            .map_err(|e| {
+                TaskError::Invalid(format!("The workspace could not be snapshotted: {e}"))
+            })?;
+        let checks = [self.check.clone()];
+        let mut batch = checks::run_batch(
+            &self.workspace.path,
+            &checks,
+            &checkpoint,
+            &reference("after"),
+        );
+        if let Some(error) = batch.error.take() {
+            return Err(TaskError::Invalid(error));
+        }
+        if !batch.modified.is_empty() {
+            return Err(TaskError::Invalid(format!(
+                "`{}` modified the workspace ({}), so it verifies nothing.",
+                self.check,
+                batch.modified.join(", ")
+            )));
+        }
+        let run = batch.results.remove(0).map_err(TaskError::Invalid)?;
+        Ok(Verification {
+            id: format!("criterion:{task_id}:{criterion_id}:{}", self.run_id),
+            task_id: task_id.clone(),
+            assignment_id: self.workspace.assignment_id.clone(),
+            criterion_id: Some(criterion_id.clone()),
+            checkpoint_commit: checkpoint,
+            check: self.check.clone(),
+            passed: run.passed(),
+            evidence: evidence(&self.workspace, &run),
+            invalidated: false,
+            created_at: now,
+        })
+    }
+
+    /// Records the verification if the task did not change meanwhile.
+    pub fn record(&self, store: &Store, verification: &Verification) -> Result<(), TaskError> {
+        let tasks = store.tasks()?;
+        let actual = tasks.revision(super::Subject::Task(&self.task_id))?;
+        if actual != self.task_revision {
+            return Err(TaskError::Stale {
+                subject: format!("task:{}", self.task_id),
+                expected: self.task_revision,
+                actual,
+            });
+        }
+        tasks.record_verification(verification)
+    }
+}
+
 /// Runs `check` in `workspace` against a fresh snapshot and records whether
-/// it shows the task's criterion `criterion_id`. Which check demonstrates a
-/// criterion is the caller's judgement (Mono, or integration's acceptance
-/// run); the result is evidence either way.
+/// it shows the task's criterion `criterion_id`, holding `store` throughout.
+/// Which check demonstrates a criterion is the caller's judgement (Mono, or
+/// integration's acceptance run); the result is evidence either way. The app
+/// uses [`CriterionRun`]'s steps instead, so the check runs unlocked.
 pub fn verify_criterion(
     store: &Store,
     task_id: &str,
@@ -90,44 +189,9 @@ pub fn verify_criterion(
     check: &str,
     now: u64,
 ) -> Result<Verification, TaskError> {
-    let tasks = store.tasks()?;
-    let task = tasks
-        .task(task_id)?
-        .ok_or_else(|| TaskError::NotFound(format!("task:{task_id}")))?;
-    if !task.criteria.iter().any(|c| c.id == criterion_id) {
-        return Err(TaskError::Invalid(format!(
-            "Task {task_id} has no criterion {criterion_id}."
-        )));
-    }
-    let run_id = crate::mono::new_id();
-    let reference = |side: &str| task_ref(task_id, &["criteria", criterion_id, &run_id, side]);
-    let checkpoint = checkpoint::snapshot_workspace(&workspace.path, &reference("before"))
-        .map_err(|e| TaskError::Invalid(format!("The workspace could not be snapshotted: {e}")))?;
-    let checks = [check.to_owned()];
-    let mut batch = checks::run_batch(&workspace.path, &checks, &checkpoint, &reference("after"));
-    if let Some(error) = batch.error.take() {
-        return Err(TaskError::Invalid(error));
-    }
-    if !batch.modified.is_empty() {
-        return Err(TaskError::Invalid(format!(
-            "`{check}` modified the workspace ({}), so it verifies nothing.",
-            batch.modified.join(", ")
-        )));
-    }
-    let run = batch.results.remove(0).map_err(TaskError::Invalid)?;
-    let verification = Verification {
-        id: format!("criterion:{task_id}:{criterion_id}:{run_id}"),
-        task_id: task_id.into(),
-        assignment_id: workspace.assignment_id.clone(),
-        criterion_id: Some(criterion_id.into()),
-        checkpoint_commit: checkpoint,
-        check: check.into(),
-        passed: run.passed(),
-        evidence: evidence(workspace, &run),
-        invalidated: false,
-        created_at: now,
-    };
-    tasks.record_verification(&verification)?;
+    let run = CriterionRun::prepare(store, task_id, criterion_id, workspace, check)?;
+    let verification = run.run(now)?;
+    run.record(store, &verification)?;
     Ok(verification)
 }
 

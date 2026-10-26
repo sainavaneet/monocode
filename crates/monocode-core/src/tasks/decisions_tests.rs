@@ -14,10 +14,14 @@ use crate::tasks::{
 use serde_json::{json, Value};
 use std::path::Path;
 
-pub(super) const NOW: u64 = 1_000;
+pub(in crate::tasks) const NOW: u64 = 1_000;
 
 /// Task `t` (owned by `mono-1`) Implementing, with `assignments` all Queued.
-pub(super) fn task_with(store: &Store, project: &str, assignments: Vec<crate::tasks::Assignment>) {
+pub(in crate::tasks) fn task_with(
+    store: &Store,
+    project: &str,
+    assignments: Vec<crate::tasks::Assignment>,
+) {
     store.save_setting(FLAG, "enabled").unwrap();
     let tasks = store.tasks().unwrap();
     tasks
@@ -43,7 +47,7 @@ pub(super) fn task_with(store: &Store, project: &str, assignments: Vec<crate::ta
     }
 }
 
-pub(super) fn independent(id: &str) -> crate::tasks::Assignment {
+pub(in crate::tasks) fn independent(id: &str) -> crate::tasks::Assignment {
     crate::tasks::Assignment {
         files: vec![format!("src/{id}")],
         ..assignment(id, &[])
@@ -51,7 +55,7 @@ pub(super) fn independent(id: &str) -> crate::tasks::Assignment {
 }
 
 /// Runs assignment `a` with attempt `x` bound to a new worker session.
-pub(super) fn running(store: &Store, assignment: &str, attempt: &str) -> i64 {
+pub(in crate::tasks) fn running(store: &Store, assignment: &str, attempt: &str) -> i64 {
     let session = store.create("codex", "/project").unwrap().id;
     let tasks = store.tasks().unwrap();
     let a = Subject::Assignment {
@@ -92,7 +96,7 @@ pub(super) fn running(store: &Store, assignment: &str, attempt: &str) -> i64 {
     session
 }
 
-pub(super) fn ask(
+pub(in crate::tasks) fn ask(
     store: &Store,
     session: i64,
     request: &str,
@@ -111,15 +115,15 @@ pub(super) fn ask(
     asked["decision"]["id"].as_str().unwrap().to_owned()
 }
 
-pub(super) fn mono(store: &Store, action: &str, input: Value) -> Result<Value, String> {
+pub(in crate::tasks) fn mono(store: &Store, action: &str, input: Value) -> Result<Value, String> {
     mono_task_action(store, "mono-1", action, &input, NOW + 2)
 }
 
-pub(super) fn decision(store: &Store, id: &str) -> crate::tasks::DecisionRequest {
+pub(in crate::tasks) fn decision(store: &Store, id: &str) -> crate::tasks::DecisionRequest {
     store.tasks().unwrap().decision(id).unwrap().unwrap()
 }
 
-pub(super) fn answer(store: &Store, id: &str, text: &str) {
+pub(in crate::tasks) fn answer(store: &Store, id: &str, text: &str) {
     let revision = decision(store, id).revision;
     mono(
         store,
@@ -143,7 +147,7 @@ fn escalate(store: &Store, id: &str) -> Value {
         .clone()
 }
 
-pub(super) fn status(store: &Store, assignment: &str) -> AssignmentState {
+pub(in crate::tasks) fn status(store: &Store, assignment: &str) -> AssignmentState {
     let tasks = store.tasks().unwrap();
     tasks.assignment("t", assignment).unwrap().unwrap().status
 }
@@ -152,13 +156,13 @@ fn attempt_status(store: &Store, id: &str) -> AttemptState {
     store.tasks().unwrap().attempt(id).unwrap().unwrap().status
 }
 
-pub(super) fn events(store: &Store, kind: &str) -> Vec<crate::tasks::Event> {
+pub(in crate::tasks) fn events(store: &Store, kind: &str) -> Vec<crate::tasks::Event> {
     let all = store.tasks().unwrap().events_after(0, 10_000).unwrap();
     all.into_iter().filter(|e| e.kind == kind).collect()
 }
 
 /// Mono's chat turn carrying `batch` was persisted.
-fn mono_received(store: &Store, mono_session: i64, batch: &inbox::Batch) {
+pub(in crate::tasks) fn mono_received(store: &Store, mono_session: i64, batch: &inbox::Batch) {
     store
         .save_setting(&format!("mono-delivered:{mono_session}:{}", batch.id), "1")
         .unwrap();
@@ -583,7 +587,8 @@ fn provider_questions_on_attempt_sessions_go_to_mono_and_others_stay_with_the_us
     let original = handoff.question.expect("the provider question");
     assert_eq!(original.id, question.id);
     let answers =
-        crate::provider::answers_from_text(&original, handoff.decision.answer.as_deref().unwrap());
+        crate::provider::answers_from_text(&original, handoff.decision.answer.as_deref().unwrap())
+            .unwrap();
     assert_eq!(answers, vec![vec!["Postgres".to_owned()]]);
 }
 
@@ -717,5 +722,46 @@ fn free_text_replies_resolve_only_unambiguous_decisions() {
     assert_eq!(
         tasks.match_user_reply("mono-1", "").unwrap(),
         decisions::ReplyMatch::Unclear(vec![qa, qb])
+    );
+}
+
+#[test]
+fn a_failed_askers_question_stops_holding_other_launches() {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    task_with(&store, "/project", vec![independent("a"), independent("b")]);
+    let worker = running(&store, "a", "x");
+    let id = ask(&store, worker, "q1", "Rename the crate?", "task");
+    answer(&store, &id, "Keep the name");
+    let tasks = store.tasks().unwrap();
+    let blocked = || {
+        let all = tasks.assignments("t").unwrap();
+        let b = all.iter().find(|a| a.id == "b").unwrap();
+        tasks.launch_blocked("t", b, &all).unwrap().is_some()
+    };
+    assert!(
+        blocked(),
+        "an answered task-wide question holds until handed over"
+    );
+    // The asking worker died and its assignment failed: nobody takes the
+    // answer until it is queued again, so it holds nothing meanwhile.
+    let a = Subject::Assignment { task: "t", id: "a" };
+    let to = |state| {
+        let rev = tasks.revision(a).unwrap();
+        tasks
+            .transition(
+                a,
+                State::Assignment(state),
+                Requester::Coordinator,
+                rev,
+                NOW + 5,
+            )
+            .unwrap();
+    };
+    to(AssignmentState::Failed);
+    assert!(!blocked());
+    to(AssignmentState::Queued);
+    assert!(
+        blocked(),
+        "queued again, its replacement will take the answer"
     );
 }

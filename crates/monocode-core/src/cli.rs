@@ -32,6 +32,7 @@ pub fn output(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<String, String> {
+    crate::provider::test_guard::check(binary)?;
     let mut command = Command::new(binary);
     crate::scm::shell::apply_gui_env(&mut command);
     command

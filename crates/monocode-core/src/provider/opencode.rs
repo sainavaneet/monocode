@@ -155,6 +155,7 @@ fn park(server: Server, request: &Request, session: String) {
     });
 }
 fn command(request: &Request) -> Result<Command, String> {
+    super::test_guard::check(&request.binary)?;
     let mut command = Command::new(&request.binary);
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);

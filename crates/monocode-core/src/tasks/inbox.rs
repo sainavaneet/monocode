@@ -20,6 +20,13 @@ use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 const INBOX: &str = "mono.inbox";
+/// A batch whose message fails this many times is surfaced in Mono's chat
+/// and its events stop blocking later ones.
+pub const INBOX_RETRY_LIMIT: u32 = 3;
+/// An open question Mono has not answered is sent again after this long...
+pub const REMIND_AFTER_MS: u64 = 30 * 60 * 1000;
+/// ...at most this many times; it then waits without further reminders.
+pub const MAX_REMINDERS: usize = 3;
 /// Caps one message; the rest waits for the next batch.
 const MAX_PER_BATCH: usize = 20;
 const HOW: &str = "Handle each item with the tasks.* app actions. Answer routine technical questions yourself from the request, prior decisions, project conventions, memory and your authorized scope; ask the user only when it needs them (escalate), and never answer for the user.";
@@ -115,6 +122,7 @@ pub fn next_batch(store: &Store, mono: &str, now: u64) -> Result<Option<Batch>, 
         return Ok(Some(batch));
     }
     let tx = tasks.begin()?;
+    remind(&tasks, mono, now)?;
     let mut items = Vec::new();
     let mut deliveries = Vec::new();
     let mut task_id = None;
@@ -157,6 +165,94 @@ pub fn next_batch(store: &Store, mono: &str, now: u64) -> Result<Option<Batch>, 
     append(&tx, &event, now)?;
     tx.commit()?;
     Ok(batch_of(&payload))
+}
+
+/// Mono was not reminded of a question it has not answered since its last
+/// delivery reached it more than [`REMIND_AFTER_MS`] ago: queue it again (at
+/// most [`MAX_REMINDERS`] times). Covers a Mono turn that failed after the
+/// batch was acknowledged. Inside the caller's transaction.
+fn remind(tasks: &TaskStore<'_>, mono: &str, now: u64) -> Result<(), TaskError> {
+    for decision in tasks.mono_decisions(mono)? {
+        if decision.state != DecisionState::Open || tasks.escalation(&decision.id)?.is_some() {
+            continue;
+        }
+        let reference = format!("decision:{}", decision.id);
+        let mut statement = tasks.conn.prepare(
+            "SELECT state,updated_at FROM native_task_deliveries
+             WHERE destination=?1 AND payload_ref=?2 ORDER BY rowid",
+        )?;
+        let sent = statement
+            .query_map([MONO_DECISION, reference.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, super::store::read_ms(row, 1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let settled = sent.iter().all(|(state, _)| state == "acknowledged");
+        let last = sent.iter().map(|(_, at)| *at).max().unwrap_or(0);
+        if sent.is_empty() || !settled || sent.len() > MAX_REMINDERS {
+            continue;
+        }
+        if now >= last.saturating_add(REMIND_AFTER_MS) {
+            tasks.enqueue_delivery(
+                &format!("mono-decision:{}:reminder-{}", decision.id, sent.len()),
+                &format!("decision:{}@1", decision.id),
+                MONO_DECISION,
+                &reference,
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Mono's outbox reports the batch's message failed. Its deliveries go back
+/// to pending for another batch, until a delivery has failed
+/// [`INBOX_RETRY_LIMIT`] times: it is then acknowledged (so later events are
+/// not held behind it) and returned, for the app to show in Mono's chat.
+pub fn batch_failed(
+    store: &Store,
+    mono: &str,
+    batch: &str,
+    error: &str,
+    now: u64,
+) -> Result<Vec<String>, TaskError> {
+    let tasks = store.tasks()?;
+    let Some(batch) = unacknowledged(&tasks, mono)?
+        .into_iter()
+        .find(|b| b.id == batch)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut abandoned = Vec::new();
+    for id in &batch.deliveries {
+        let Some(delivery) = tasks
+            .delivery(id)?
+            .filter(|d| d.state.as_str() == "delivered")
+        else {
+            continue;
+        };
+        if delivery.retries + 1 >= INBOX_RETRY_LIMIT {
+            let task = event(&tasks, &delivery.event_id)?.map(|e| e.task_id);
+            let tx = tasks.begin()?;
+            acknowledge(&tx, id, now)?;
+            if let Some(task_id) = task {
+                let abandoned = NewEvent {
+                    id: format!("inbox_abandoned:{id}"),
+                    task_id,
+                    assignment_id: None,
+                    attempt_id: None,
+                    kind: "mono.inbox_abandoned".into(),
+                    payload: json!({"batchId": batch.id, "deliveryId": id, "error": error}),
+                };
+                append(&tx, &abandoned, now)?;
+            }
+            tx.commit()?;
+            abandoned.push(id.clone());
+        } else {
+            let failed = super::DeliveryOutcome::Failed(error.into());
+            tasks.record_delivery(id, delivery.revision, failed, now)?;
+        }
+    }
+    Ok(abandoned)
 }
 
 /// Acknowledges every batch whose message reached Mono's transcript (the
@@ -371,8 +467,13 @@ fn review(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskErr
         None => 0,
     };
     text.push_str(&format!(
-        "\nResolve with tasks.review.accept {{\"taskId\":\"{t}\",\"assignmentId\":\"...\",\"revision\":{revision}}}, tasks.review.sendBack {{\"taskId\":\"{t}\",\"assignmentId\":\"...\",\"revision\":{revision},\"reason\":\"...\"}} or tasks.criteria.verify {{\"taskId\":\"{t}\",\"criterionId\":\"...\",\"check\":\"...\"}}.",
-        t = event.task_id
+        "\nResolve with tasks.review.accept {{\"taskId\":\"{t}\",\"assignmentId\":\"{a}\",\"revision\":{revision}}}, tasks.review.sendBack {{\"taskId\":\"{t}\",\"assignmentId\":\"{a}\",\"revision\":{revision},\"reason\":\"...\"}} or tasks.criteria.verify {{\"taskId\":\"{t}\",\"criterionId\":\"...\",\"check\":\"...\"}}.",
+        t = event.task_id,
+        a = event.assignment_id.as_deref().unwrap_or("...")
     ));
     Ok(text)
 }
+
+#[cfg(test)]
+#[path = "inbox_tests.rs"]
+mod tests;

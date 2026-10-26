@@ -10,6 +10,8 @@ pub mod coordinator;
 pub mod decisions;
 pub mod events;
 pub mod findings;
+#[doc(hidden)]
+pub mod fixtures;
 pub mod inbox;
 mod launch;
 pub mod model;

@@ -471,6 +471,10 @@ impl TaskStore<'_> {
                 )))
             }
         }
+        // A provider question's answer must fit its parts before it is kept.
+        if let Some(question) = self.provider_question(id)? {
+            crate::provider::answers_from_text(&question, answer).map_err(TaskError::Invalid)?;
+        }
         let who = by.as_str();
         let revision = key.bump(
             &tx,
@@ -568,7 +572,10 @@ impl TaskStore<'_> {
     /// Why `assignment` may not launch now, if a decision holds it: its own
     /// open question; a task-wide question asked elsewhere in the task; or a
     /// `dependents` question on an assignment it depends on. Answered
-    /// questions still hold others until their worker has the answer.
+    /// questions still hold others until their worker has the answer. A
+    /// question whose asking assignment failed or was cancelled holds
+    /// nothing: no worker of it will take the answer until it is queued
+    /// again.
     pub fn launch_blocked(
         &self,
         task: &str,
@@ -579,7 +586,8 @@ impl TaskStore<'_> {
             "SELECT d.id,d.scope,d.state,COALESCE(d.assignment_id,'') FROM native_task_decisions d
              WHERE d.task_id=?1 AND d.state<>'resolved'
                AND NOT EXISTS(SELECT 1 FROM native_task_assignments a
-                 WHERE a.task_id=d.task_id AND a.id=d.assignment_id AND a.status='cancelled')
+                 WHERE a.task_id=d.task_id AND a.id=d.assignment_id
+                   AND a.status IN ('cancelled','failed'))
              ORDER BY d.rowid",
         )?;
         let rows = statement
@@ -749,7 +757,7 @@ pub(super) fn assignment_decisions(
 
 #[cfg(test)]
 #[path = "decisions_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(test)]
 #[path = "decisions_launch_tests.rs"]

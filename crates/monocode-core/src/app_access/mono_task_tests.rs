@@ -1,86 +1,19 @@
 //! Mono's task commands: authority comes from the Mono that owns the task,
 //! which the bridge derives from the calling session, never from the input.
 use super::*;
-use crate::orchestration::{Plan, Task as Assignment};
-use crate::tasks::{
-    AssignmentState, AttemptState, DecisionState, NewAttempt, NewTask, Requester, State, Subject,
-    TaskStage,
-};
+use crate::tasks::DecisionState;
 use std::path::Path;
 
 const NOW: u64 = 10;
 
-/// Task `t` owned by `mono-1`, assignment `a` Running, attempt `x` bound to a
-/// worker session that asked one question. Returns the decision id.
+/// The shared running-worker fixture, owned by `mono-1`, whose worker asked
+/// one question. Returns the decision id.
 fn fixture() -> (Store, String) {
     let store = Store::open(Path::new(":memory:")).unwrap();
     store
         .save_setting(crate::tasks::coordinator::FLAG, "enabled")
         .unwrap();
-    let worker = store.create("codex", "/project").unwrap().id;
-    let tasks = store.tasks().unwrap();
-    tasks
-        .create_task(
-            &NewTask {
-                id: "t".into(),
-                mono_id: Some("mono-1".into()),
-                project: "/project".into(),
-                title: "Ship it".into(),
-                request: "Implement the feature".into(),
-                criteria: vec![],
-            },
-            1,
-        )
-        .unwrap();
-    let plan = Plan {
-        title: "Plan".into(),
-        summary: "Approach".into(),
-        tasks: vec![Assignment {
-            id: "a".into(),
-            title: "Assignment a".into(),
-            prompt: "Do the work".into(),
-            files: vec!["src".into()],
-            ..Assignment::default()
-        }],
-    };
-    tasks.save_plan("t", 1, &plan, 1).unwrap();
-    let t = Subject::Task("t");
-    for stage in [TaskStage::Ready, TaskStage::Implementing] {
-        let rev = tasks.revision(t).unwrap();
-        tasks
-            .transition(t, State::Stage(stage), Requester::Mono, rev, 1)
-            .unwrap();
-    }
-    let a = Subject::Assignment { task: "t", id: "a" };
-    for to in [AssignmentState::Ready, AssignmentState::Running] {
-        let rev = tasks.revision(a).unwrap();
-        tasks
-            .transition(a, State::Assignment(to), Requester::Coordinator, rev, 1)
-            .unwrap();
-    }
-    tasks
-        .create_attempt(
-            &NewAttempt {
-                id: "x".into(),
-                task_id: "t".into(),
-                assignment_id: "a".into(),
-                operation_id: "launch-x".into(),
-                provider: "codex".into(),
-                account_id: None,
-            },
-            1,
-        )
-        .unwrap();
-    let x = Subject::Attempt("x");
-    for to in [AttemptState::Starting, AttemptState::Running] {
-        let rev = tasks.revision(x).unwrap();
-        tasks
-            .transition(x, State::Attempt(to), Requester::Coordinator, rev, 1)
-            .unwrap();
-    }
-    let rev = tasks.revision(x).unwrap();
-    let bound = store.persisted_session_id(worker).unwrap();
-    tasks.bind_attempt_session("x", rev, &bound, 1).unwrap();
+    let worker = crate::tasks::fixtures::running_worker(&store, "mono-1", "/project").unwrap();
     let asked = worker_action(
         &store,
         worker,
