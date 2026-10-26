@@ -126,4 +126,47 @@ mod tests {
             assert_eq!(view.read(cx).source_rows()[2].text,"Ready for review");
         });
     }
+    #[gpui::test]
+    fn orchestration_plan_json_stays_out_of_the_reply(cx: &mut gpui::TestAppContext) {
+        let reply = "Plan ready.\n\n<monocode_orchestration>\n{\"title\":\"Work\",\"summary\":\"Split it\",\"tasks\":[{\"id\":\"task-1\",\"title\":\"Do it\",\"prompt\":\"many words of instructions here\",\"files\":[\"src\"],\"depends_on\":[]}]}\n</monocode_orchestration>";
+        cx.update(|cx| {
+            let view = cx.new(|cx| {
+                let mut view = TranscriptView::new();
+                view.patch(
+                    0,
+                    vec![
+                        Row {
+                            role: "user".into(),
+                            text: "Orchestrate".into(),
+                            first: true,
+                            sent_at: None,
+                        },
+                        Row {
+                            role: "assistant".into(),
+                            text: reply.into(),
+                            first: true,
+                            sent_at: None,
+                        },
+                    ],
+                    cx,
+                );
+                view
+            });
+            let words: usize = view
+                .read(cx)
+                .rows
+                .iter()
+                .filter_map(|row| match &row.body {
+                    Body::Markdown(row) => Some(crate::markdown::word_count(row)),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(words, 2, "only \"Plan ready.\" is drawn");
+            assert_eq!(
+                view.read(cx).source_rows()[1].text,
+                reply,
+                "the source keeps the plan"
+            );
+        });
+    }
 }

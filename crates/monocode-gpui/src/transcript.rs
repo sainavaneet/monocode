@@ -3027,6 +3027,14 @@ impl TranscriptView {
                 .iter()
                 .map(|r| r.text.as_str())
                 .collect();
+            // The plan card above the composer presents an orchestration plan.
+            let text = match (role == "assistant")
+                .then(|| monocode_core::orchestration::display_text(&text))
+                .flatten()
+            {
+                Some(shown) => shown,
+                None => text,
+            };
             // Older native versions saved user cancellation as an error row.
             let stopped_notice = role == "error" && text.trim() == "Stopped";
             let (display_text, attachments) = if role == "user" {

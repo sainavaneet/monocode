@@ -705,6 +705,9 @@ pub(crate) struct Shell {
     review_slide: Option<(i64, PaneSlide, Entity<crate::review::ReviewPane>)>,
     /// A session review card's Review, opened beside its pane next frame.
     pending_review: Option<(i64, crate::review::ReviewTab)>,
+    /// A session opened from a view event that has no window, such as the
+    /// orchestration card's worker link.
+    pending_activation: Option<i64>,
     pending_composer_focus: Option<i64>,
     review_focused: bool,
     review_drag: bool,
@@ -1041,6 +1044,7 @@ impl Shell {
             reviews: HashMap::new(),
             review_slide: None,
             pending_review: None,
+            pending_activation: None,
             pending_composer_focus: None,
             review_focused: false,
             review_drag: false,
@@ -7785,6 +7789,9 @@ impl Render for Shell {
             m.update(cx, |m, cx| m.bind_window(window, cx));
         }
         self.render_passes += 1;
+        if let Some(id) = self.pending_activation.take() {
+            self.activate_session(id, window, cx);
+        }
         if let Some((id, tab)) = self.pending_review.take()
             && self.workspace.tab_of(id).is_some()
         {
