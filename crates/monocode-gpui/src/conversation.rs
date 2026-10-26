@@ -2239,6 +2239,9 @@ impl Conversation {
             }
         }
         self.model = picked.1.clone();
+        // The saved settings travel with the conversation: clones of them
+        // (orchestration workers, Monos) and a reload must see this pick too.
+        self.settings.model = picked.1.clone();
         if let Some(context) = &mut self.context {
             context.window = None;
         }

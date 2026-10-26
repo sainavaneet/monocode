@@ -301,3 +301,50 @@ fn stopping_before_the_worker_runs_keeps_the_optimistic_message(cx: &mut TestApp
             .unwrap();
     }
 }
+
+#[gpui::test]
+fn picking_a_model_updates_the_saved_settings_too(cx: &mut gpui::TestAppContext) {
+    use crate::pickers::ModelPicked;
+    use monocode_core::{provider::Kind, store::Store};
+    let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let summary = store.create("antigravity", "/tmp").unwrap();
+    let id = summary.id;
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let saved = store.clone();
+    let window = cx.update(|cx| {
+        cx.set_global(crate::settings::Preferences::default());
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, store, cx);
+                view.loaded = true;
+                // Created under another provider's default model.
+                view.settings.model = Some("gemini-3.8-flash-high".into());
+                view.model = view.settings.model.clone();
+                view
+            })
+        })
+        .unwrap()
+    });
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.apply_model_pick(&ModelPicked(Kind::Claude, Some("opus".into())), cx));
+            assert_eq!(view.summary.provider, "claude");
+            assert_eq!(
+                view.settings.model.as_deref(),
+                Some("opus"),
+                "clones of the settings, such as orchestration workers, must see the picked model"
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let persisted = crate::runtime::locked(&saved)
+        .unwrap()
+        .agent_settings(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.model.as_deref(),
+        Some("opus"),
+        "a restart must not revert the pick"
+    );
+}
