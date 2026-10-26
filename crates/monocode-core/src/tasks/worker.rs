@@ -206,10 +206,13 @@ impl TaskStore<'_> {
             .ok_or_else(|| TaskError::NotFound(format!("decision:{}", question.id)))
     }
 
-    /// Records the attempt's result claim and finishes the attempt: Succeeded
-    /// (its assignment moves to NeedsReview when it is the latest attempt) or
-    /// Failed. Returns the claim and whether this call recorded it; the same
-    /// claim again returns the stored one, and a different one is refused.
+    /// Records the attempt's result claim. A succeeded claim moves the
+    /// attempt to Succeeded (and its assignment to NeedsReview when it is the
+    /// latest attempt). Any other claim only records it: the attempt stays
+    /// Running or Waiting until the coordinator classifies it on its own
+    /// authority, since the table does not let a worker fail an attempt.
+    /// Returns the claim and whether this call recorded it; the same claim
+    /// again returns the stored one, and a different one is refused.
     pub fn claim_result(
         &self,
         attempt_id: &str,
@@ -229,24 +232,30 @@ impl TaskStore<'_> {
         let attempt = self
             .attempt(attempt_id)?
             .ok_or_else(|| TaskError::NotFound(format!("attempt:{attempt_id}")))?;
+        if !matches!(
+            attempt.status,
+            AttemptState::Running | AttemptState::Waiting
+        ) {
+            return Err(TaskError::InvalidState {
+                subject: format!("attempt:{attempt_id}"),
+                state: attempt.status.as_str().into(),
+            });
+        }
         let payload = serde_json::to_value(claim)?;
         let claimed = event(&attempt, claim_event(attempt_id), "attempt.claim", payload);
         append(&tx, &claimed, now)?;
-        // A worker may claim success; a reported failure is recorded by the
-        // app on the coordinator's authority, as the table reserves it.
-        let (to, requester) = match claim.outcome {
-            ClaimOutcome::Succeeded => (AttemptState::Succeeded, Requester::Worker),
-            ClaimOutcome::Failed => (AttemptState::Failed, Requester::Coordinator),
-        };
-        let subject = Subject::Attempt(attempt_id);
-        apply(
-            &tx,
-            subject,
-            State::Attempt(to),
-            requester,
-            attempt.revision,
-            now,
-        )?;
+        if claim.outcome == ClaimOutcome::Succeeded {
+            let succeeded = State::Attempt(AttemptState::Succeeded);
+            let subject = Subject::Attempt(attempt_id);
+            apply(
+                &tx,
+                subject,
+                succeeded,
+                Requester::Worker,
+                attempt.revision,
+                now,
+            )?;
+        }
         tx.commit()?;
         Ok((claim.clone(), true))
     }

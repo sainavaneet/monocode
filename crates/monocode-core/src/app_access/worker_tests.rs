@@ -66,6 +66,16 @@ fn fixture() -> (Store, i64) {
 
 /// Records attempt `id` for assignment `a`, starts it and binds `session`.
 fn launch(store: &Store, id: &str, session: i64) {
+    start(
+        store,
+        id,
+        session,
+        &[AttemptState::Starting, AttemptState::Running],
+    );
+}
+
+/// Records attempt `id`, moves it through `states` and binds `session`.
+fn start(store: &Store, id: &str, session: i64, states: &[AttemptState]) {
     let tasks = store.tasks().unwrap();
     tasks
         .create_attempt(
@@ -81,7 +91,7 @@ fn launch(store: &Store, id: &str, session: i64) {
         )
         .unwrap();
     let x = Subject::Attempt(id);
-    for to in [AttemptState::Starting, AttemptState::Running] {
+    for &to in states {
         let rev = tasks.revision(x).unwrap();
         tasks
             .transition(x, State::Attempt(to), Requester::Coordinator, rev, 1)
@@ -187,6 +197,7 @@ fn status_reports_the_bound_work_and_answered_decisions_without_writing() {
     assert_eq!(status["attempt"]["status"], "running");
     assert_eq!(status["answeredDecisions"], json!([]));
     assert!(status["claim"].is_null());
+    assert!(status["claimState"].is_null());
 
     let asked = call(
         &store,
@@ -287,6 +298,10 @@ fn a_result_is_one_claim_in_review_and_never_completes_the_task() {
     );
     assert_eq!(attempt_status(&store, "x"), AttemptState::Succeeded);
     assert_eq!(assignment_status(&store), AssignmentState::NeedsReview);
+    let review = events(&store, "assignment.needs_review");
+    assert_eq!(review[0].payload["requester"], "worker");
+    let status = call(&store, caller, "s1", "tasks.worker.status", json!({})).unwrap();
+    assert_eq!(status["claimState"], "awaiting_review");
     let task = tasks.task("t").unwrap().unwrap();
     assert_eq!(task.stage, TaskStage::Implementing);
     assert_eq!(task.lifecycle, TaskLifecycle::Active);
@@ -308,23 +323,76 @@ fn a_result_is_one_claim_in_review_and_never_completes_the_task() {
 }
 
 #[test]
-fn a_failed_result_is_recorded_without_review() {
+fn a_failed_result_is_a_claim_left_for_the_coordinator() {
     let (store, caller) = fixture();
-    let input =
-        json!({"outcome":"failed","summary":"Could not reproduce","remainingWork":["Everything"]});
-    call(&store, caller, "r1", "tasks.worker.result", input).unwrap();
-    let claim = store.tasks().unwrap().claim("x").unwrap().unwrap();
-    assert_eq!(claim.outcome, crate::tasks::ClaimOutcome::Failed);
-    assert_eq!(attempt_status(&store, "x"), AttemptState::Failed);
-    assert_eq!(assignment_status(&store), AssignmentState::Running);
     for bad in [
         json!({"outcome":"done","summary":"x"}),
         json!({"outcome":"succeeded"}),
         json!({"outcome":"succeeded","summary":"x","commits":"abc"}),
         json!({"outcome":"succeeded","summary":"x","evidence":[1]}),
+        json!({"outcome":"succeeded","summary":"x","commits":["abc","  "]}),
     ] {
-        assert!(call(&store, caller, "r2", "tasks.worker.result", bad).is_err());
+        assert!(call(&store, caller, "r0", "tasks.worker.result", bad).is_err());
     }
+    let input = json!({"outcome":"failed","summary":"Could not reproduce","remainingWork":[" Everything "]});
+    let first = call(&store, caller, "r1", "tasks.worker.result", input.clone()).unwrap();
+    assert_eq!(first["duplicate"], false);
+    assert_eq!(first["claim"]["remainingWork"], json!(["Everything"]));
+    let claim = store.tasks().unwrap().claim("x").unwrap().unwrap();
+    assert_eq!(claim.outcome, crate::tasks::ClaimOutcome::Failed);
+    // The worker cannot fail its attempt; the coordinator classifies it.
+    assert_eq!(attempt_status(&store, "x"), AttemptState::Running);
+    assert_eq!(assignment_status(&store), AssignmentState::Running);
+    assert!(events(&store, "attempt.failed").is_empty());
+    let status = call(&store, caller, "s1", "tasks.worker.status", json!({})).unwrap();
+    assert_eq!(status["claim"]["outcome"], "failed");
+    assert_eq!(status["claimState"], "awaiting_coordinator");
+
+    // A duplicated failed claim is the same claim; a changed one is refused.
+    let again = call(&store, caller, "r2", "tasks.worker.result", input).unwrap();
+    assert_eq!(again["duplicate"], true);
+    assert_eq!(again["claim"], first["claim"]);
+    assert_eq!(events(&store, "attempt.claim").len(), 1);
+    assert!(call(&store, caller, "r3", "tasks.worker.result", full_result()).is_err());
+    assert_eq!(attempt_status(&store, "x"), AttemptState::Running);
+}
+
+#[test]
+fn a_late_success_from_a_replaced_attempt_is_recorded_but_not_reviewed() {
+    let (store, caller) = fixture();
+    let replacement = store.create("codex", "/project").unwrap().id;
+    launch(&store, "y", replacement);
+    let late = call(&store, caller, "r1", "tasks.worker.result", full_result()).unwrap();
+    assert_eq!(late["duplicate"], false);
+    assert!(store.tasks().unwrap().claim("x").unwrap().is_some());
+    assert_eq!(attempt_status(&store, "x"), AttemptState::Succeeded);
+    assert_eq!(assignment_status(&store), AssignmentState::Running);
+    assert!(events(&store, "assignment.needs_review").is_empty());
+}
+
+#[test]
+fn an_attempt_still_starting_can_read_status_but_not_report() {
+    let (store, _) = fixture();
+    let starting = store.create("codex", "/project").unwrap().id;
+    start(&store, "s", starting, &[AttemptState::Starting]);
+    let status = call(&store, starting, "s1", "tasks.worker.status", json!({})).unwrap();
+    assert_eq!(status["attempt"]["status"], "starting");
+    let reports = [
+        ("tasks.worker.ask", json!({"question":"Which parser?"})),
+        ("tasks.worker.result", full_result()),
+        (
+            "tasks.worker.blocked",
+            json!({"reason":"Missing credentials"}),
+        ),
+    ];
+    for (action, input) in reports {
+        let error = call(&store, starting, "r1", action, input).unwrap_err();
+        assert!(error.contains("starting"), "{action}: {error}");
+    }
+    assert_eq!(attempt_status(&store, "s"), AttemptState::Starting);
+    assert!(store.tasks().unwrap().claim("s").unwrap().is_none());
+    assert!(events(&store, "decision.requested").is_empty());
+    assert!(events(&store, "attempt.blocked").is_empty());
 }
 
 #[test]

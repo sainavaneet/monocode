@@ -103,18 +103,6 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             ));
         }
     }
-    if input
-        .get("scope")
-        .is_some_and(|v| !matches!(v.as_str(), Some("assignment" | "dependents" | "task")))
-    {
-        return Err("scope must be assignment, dependents or task".into());
-    }
-    if input
-        .get("outcome")
-        .is_some_and(|v| !matches!(v.as_str(), Some("succeeded" | "failed")))
-    {
-        return Err("outcome must be succeeded or failed".into());
-    }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
     }
@@ -180,12 +168,10 @@ mod tests {
             &json!({"question":"?","context":"why","scope":"dependents"})
         )
         .is_ok());
-        assert!(validate("tasks.worker.ask", &json!({"question":"?","scope":"all"})).is_err());
         assert!(validate("tasks.worker.ask", &json!({"question":"?","taskId":"t"})).is_err());
         let result = json!({"outcome":"failed","summary":"s","workspace":"/w","commits":["a"],
             "validation":["v"],"evidence":["e"],"remainingWork":["r"],"limitations":["l"]});
         assert!(validate("tasks.worker.result", &result).is_ok());
-        assert!(validate("tasks.worker.result", &json!({"outcome":"maybe"})).is_err());
         assert!(validate("tasks.worker.result", &json!({"commits":"abc"})).is_err());
         assert!(validate("tasks.worker.result", &json!({"limitations":[3]})).is_err());
         assert!(validate("tasks.worker.blocked", &json!({"reason":"r"})).is_ok());

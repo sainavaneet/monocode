@@ -468,9 +468,11 @@ pub(super) fn apply(
         let tasks = TaskStore { conn };
         let review = State::Assignment(AssignmentState::NeedsReview);
         let status = tasks.state(parent, review)?;
-        if authorize(status, review, Requester::Coordinator).is_ok() {
+        // The cascade is requested by whoever finished the attempt; the
+        // Succeeded and NeedsReview rules allow the same requesters.
+        if authorize(status, review, requester).is_ok() {
             let current = tasks.revision(parent)?;
-            apply(conn, parent, review, Requester::Coordinator, current, now)?;
+            apply(conn, parent, review, requester, current, now)?;
         }
     }
     Ok(revision)

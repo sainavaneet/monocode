@@ -476,6 +476,10 @@ const MAX_CONTEXT: usize = 20_000;
 const MAX_SUMMARY: usize = 20_000;
 const MAX_WORKSPACE: usize = 4_096;
 const MAX_REASON: usize = 8_000;
+/// `Store::persisted_session_id`'s refusal for a handle with no session.
+const NO_SESSION: &str = "Session no longer exists";
+const BAD_SCOPE: &str = "scope must be assignment, dependents or task";
+const BAD_OUTCOME: &str = "outcome must be succeeded or failed";
 
 fn task_error(error: crate::tasks::TaskError) -> String {
     error.to_string()
@@ -496,9 +500,14 @@ pub fn worker_action(
         return Err("Unknown worker action. Run app help".into());
     }
     crate::mono::api::validate(action, input)?;
-    let session = store
-        .persisted_session_id(caller)
-        .map_err(|_| NOT_A_WORKER.to_owned())?;
+    // A handle with no session cannot be a worker; other errors are real.
+    let session = store.persisted_session_id(caller).map_err(|e| {
+        if e == NO_SESSION {
+            NOT_A_WORKER.to_owned()
+        } else {
+            e
+        }
+    })?;
     let tasks = store.tasks().map_err(task_error)?;
     let attempt = tasks
         .attempt_for_session(&session)
@@ -513,8 +522,7 @@ pub fn worker_action(
                 id: format!("ask-{}-{key}", attempt.id),
                 question: text(input, "question", MAX_QUESTION)?,
                 context: optional_text(input, "context", MAX_CONTEXT)?.unwrap_or_default(),
-                scope: crate::tasks::DecisionScope::parse(scope)
-                    .ok_or("scope must be assignment, dependents or task")?,
+                scope: crate::tasks::DecisionScope::parse(scope).ok_or(BAD_SCOPE)?,
             };
             let decision = tasks.ask(&attempt.id, &question, now).map_err(task_error)?;
             let mut states = worker_states(&tasks, &attempt)?;
@@ -544,32 +552,36 @@ pub fn worker_action(
 }
 
 fn worker_claim(input: &Value) -> Result<crate::tasks::Claim, String> {
-    let list = |key: &str| -> Vec<String> {
+    // Items are trimmed; a blank one is refused, as a blank summary is.
+    let list = |key: &str| -> Result<Vec<String>, String> {
         input[key]
             .as_array()
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| format!("{key} items must not be blank"))
+                    })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or(Ok(Vec::new()))
     };
     Ok(crate::tasks::Claim {
         outcome: input["outcome"]
             .as_str()
             .and_then(crate::tasks::ClaimOutcome::parse)
-            .ok_or("Provide outcome: succeeded or failed.")?,
+            .ok_or(BAD_OUTCOME)?,
         summary: text(input, "summary", MAX_SUMMARY)?,
         workspace: optional_text(input, "workspace", MAX_WORKSPACE)?,
-        commits: list("commits"),
-        validation: list("validation"),
-        evidence: list("evidence"),
-        remaining_work: list("remainingWork"),
-        limitations: list("limitations"),
+        commits: list("commits")?,
+        validation: list("validation")?,
+        evidence: list("evidence")?,
+        remaining_work: list("remainingWork")?,
+        limitations: list("limitations")?,
     })
 }
 
@@ -607,6 +619,13 @@ fn worker_status(
         .map_err(task_error)?
         .ok_or("The assignment no longer exists")?;
     let decisions = tasks.attempt_decisions(&attempt.id).map_err(task_error)?;
+    let claim = tasks.claim(&attempt.id).map_err(task_error)?;
+    // A succeeded claim is in review; any other waits for the coordinator to
+    // classify the attempt.
+    let claim_state = claim.as_ref().map(|c| match c.outcome {
+        crate::tasks::ClaimOutcome::Succeeded => "awaiting_review",
+        crate::tasks::ClaimOutcome::Failed => "awaiting_coordinator",
+    });
     let listed = |state: crate::tasks::DecisionState| -> Vec<Value> {
         decisions
             .iter()
@@ -624,6 +643,7 @@ fn worker_status(
         "attempt": {"id": attempt.id, "status": attempt.status},
         "answeredDecisions": listed(crate::tasks::DecisionState::Answered),
         "openDecisions": listed(crate::tasks::DecisionState::Open),
-        "claim": tasks.claim(&attempt.id).map_err(task_error)?,
+        "claim": claim,
+        "claimState": claim_state,
     }))
 }
