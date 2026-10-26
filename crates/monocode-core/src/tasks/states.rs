@@ -414,6 +414,31 @@ impl TaskStore<'_> {
         tx.commit()?;
         Ok(revision)
     }
+
+    /// Returns a Blocked task to Active for `requester`, in one transaction
+    /// through the table (which clears the blocked reason). A task that is
+    /// not Blocked is refused. Returns the task's new revision.
+    pub fn unblock(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+        requester: Requester,
+        now: u64,
+    ) -> Result<u64, TaskError> {
+        let tx = self.begin()?;
+        let subject = Subject::Task(task_id);
+        let lifecycle = self.state(subject, State::Lifecycle(TaskLifecycle::Active))?;
+        if lifecycle != State::Lifecycle(TaskLifecycle::Blocked) {
+            return Err(TaskError::Invalid(format!(
+                "Task {task_id} is not blocked (it is {}).",
+                lifecycle.as_str()
+            )));
+        }
+        let active = State::Lifecycle(TaskLifecycle::Active);
+        let revision = apply(&tx, subject, active, requester, expected_revision, now)?;
+        tx.commit()?;
+        Ok(revision)
+    }
 }
 
 /// The task, assignment and attempt a subject belongs to.
@@ -463,6 +488,14 @@ pub(super) fn apply(
     }
     let set = format!("{}=?", to.column());
     let revision = key.bump(conn, expected, &set, vec![&to.as_str()], now)?;
+    // The table persists `blocked_reason` with the lifecycle: a task that
+    // leaves Blocked shows no reason (it stays in the task's events).
+    if from == State::Lifecycle(TaskLifecycle::Blocked) {
+        conn.execute(
+            "UPDATE native_tasks SET blocked_reason=NULL WHERE id=?1",
+            [&task],
+        )?;
+    }
     let payload = json!({"from": from.as_str(), "to": to.as_str(), "requester": requester, "revision": revision});
     let mut event = event_for(&task, &key.label, revision, rule.event, payload);
     event.assignment_id.clone_from(&assignment);

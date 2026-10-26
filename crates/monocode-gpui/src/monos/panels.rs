@@ -19,6 +19,7 @@ pub(super) enum SettingsSection {
     General,
     Soul,
     Memory,
+    Autonomy,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Route {
@@ -139,7 +140,7 @@ fn switch_setting(label: &str, description: &str, disabled: bool, control: AnyEl
         )
         .child(control)
 }
-fn heading(title: &str, description: Option<&str>) -> Div {
+pub(super) fn heading(title: &str, description: Option<&str>) -> Div {
     div()
         .pt_7()
         .pb_2()
@@ -158,7 +159,7 @@ fn heading(title: &str, description: Option<&str>) -> Div {
             )
         })
 }
-fn card() -> Div {
+pub(super) fn card() -> Div {
     div()
         .rounded_xl()
         .border_1()
@@ -1389,6 +1390,7 @@ impl Monos {
             SettingsSection::General => self.general_settings(mono, window, cx),
             SettingsSection::Soul => self.soul_page(mono, cx),
             SettingsSection::Memory => self.memory_page(mono, window, cx),
+            SettingsSection::Autonomy => self.autonomy_page(mono, cx),
         };
         self.bind_settings_blurs(window, cx);
         let weak = cx.weak_entity();
@@ -1473,6 +1475,7 @@ impl Monos {
                                             (SettingsSection::General, "General", "settings"),
                                             (SettingsSection::Soul, "Soul", "sparkles"),
                                             (SettingsSection::Memory, "Memory", "sticky-note"),
+                                            (SettingsSection::Autonomy, "Autonomy", "square-lock"),
                                         ]
                                         .into_iter()
                                         .map(
@@ -1544,6 +1547,9 @@ impl Monos {
                                                     .on_click(cx.listener(
                                                         move |this, _, window, cx| {
                                                             this.save_open_file(cx);
+                                                            if tab == SettingsSection::Autonomy {
+                                                                this.refresh_autonomy(cx);
+                                                            }
                                                             this.settings = Some(tab);
                                                             window.focus(&this.settings_focus, cx);
                                                             cx.notify();

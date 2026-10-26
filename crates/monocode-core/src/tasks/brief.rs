@@ -1,6 +1,7 @@
 //! The first prompt of a task worker. Workers do not inherit Mono's
 //! conversation, so it carries everything: objective, workspace, scope,
 //! dependencies, expected checks and how to report.
+use super::autonomy::Autonomy;
 use super::review::{Review, ReviewOutcome};
 use super::{Assignment, DecisionRequest, DecisionState, Task, Workspace};
 use crate::orchestration::WorkspaceMode;
@@ -74,18 +75,26 @@ fn decisions_text(decisions: &[DecisionRequest]) -> String {
 /// user's own working copy, so its worker only reads: the brief lists no
 /// writable files and forbids edits. `correction` is the review that sent
 /// the previous attempt back, if one did; `decisions` are the questions
-/// asked for the assignment so far.
+/// asked for the assignment so far. `authority` is the task's effective
+/// policy: whether the worker may commit in its worktree. Merging, pushing
+/// and deploying are Mono's integration steps, never a worker's.
 pub fn worker_brief(
     task: &Task,
     assignment: &Assignment,
     workspace: &Workspace,
     correction: Option<&Review>,
     decisions: &[DecisionRequest],
+    authority: &Autonomy,
 ) -> String {
+    let commits = if authority.commit {
+        "Commit your work there"
+    } else {
+        "Do not commit: leave your changes uncommitted there for Mono to review"
+    };
     let (place, rules) = match workspace.mode {
         WorkspaceMode::Worktree => (
             format!(
-                "your own worktree {} on branch {} from commit {}. Commit your work there; never touch the main checkout.",
+                "your own worktree {} on branch {} from commit {}. {commits}; never touch the main checkout. Leave merging, pushing and deploying to Mono.",
                 workspace.path,
                 workspace.branch.as_deref().unwrap_or("?"),
                 workspace.base_commit.as_deref().unwrap_or("?"),

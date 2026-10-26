@@ -260,7 +260,7 @@ fn decide(
     }
     let pool = candidates.pool();
     let retry = |due: u64, provider: &str, account: &str, waiting: bool| {
-        if used >= RETRY_BUDGET {
+        if used >= candidates.retry_limit {
             Next::Exhausted
         } else {
             Next::Schedule {
@@ -522,7 +522,7 @@ fn settle_failure(
         }
         Next::Exhausted => {
             fail_assignment(&tx, &attempt, now)?;
-            let why = format!("The worker failed ({category}: {reason}) after {used} retries, the budget of {RETRY_BUDGET}.");
+            let why = format!("The worker failed ({category}: {reason}) after {used} retries, the task's retry limit.");
             notify_mono(&tx, &attempt, "recovery.exhausted", &why, 1, now)?;
         }
         Next::Mono => {

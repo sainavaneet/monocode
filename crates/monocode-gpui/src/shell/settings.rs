@@ -348,6 +348,8 @@ impl Shell {
             let prefs = self.workspace.preferences.clone();
             monos.update(cx, |m, cx| m.set_preferences(prefs, cx));
         }
+        // The task coordinator reads each Mono's policy from here.
+        monocode_core::tasks::autonomy::publish(self.workspace.preferences.mono_policies.clone());
         crate::settings::apply_keybindings(&self.workspace.preferences, cx);
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
@@ -388,6 +390,26 @@ impl Shell {
         self.persist(cx);
         self.sync_settings(cx);
         self.invalidate_chrome(cx);
+        cx.notify();
+    }
+    /// The Mono's Autonomy settings change the policy the Settings page
+    /// edits; saved and published like any preference.
+    pub(crate) fn set_mono_autonomy(
+        &mut self,
+        mono: String,
+        policy: monocode_core::tasks::autonomy::MonoAutonomy,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.preferences.mono_policies.get(&mono) == Some(&policy) {
+            return;
+        }
+        self.workspace
+            .preferences
+            .mono_policies
+            .insert(mono, policy);
+        self.apply_preferences(cx);
+        self.persist(cx);
+        self.sync_settings(cx);
         cx.notify();
     }
     fn choose_chat_background(&mut self, cx: &mut Context<Self>) {

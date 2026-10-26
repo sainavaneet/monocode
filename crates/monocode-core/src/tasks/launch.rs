@@ -65,6 +65,11 @@ impl<P: Policy> Coordinator<P> {
         if super::guard::pending_stop(tasks.conn, &task.id, &assignment.id)?.is_some() {
             return Ok(None);
         }
+        // The task's snapshot decides the account (account ids only) and,
+        // taken before the workspace, where the work runs.
+        let live = self.policy.autonomy(task);
+        let provider = self.policy.worker_provider(task);
+        let policy = policy::capture_with(store, task, &provider, &live, now)?;
         let prepared = match workspaces::prepare(&tasks, task, assignment, now) {
             Ok(prepared) => prepared,
             Err(PrepareError::Workspace(reason)) => {
@@ -76,8 +81,6 @@ impl<P: Policy> Coordinator<P> {
         let attempt = match latest_attempt(&tasks, &task.id, &assignment.id)? {
             Some(attempt) if in_flight(&attempt) => attempt,
             _ => {
-                // The task's snapshot decides the account (account ids only).
-                let policy = policy::capture(store, task, &self.policy.worker_provider(task), now)?;
                 let account = match policy::launch_choice(store, task, &policy, now)? {
                     LaunchAccount::Use(account) => account,
                     LaunchAccount::Wait => return Ok(None),
@@ -148,7 +151,8 @@ impl<P: Policy> Coordinator<P> {
         }
         // Fence: a coordinator that lost the lease must not start a worker.
         self.lease(&tasks, &task.id, now)?;
-        let (session, settings, fresh) = match reserve(store, task, attempt) {
+        let authority = self.autonomy(store, task)?;
+        let (session, settings, fresh) = match reserve_with(store, task, attempt, &authority) {
             Ok(reserved) => reserved,
             Err(reason) => {
                 fail(&tasks, attempt, Some((DISPATCH_FAILED, &reason)), now)?;
@@ -266,11 +270,31 @@ fn intent(attempt: &Attempt, assignment: &Assignment, prepared: &Prepared) -> Ne
 
 /// `sessions.start`'s durable steps, keyed by the operation id: reserve the
 /// session, select the workspace, configure it and prepare the worker brief
-/// as its first prompt. Returns whether this call reserved it.
+/// as its first prompt. Returns whether this call reserved it. Tests reserve
+/// directly; the coordinator passes the effective policy to
+/// [`reserve_with`].
+#[cfg(test)]
 pub(super) fn reserve(
     store: &Store,
     task: &Task,
     attempt: &Attempt,
+) -> Result<(Session, Settings, bool), String> {
+    let snapshot = store
+        .tasks()
+        .and_then(|tasks| policy::of(&tasks, &task.id))
+        .map_err(|e| e.to_string())?;
+    let live = super::autonomy::live(task.mono_id.as_deref(), &task.project);
+    let authority = super::autonomy::effective(snapshot.as_ref(), &live);
+    reserve_with(store, task, attempt, &authority)
+}
+
+/// As [`reserve`], with the task's effective policy, which the brief states
+/// as the worker's authority.
+pub(super) fn reserve_with(
+    store: &Store,
+    task: &Task,
+    attempt: &Attempt,
+    authority: &super::autonomy::Autonomy,
 ) -> Result<(Session, Settings, bool), String> {
     let tasks = store.tasks().map_err(|e| e.to_string())?;
     let assignment = tasks
@@ -290,6 +314,7 @@ pub(super) fn reserve(
         &workspace,
         correction.as_ref(),
         &decisions,
+        authority,
     );
     // Mono's reason for sending the previous attempt back, if it did.
     let previous = tasks

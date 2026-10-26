@@ -46,6 +46,17 @@ pub fn lease_resource(task_id: &str) -> String {
 /// What a Mono allows the coordinator to do on its own. The defaults launch
 /// only tasks Mono or the user explicitly started, one worker at a time.
 pub trait Policy {
+    /// The Mono's live autonomy policy for `task`. The coordinator combines
+    /// it with the task's snapshot (`autonomy::effective`): reductions apply
+    /// at once, more authority waits for an explicit apply. By default it
+    /// follows the two methods below.
+    fn autonomy(&self, task: &Task) -> super::autonomy::Autonomy {
+        super::autonomy::Autonomy {
+            automatic_execution: self.automatic_execution(task),
+            worker_limit: u32::try_from(self.worker_limit(task)).unwrap_or(u32::MAX),
+            ..super::autonomy::Autonomy::default()
+        }
+    }
     /// Whether a Ready task may move into Implementing without an explicit
     /// start.
     fn automatic_execution(&self, _task: &Task) -> bool {
@@ -68,9 +79,15 @@ pub trait Policy {
     }
 }
 
-/// The default policy: nothing automatic.
+/// The app's policy: each Mono's policy as the app published it
+/// (`autonomy::publish`, from its preferences). A Mono with none published
+/// gets the default: nothing automatic, one worker at a time.
 pub struct ExplicitStart;
-impl Policy for ExplicitStart {}
+impl Policy for ExplicitStart {
+    fn autonomy(&self, task: &Task) -> super::autonomy::Autonomy {
+        super::autonomy::live(task.mono_id.as_deref(), &task.project)
+    }
+}
 
 /// Starts a worker session the coordinator already reserved and configured
 /// through `sessions.start`'s durable steps. The GUI installs and submits it;
@@ -192,7 +209,9 @@ impl<P: Policy> Coordinator<P> {
             return Ok(());
         };
         if task.stage == TaskStage::Ready {
-            if task.lifecycle != TaskLifecycle::Active || !self.policy.automatic_execution(&task) {
+            if task.lifecycle != TaskLifecycle::Active
+                || !self.autonomy(store, &task)?.automatic_execution
+            {
                 return Ok(());
             }
             let implementing = State::Stage(TaskStage::Implementing);
@@ -270,7 +289,9 @@ impl<P: Policy> Coordinator<P> {
                 occupied.push(assignment.files.as_slice());
             }
         }
-        let limit = self.policy.worker_limit(task);
+        // The effective policy (snapshot restricted by live): fewer workers
+        // than running now launches nothing; none is stopped.
+        let limit = self.autonomy(store, task)?.worker_limit as usize;
         for assignment in assignments
             .iter()
             .filter(|a| a.status == AssignmentState::Ready)

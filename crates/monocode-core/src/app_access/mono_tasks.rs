@@ -36,18 +36,18 @@ const MAX_CHECK: usize = 2_000;
 const OFF: &str =
     "Task coordination is off (native-task-coordinator), so Mono's task actions are unavailable.";
 
-fn failed(error: TaskError) -> String {
+pub(super) fn failed(error: TaskError) -> String {
     error.to_string()
 }
 
-fn revision(input: &Value) -> Result<u64, String> {
+pub(super) fn revision(input: &Value) -> Result<u64, String> {
     input["revision"]
         .as_u64()
         .ok_or_else(|| "Provide revision (the one you read).".into())
 }
 
 /// The task if `mono` owns it.
-fn owned_task(tasks: &TaskStore<'_>, mono: &str, id: &str) -> Result<Task, String> {
+pub(super) fn owned_task(tasks: &TaskStore<'_>, mono: &str, id: &str) -> Result<Task, String> {
     tasks
         .task(id)
         .map_err(failed)?
@@ -63,6 +63,16 @@ fn owned_decision(tasks: &TaskStore<'_>, mono: &str, id: &str) -> Result<Decisio
     Ok(decision)
 }
 
+/// The gate every Mono task action passes: its fields are valid and task
+/// coordination is on.
+pub(super) fn ready(store: &Store, action: &str, input: &Value) -> Result<(), String> {
+    crate::mono::api::validate(action, input)?;
+    if !crate::tasks::coordinator::enabled(store) {
+        return Err(OFF.into());
+    }
+    Ok(())
+}
+
 /// Runs a Mono task action for `mono`, the Mono bound to the calling
 /// session. Nothing happens unless the task coordinator is enabled.
 pub fn mono_task_action(
@@ -75,10 +85,7 @@ pub fn mono_task_action(
     if !MONO_TASK_ACTIONS.contains(&action) {
         return Err("Unknown task action. Run app help".into());
     }
-    crate::mono::api::validate(action, input)?;
-    if !crate::tasks::coordinator::enabled(store) {
-        return Err(OFF.into());
-    }
+    ready(store, action, input)?;
     let tasks = store.tasks().map_err(failed)?;
     match action {
         "tasks.decisions.list" => list(&tasks, mono),
@@ -284,10 +291,7 @@ pub fn prepare_mono_verify(
     mono: &str,
     input: &Value,
 ) -> Result<CriterionRun, String> {
-    crate::mono::api::validate("tasks.criteria.verify", input)?;
-    if !crate::tasks::coordinator::enabled(store) {
-        return Err(OFF.into());
-    }
+    ready(store, "tasks.criteria.verify", input)?;
     let tasks = store.tasks().map_err(failed)?;
     let task = owned_task(&tasks, mono, &text(input, "taskId", 512)?)?;
     let criterion = text(input, "criterionId", 512)?;

@@ -675,9 +675,13 @@ fn limits_dependencies_and_overlapping_scopes_gate_launches() {
     let tick = coordinator("gpui-1").tick(&store, &launcher, NOW).unwrap();
     assert_eq!(tick.launched.len(), 1, "{tick:?}");
     assert_eq!(status(&store, "a"), AssignmentState::Running);
-    // With room for more, b still waits for a's overlapping scope and d for
+    // With room for more (which reaches a started task only through an
+    // explicit apply), b still waits for a's overlapping scope and d for
     // its dependency.
     let wider = Coordinator::new("gpui-1", Automatic(4));
+    let task = store.tasks().unwrap().task("t").unwrap().unwrap();
+    let room = wider.policy().autonomy(&task);
+    crate::tasks::autonomy::apply(&store, "t", 0, &room, NOW + 1).unwrap();
     let tick = wider.tick(&store, &launcher, NOW + 1).unwrap();
     assert_eq!(tick.launched.len(), 1, "{tick:?}");
     assert_eq!(status(&store, "b"), AssignmentState::Ready);

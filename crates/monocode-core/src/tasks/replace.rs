@@ -7,7 +7,7 @@ use super::launch::fail_assignment;
 use super::policy::Candidates;
 use super::recovery::{
     self, block, block_reason, notify_mono, Recovery, BLOCKED, BLOCK_PENDING, EXHAUSTED, REPLACED,
-    RETRY_BUDGET, SCHEDULED,
+    SCHEDULED,
 };
 use super::store::{ms, Key};
 use super::{policy, Assignment, Attempt, NewAttempt, Task, TaskError, TaskLifecycle, TaskStore};
@@ -48,17 +48,21 @@ fn choose(store: &Store, row: &Recovery, now: u64) -> Result<Choice, TaskError> 
         .task(&row.task_id)?
         .ok_or_else(|| TaskError::NotFound(format!("task:{}", row.task_id)))?;
     let policy = policy::capture(store, &task, &row.provider, now)?;
-    // A blocked lineage that was unblocked spends a retry now.
+    let candidates = Candidates::read(store, &task, &policy)?;
+    // A blocked lineage that was unblocked spends a retry now; a scheduled
+    // one already counted its retry, which a lowered limit may refuse.
     let retries = if row.state == BLOCKED {
-        if row.retries_used >= RETRY_BUDGET {
+        if row.retries_used >= candidates.retry_limit {
             return Ok(Choice::Exhausted);
         }
         row.retries_used + 1
     } else {
+        if row.retries_used > candidates.retry_limit {
+            return Ok(Choice::Exhausted);
+        }
         row.retries_used
     };
     let provider = row.next_provider.clone().unwrap_or(row.provider.clone());
-    let candidates = Candidates::read(store, &task, &policy)?;
     let pool = candidates.pool();
     let failed: AllowedAccount = candidates.entry(&row.provider, row.failed_account.as_deref());
     let replace = |account: AllowedAccount| Choice::Replace {
@@ -191,7 +195,7 @@ impl<P: Policy> Coordinator<P> {
                 )?;
                 fail_assignment(&tx, attempt, now)?;
                 let why = format!(
-                    "The worker's retries are spent (budget {RETRY_BUDGET}); its last failure was {}: {}.",
+                    "The worker's retries are spent (the task's retry limit); its last failure was {}: {}.",
                     row.failure, row.reason
                 );
                 notify_mono(&tx, attempt, "recovery.exhausted", &why, revision, now)?;

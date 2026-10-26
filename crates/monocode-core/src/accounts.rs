@@ -316,7 +316,9 @@ impl Book {
         Ok(())
     }
 }
-fn project_key(project: &str) -> String {
+/// A project path as settings key it (trailing slashes and separators
+/// normalised).
+pub(crate) fn project_key(project: &str) -> String {
     let key = project.trim().replace('\\', "/");
     let key = key.trim_end_matches('/');
     let key = if key.is_empty() { "~" } else { key };

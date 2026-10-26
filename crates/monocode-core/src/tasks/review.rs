@@ -12,6 +12,7 @@
 //! never snapshotted or checked here; Mono judges them. Collecting jobs and
 //! recording outcomes need the store; inspecting (Git and the checks) does
 //! not, so the app can run it without holding the store lock.
+use super::autonomy::Authority;
 use super::checks::{self, Batch};
 use super::completion::evidence;
 use super::coordinator::{Coordinator, Policy, REVIEW};
@@ -29,6 +30,7 @@ use crate::checkpoint;
 use crate::orchestration::WorkspaceMode;
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 
 /// Corrections an assignment may receive before review stops re-queueing it
 /// and hands the next claim to Mono.
@@ -53,6 +55,9 @@ pub struct ReviewJob {
     /// The last error once inspecting or recording failed too often.
     exhausted: Option<String>,
     corrections: usize,
+    /// The task may not commit now (its effective policy says so), so any
+    /// commit in the worktree is sent back.
+    commits_refused: bool,
 }
 
 /// What inspecting the workspace found; no store access.
@@ -170,6 +175,25 @@ impl ReviewJob {
                 return found;
             }
         };
+        if self.commits_refused {
+            match crate::git::git(
+                Path::new(&workspace.path),
+                &["rev-list", "--abbrev-commit", &format!("{base}..HEAD")],
+            ) {
+                Ok(list) => {
+                    let commits: Vec<String> = list.lines().map(str::to_owned).collect();
+                    if !commits.is_empty() {
+                        found
+                            .findings
+                            .push(Finding::UnauthorizedCommits { commits });
+                    }
+                }
+                Err(error) => {
+                    found.error = Some(error);
+                    return found;
+                }
+            }
+        }
         match out_of_scope(&found.changed_files, &self.assignment.files) {
             Ok(paths) => found
                 .findings
@@ -349,7 +373,15 @@ impl<P: Policy> Coordinator<P> {
                 let last = delivery.last_error.as_deref().unwrap_or("unknown error");
                 format!("Review failed {} times: {last}", delivery.retries)
             });
+            // Fail closed: an error reading the policy fails the pass (the
+            // next tick retries) rather than counting as authority.
+            let commits_refused = match self.authorize(store, &task.id, Authority::Commit) {
+                Ok(()) => false,
+                Err(TaskError::Invalid(_)) => true,
+                Err(error) => return Err(error),
+            };
             jobs.push(ReviewJob {
+                commits_refused,
                 superseded: superseded(&tasks, &task, &assignment, &attempt, claim.as_ref())?,
                 stale: stale(&tasks, &attempt, &assignment)?,
                 exhausted,

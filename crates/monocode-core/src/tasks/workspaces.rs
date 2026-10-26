@@ -6,6 +6,7 @@
 //! never copied: a worktree starts from the committed `HEAD`, the dirty files
 //! stay where they are, and the caller is told so it can say so. Nothing here
 //! deletes a worktree.
+use super::autonomy::WorkspacePreference;
 use super::{Assignment, Task, TaskError, TaskStore, Workspace};
 use crate::git::{self, git};
 use crate::orchestration::WorkspaceMode;
@@ -28,6 +29,26 @@ pub fn mode_for(assignment: &Assignment) -> WorkspaceMode {
         } else {
             WorkspaceMode::Worktree
         })
+}
+
+/// The mode under the task's workspace preference. A writing assignment
+/// under the current-checkout preference is refused with the reason: the
+/// coordinator never writes into the user's checkout.
+pub fn mode_with(
+    assignment: &Assignment,
+    preference: WorkspacePreference,
+) -> Result<WorkspaceMode, String> {
+    let automatic = mode_for(assignment);
+    match preference {
+        WorkspacePreference::Automatic => Ok(automatic),
+        WorkspacePreference::Worktree => Ok(WorkspaceMode::Worktree),
+        WorkspacePreference::Checkout if automatic == WorkspaceMode::Checkout => Ok(automatic),
+        WorkspacePreference::Checkout => Err(format!(
+            "The Mono's policy keeps work in the current checkout, but assignment {} changes files ({}), and the coordinator never writes into your checkout. Choose automatic or dedicated worktrees in the Mono's Autonomy settings, apply the policy to the task, then unblock it.",
+            assignment.id,
+            assignment.files.join(", ")
+        )),
+    }
 }
 
 /// One stable branch per assignment, so a retry finds its earlier work.
@@ -99,7 +120,10 @@ pub fn prepare(
         });
     }
     let project = Path::new(&task.project);
-    let mode = mode_for(assignment);
+    let preference = super::policy::of(tasks, &task.id)?
+        .map(|policy| policy.autonomy.workspace)
+        .unwrap_or_default();
+    let mode = mode_with(assignment, preference).map_err(PrepareError::Workspace)?;
     let dirty_base = mode == WorkspaceMode::Worktree && dirty(project);
     let repository = git(project, &["rev-parse", "--show-toplevel"])
         .map(|root| root.trim().to_owned())

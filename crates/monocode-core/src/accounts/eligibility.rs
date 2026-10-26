@@ -118,12 +118,17 @@ impl Allowlist {
 pub enum Scope<'a> {
     Mono(&'a str),
     Project(&'a str),
+    /// A Mono's override for one project.
+    MonoProject(&'a str, &'a str),
 }
 
 fn allowlist_key(scope: Scope<'_>) -> String {
     match scope {
         Scope::Mono(id) => format!("{ALLOWLIST_KEY}:mono:{id}"),
         Scope::Project(path) => format!("{ALLOWLIST_KEY}:project:{}", project_key(path)),
+        Scope::MonoProject(id, path) => {
+            format!("{ALLOWLIST_KEY}:mono:{id}:project:{}", project_key(path))
+        }
     }
 }
 
@@ -142,14 +147,23 @@ pub fn save_allowlist(store: &Store, scope: Scope<'_>, list: &Allowlist) -> Resu
     store.save_setting(&allowlist_key(scope), &text)
 }
 
-/// The Mono's own allowlist, else the project's; None means the default
-/// (only the account the work started on).
+/// Removes the allowlist saved for `scope`, so the next one in line applies.
+pub fn clear_allowlist(store: &Store, scope: Scope<'_>) -> Result<(), String> {
+    store.save_setting(&allowlist_key(scope), "")
+}
+
+/// The Mono's override for the project, else the Mono's own allowlist, else
+/// the project's; None means the default (only the account the work
+/// started on).
 pub fn allowlist_for(
     store: &Store,
     mono: Option<&str>,
     project: &str,
 ) -> Result<Option<Allowlist>, String> {
     if let Some(mono) = mono {
+        if let Some(list) = allowlist(store, Scope::MonoProject(mono, project))? {
+            return Ok(Some(list));
+        }
         if let Some(list) = allowlist(store, Scope::Mono(mono))? {
             return Ok(Some(list));
         }

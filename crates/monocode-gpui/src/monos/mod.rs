@@ -1,5 +1,9 @@
 //! Mono workspaces: one runtime per identity, shared by the rail, title tabs,
 //! overview, settings and floating windows.
+pub(crate) mod autonomy;
+#[cfg(test)]
+mod autonomy_tests;
+mod autonomy_view;
 pub(crate) mod avatar;
 pub(crate) mod cards;
 mod changes;
@@ -159,6 +163,8 @@ pub(crate) struct Monos {
     task_sent: HashSet<String>,
     /// Decisions whose "did not answer" note was already shown.
     task_noted: HashSet<String>,
+    /// The Autonomy settings' scope, task list and account list.
+    autonomy: autonomy::PanelState,
 }
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
@@ -385,6 +391,7 @@ impl Monos {
             pumping_tasks: false,
             task_sent: HashSet::new(),
             task_noted: HashSet::new(),
+            autonomy: autonomy::PanelState::default(),
         };
         if let Some(rx) = rx {
             this._bridge_task = Some(cx.spawn(async move |this, cx| {

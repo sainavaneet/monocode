@@ -196,6 +196,70 @@ fn mono_mascot_is_beside_name_and_sidebar_switch_stays_visible(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn mono_autonomy_rows_edit_each_monos_policy_through_settings_changed(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+    let window = window(Section::Monos, cx);
+    let changes = Rc::new(RefCell::new(Vec::new()));
+    let sink = changes.clone();
+    window
+        .update(cx, |view, _, cx| {
+            view.ctx.monos = vec![MonoSetting {
+                id: "layout-mono".into(),
+                name: "Big Boss".into(),
+                mascot: "ghost".into(),
+                color: 0xee99bb,
+                projects: vec!["monocode".into()],
+                show: false,
+                folders: false,
+            }];
+            let entity = cx.entity();
+            cx.subscribe(&entity, move |_, _, event: &SettingsEvent, _| {
+                if let SettingsEvent::Changed(prefs) = event {
+                    sink.borrow_mut().push(*prefs.clone());
+                }
+            })
+            .detach();
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // Tall enough that every row is on screen without scrolling.
+    visual.simulate_resize(size(px(1200.), px(4000.)));
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("settings-mono-autonomy-note").is_some());
+    let last = |changes: &Rc<RefCell<Vec<Preferences>>>| {
+        changes
+            .borrow()
+            .last()
+            .expect("a change was emitted")
+            .mono_policy("layout-mono")
+            .policy
+    };
+    for (selector, check) in [
+        (
+            "settings-toggle-autonomy-automatic-execution",
+            (|p| p.automatic_execution) as fn(&monocode_core::tasks::autonomy::Autonomy) -> bool,
+        ),
+        ("settings-autonomy-workers-3", |p| p.worker_limit == 3),
+        ("settings-toggle-autonomy-push", |p| p.push),
+        ("settings-autonomy-workspace-checkout", |p| {
+            p.workspace == monocode_core::tasks::autonomy::WorkspacePreference::Checkout
+        }),
+    ] {
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"));
+        visual.simulate_click(bounds.center(), Default::default());
+        visual.run_until_parked();
+        assert!(check(&last(&changes)), "{selector}");
+    }
+    // Earlier edits are kept: each change builds on the saved policy.
+    let policy = last(&changes);
+    assert!(policy.automatic_execution && policy.push);
+    assert_eq!(policy.worker_limit, 3);
+}
+
+#[gpui::test]
 fn providers_page_saves_clears_and_enables_api_keys(cx: &mut TestAppContext) {
     use monocode_core::{api_keys, provider::Kind};
     use std::{cell::RefCell, rc::Rc};
