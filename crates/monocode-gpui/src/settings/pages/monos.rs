@@ -1,3 +1,4 @@
+use crate::monos::autonomy::{Control, SPENDING_NOTE, fields};
 use crate::settings::SettingsView;
 use crate::{
     settings::{SettingsEvent, management::Target, widgets::icon_action},
@@ -95,6 +96,86 @@ impl SettingsView {
         if roster.is_empty() {
             roster.push(super::super::widgets::note("No monos yet."));
         }
-        vec![self.group(None,true,"Monos",None,None,rows),self.group(Some("mono-list"),false,"Your monos",Some("Show or hide sessions started by each Mono. Hidden sessions remain available from the Mono's chat.".into()),None,roster)]
+        let mut groups = vec![self.group(None,true,"Monos",None,None,rows),self.group(Some("mono-list"),false,"Your monos",Some("Show or hide sessions started by each Mono. Hidden sessions remain available from the Mono's chat.".into()),None,roster)];
+        groups.extend(self.autonomy_groups(cx));
+        groups
+    }
+
+    /// Each Mono's autonomy policy for all its projects. Project overrides,
+    /// the account fallback list and the tasks are in the Mono's own
+    /// settings.
+    fn autonomy_groups(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut groups = Vec::new();
+        for mono in self.ctx.monos.clone() {
+            let policy = self.prefs.mono_policy(&mono.id).policy;
+            let rows = fields()
+                .into_iter()
+                .enumerate()
+                .map(|(ix, field)| {
+                    let id = mono.id.clone();
+                    let control = match field.control {
+                        Control::Switch { get, set } => self.toggle(
+                            field.id,
+                            field.label,
+                            get(&policy),
+                            false,
+                            cx,
+                            move |this, on, cx| {
+                                let id = id.clone();
+                                this.update(cx, move |p| {
+                                    set(&mut p.mono_policies.entry(id).or_default().policy, on)
+                                })
+                            },
+                        ),
+                        Control::Choice { options, get, set } => self.segmented(
+                            field.id,
+                            field.label,
+                            &get(&policy),
+                            options,
+                            cx,
+                            move |this, option, cx| {
+                                let id = id.clone();
+                                this.update(cx, move |p| {
+                                    set(&mut p.mono_policies.entry(id).or_default().policy, option)
+                                })
+                            },
+                        ),
+                    };
+                    self.row(
+                        None,
+                        ix == 0,
+                        field.label,
+                        Some(field.description.into()),
+                        vec![control],
+                    )
+                })
+                .collect();
+            groups.push(
+                div()
+                    .id(SharedString::from(format!("settings-mono-autonomy-{}", mono.id)))
+                    .child(self.group(
+                        None,
+                        false,
+                        format!("{}: autonomy", mono.name),
+                        Some(
+                            "What this Mono may do on its own in all its projects. Tasks keep the policy they started with: less authority applies to them at once, more when it is applied in the Mono's settings (Autonomy), where projects can also have their own policy and account fallback list."
+                                .into(),
+                        ),
+                        None,
+                        rows,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if !groups.is_empty() {
+            groups.push(
+                div()
+                    .debug_selector(|| "settings-mono-autonomy-note".into())
+                    .pt_4()
+                    .child(super::super::widgets::note(SPENDING_NOTE))
+                    .into_any_element(),
+            );
+        }
+        groups
     }
 }

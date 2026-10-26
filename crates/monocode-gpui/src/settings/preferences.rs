@@ -1,6 +1,7 @@
 //! App-wide preferences the Settings pages edit. Defaults are the React
 //! app's (`settings.ts`, `appearance.ts`, `displayPrefs.ts`, `sounds.ts`).
 use monocode_core::provider::Kind;
+use monocode_core::tasks::autonomy::MonoAutonomy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -88,8 +89,16 @@ pub(crate) struct Preferences {
     pub keybindings: HashMap<String, Option<String>>,
     /// "Use API key" per provider id: turns bill the saved key, not the login.
     pub api_key_enabled: HashMap<String, bool>,
+    /// Each Mono's autonomy policy, by Mono id, with per-project overrides.
+    /// Published to the task coordinator whenever preferences apply; tasks
+    /// snapshot it when created.
+    pub mono_policies: HashMap<String, MonoAutonomy>,
 }
 impl Preferences {
+    /// The Mono's policy, or the default when none was saved.
+    pub(crate) fn mono_policy(&self, mono: &str) -> MonoAutonomy {
+        self.mono_policies.get(mono).cloned().unwrap_or_default()
+    }
     pub(crate) fn api_key_enabled(&self, kind: Kind) -> bool {
         self.api_key_enabled
             .get(kind.id())
@@ -171,6 +180,7 @@ impl Default for Preferences {
             show_archived: false,
             keybindings: HashMap::new(),
             api_key_enabled: HashMap::new(),
+            mono_policies: HashMap::new(),
         }
     }
 }
@@ -251,5 +261,43 @@ mod tests {
         let restored: Preferences =
             serde_json::from_str(r#"{"api_key_enabled":{"codex":true}}"#).unwrap();
         assert!(restored.api_key_enabled(Kind::Codex));
+    }
+
+    #[test]
+    fn mono_autonomy_defaults_to_explicit_starts_and_round_trips() {
+        use monocode_core::tasks::autonomy::{Autonomy, WorkspacePreference};
+        let prefs = Preferences::default();
+        assert!(prefs.mono_policies.is_empty());
+        // A Mono without a saved policy gets the conservative default.
+        let policy = prefs.mono_policy("mono-1");
+        assert_eq!(policy.for_project("/repo"), &Autonomy::default());
+        assert!(!policy.policy.automatic_execution);
+        assert_eq!(policy.policy.worker_limit, 1);
+        // Saved with the other preferences and read back, overrides included.
+        let mut saved = Preferences::default();
+        let entry = saved.mono_policies.entry("mono-1".into()).or_default();
+        entry.policy.push = true;
+        entry.set_project(
+            "/repo",
+            Some(Autonomy {
+                workspace: WorkspacePreference::Worktree,
+                ..Autonomy::default()
+            }),
+        );
+        let text = serde_json::to_string(&saved).unwrap();
+        assert!(text.contains("\"mono_policies\""), "{text}");
+        let restored: Preferences = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored, saved);
+        assert!(restored.mono_policy("mono-1").policy.push);
+        assert_eq!(
+            restored
+                .mono_policy("mono-1")
+                .for_project("/repo/")
+                .workspace,
+            WorkspacePreference::Worktree
+        );
+        // Older saves have no policies at all.
+        let older: Preferences = serde_json::from_str(r#"{"monos":true}"#).unwrap();
+        assert!(older.mono_policies.is_empty());
     }
 }

@@ -279,6 +279,10 @@ impl Monos {
                 self.task_call(call, mono, cx);
                 return;
             }
+            policy if app::MONO_POLICY_ACTIONS.contains(&policy) => {
+                self.policy_call(call, mono, cx);
+                return;
+            }
             "models.list" => {
                 let profiles = Kind::ALL
                     .into_iter()

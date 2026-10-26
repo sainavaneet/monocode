@@ -1120,6 +1120,12 @@ impl Shell {
                 this.set_api_key_billing(event.0, event.1, cx);
             },
         ));
+        this.observations.push(cx.subscribe(
+            &monos,
+            |this, _, event: &crate::monos::autonomy::AutonomyEdited, cx| {
+                this.set_mono_autonomy(event.0.clone(), event.1.clone(), cx);
+            },
+        ));
         let footer = this.usage_footer.clone();
         this.observations.push(cx.subscribe(
             &footer,
