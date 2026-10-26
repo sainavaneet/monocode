@@ -508,7 +508,11 @@ pub fn worker_action(
             e
         }
     })?;
-    let tasks = store.tasks().map_err(task_error)?;
+    // No task tables means no attempts; do not create them on this path.
+    let tasks = store
+        .existing_tasks()
+        .map_err(task_error)?
+        .ok_or(NOT_A_WORKER)?;
     let attempt = tasks
         .attempt_for_session(&session)
         .map_err(task_error)?

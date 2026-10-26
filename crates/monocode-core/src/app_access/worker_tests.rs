@@ -442,3 +442,35 @@ fn a_replaced_attempt_cannot_ask_or_block_for_its_assignment() {
         AssignmentState::WaitingForDecision
     );
 }
+
+#[test]
+fn worker_calls_never_create_task_tables() {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    let session = store.create("codex", "/repo").unwrap().id;
+    let tables = |store: &Store| -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'native_task%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(tables(&store), 0);
+    for action in WORKER_ACTIONS {
+        let input = match action {
+            "tasks.worker.ask" => json!({"question": "?"}),
+            "tasks.worker.result" => json!({"outcome": "succeeded", "summary": "s"}),
+            "tasks.worker.blocked" => json!({"reason": "r"}),
+            _ => json!({}),
+        };
+        let error = call(&store, session, "r", action, input).unwrap_err();
+        assert!(error.contains("not bound to a task attempt"), "{error}");
+    }
+    assert_eq!(
+        tables(&store),
+        0,
+        "a refused worker call created task tables"
+    );
+}

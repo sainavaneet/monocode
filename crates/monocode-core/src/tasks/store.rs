@@ -93,6 +93,18 @@ impl Store {
         }
         Ok(TaskStore { conn })
     }
+
+    /// The task records only if their tables already exist; never creates
+    /// them, so a lookup cannot change a database the coordinator never used.
+    pub fn existing_tasks(&self) -> Result<Option<TaskStore<'_>>, TaskError> {
+        let conn = self.connection();
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_task_attempts')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(present.then_some(TaskStore { conn }))
+    }
 }
 
 /// Locates one revisioned row.
