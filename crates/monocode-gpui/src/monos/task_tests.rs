@@ -10,13 +10,13 @@ use serde_json::json;
 
 /// The shared running-worker fixture (`monocode_core::tasks::fixtures`),
 /// owned by the setup's Mono, with the coordinator flag on.
-fn worker(s: &Setup) -> i64 {
+pub(super) fn worker(s: &Setup) -> i64 {
     let db = locked(&s.store).unwrap();
     db.save_setting(FLAG, "enabled").unwrap();
     monocode_core::tasks::fixtures::running_worker(&db, &s.id, &s.project).unwrap()
 }
 
-fn ask(s: &Setup, session: i64, question: &str) -> String {
+pub(super) fn ask(s: &Setup, session: i64, question: &str) -> String {
     let db = locked(&s.store).unwrap();
     let asked = monocode_core::app_access::worker_action(
         &db,
@@ -30,7 +30,7 @@ fn ask(s: &Setup, session: i64, question: &str) -> String {
     asked["decision"]["id"].as_str().unwrap().to_owned()
 }
 
-fn decision(s: &Setup, id: &str) -> monocode_core::tasks::DecisionRequest {
+pub(super) fn decision(s: &Setup, id: &str) -> monocode_core::tasks::DecisionRequest {
     let db = locked(&s.store).unwrap();
     db.tasks().unwrap().decision(id).unwrap().unwrap()
 }
@@ -57,7 +57,7 @@ fn assert_no_provider_started(before: usize) {
     );
 }
 
-fn pump(s: &Setup, cx: &mut TestAppContext) {
+pub(super) fn pump(s: &Setup, cx: &mut TestAppContext) {
     cx.update(|cx| s.manager.update(cx, |m, cx| m.pump_tasks(cx)));
     cx.run_until_parked();
 }

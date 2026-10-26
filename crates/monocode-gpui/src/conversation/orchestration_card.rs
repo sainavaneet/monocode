@@ -4,34 +4,37 @@
 use super::composer_features::{StartOrchestration, StopOrchestration};
 use super::*;
 use crate::right_panel::{DIFF_ADD, RED_400};
-use monocode_core::orchestration::{Plan, Task};
+use monocode_core::orchestration::{Plan, ProgressStatus, Task};
 
 const SUMMARY_LIMIT: usize = 1_200;
 const TASKS_MAX_HEIGHT: f32 = 340.;
 const PROMPT_MAX_HEIGHT: f32 = 220.;
 
-/// One assignment's state, in plan order, as the shell's run reports it.
+/// One assignment's state, as the shell's run reports it; the card finds it
+/// by the assignment's id, not by its position.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TaskProgress {
-    pub(crate) label: &'static str,
+    pub(crate) id: String,
+    pub(crate) status: ProgressStatus,
     pub(crate) session: Option<i64>,
 }
 /// Opens a worker's session from the plan card.
 pub(crate) struct OpenOrchestrationWorker(pub i64);
 impl EventEmitter<OpenOrchestrationWorker> for Conversation {}
 
-fn status_color(label: &str) -> gpui::Hsla {
-    match label {
-        "Working" => tint(FUCHSIA_300, 0.9),
-        "Done" => tint(DIFF_ADD, 0.9),
-        "Failed" => tint(RED_400, 0.9),
-        "Needs input" | "Needs review" => tint(AMBER_400, 0.9),
-        _ => content(0.5),
+fn status_color(status: ProgressStatus) -> gpui::Hsla {
+    match status {
+        ProgressStatus::Working => tint(FUCHSIA_300, 0.9),
+        ProgressStatus::Done => tint(DIFF_ADD, 0.9),
+        ProgressStatus::Failed => tint(RED_400, 0.9),
+        ProgressStatus::NeedsInput | ProgressStatus::NeedsReview => tint(AMBER_400, 0.9),
+        ProgressStatus::Saved | ProgressStatus::Queued => content(0.5),
     }
 }
 
-fn status_chip(label: &'static str) -> impl IntoElement {
-    let color = status_color(label);
+fn status_chip(status: ProgressStatus) -> impl IntoElement {
+    let color = status_color(status);
+    let label = status.label();
     div()
         .flex_shrink_0()
         .px(px(6.))
@@ -53,6 +56,12 @@ fn scope_line(task: &Task) -> String {
     }
 }
 
+/// The run's state of the assignment `id`, by id (the run may report its
+/// assignments in any order).
+fn progress_of<'a>(progress: Option<&'a [TaskProgress]>, id: &str) -> Option<&'a TaskProgress> {
+    progress.and_then(|tasks| tasks.iter().find(|p| p.id == id))
+}
+
 /// "2 working · 1 done", or the assignment count before the run starts.
 fn headline(plan: Option<&Plan>, progress: Option<&[TaskProgress]>) -> String {
     let Some(progress) = progress else {
@@ -61,16 +70,16 @@ fn headline(plan: Option<&Plan>, progress: Option<&[TaskProgress]>) -> String {
             n => format!("{n} agents"),
         });
     };
-    let mut counts: Vec<(&str, usize)> = Vec::new();
+    let mut counts: Vec<(ProgressStatus, usize)> = Vec::new();
     for task in progress {
-        match counts.iter_mut().find(|(label, _)| *label == task.label) {
+        match counts.iter_mut().find(|(status, _)| *status == task.status) {
             Some((_, n)) => *n += 1,
-            None => counts.push((task.label, 1)),
+            None => counts.push((task.status, 1)),
         }
     }
     counts
         .iter()
-        .map(|(label, n)| format!("{n} {}", label.to_lowercase()))
+        .map(|(status, n)| format!("{n} {}", status.label().to_lowercase()))
         .collect::<Vec<_>>()
         .join(" · ")
 }
@@ -113,6 +122,7 @@ impl Conversation {
             && self.orchestration_error.is_none()
             && self.orchestration_progress.is_none()
             && self.task_controls.is_empty()
+            && self.task_monitor.tasks.is_empty()
         {
             return None;
         }
@@ -142,7 +152,11 @@ impl Conversation {
                 })
                 .child(self.orchestration_tasks(plan, progress, cx))
             })
-            .children(self.task_control_rows(cx))
+            // The monitoring card carries the task controls when it shows.
+            .children(
+                self.task_monitor_cards(cx)
+                    .or_else(|| self.task_control_rows(cx)),
+            )
             .when_some(self.orchestration_error.clone(), |card, error| {
                 card.child(self.orchestration_error_row(error, cx))
             })
@@ -154,11 +168,7 @@ impl Conversation {
         plan: Option<&Plan>,
         progress: Option<&[TaskProgress]>,
     ) -> impl IntoElement {
-        let live = progress.is_some_and(|tasks| {
-            tasks
-                .iter()
-                .any(|t| matches!(t.label, "Working" | "Queued"))
-        });
+        let live = progress.is_some_and(|tasks| tasks.iter().any(|t| t.status.live()));
         div()
             .flex()
             .items_center()
@@ -196,8 +206,8 @@ impl Conversation {
             .flex()
             .flex_col()
             .gap_1()
-            .children(plan.tasks.iter().enumerate().map(|(ix, task)| {
-                let state = progress.and_then(|tasks| tasks.get(ix)).cloned();
+            .children(plan.tasks.iter().map(|task| {
+                let state = progress_of(progress, &task.id).cloned();
                 self.orchestration_task(task, state, cx)
             }))
     }
@@ -274,8 +284,8 @@ impl Conversation {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().child(toggle))
-                    .when_some(state.map(|state| state.label), |row, label| {
-                        row.child(status_chip(label))
+                    .when_some(state.map(|state| state.status), |row, status| {
+                        row.child(status_chip(status))
                     })
                     .when_some(session, |row, session| {
                         row.child(Self::open_worker_button(&task.id, session, cx))
@@ -371,11 +381,13 @@ impl Conversation {
 mod tests {
     use super::*;
 
-    fn progress(labels: &[&'static str]) -> Vec<TaskProgress> {
-        labels
+    fn progress(statuses: &[ProgressStatus]) -> Vec<TaskProgress> {
+        statuses
             .iter()
-            .map(|label| TaskProgress {
-                label,
+            .enumerate()
+            .map(|(ix, status)| TaskProgress {
+                id: format!("t{ix}"),
+                status: *status,
                 session: None,
             })
             .collect()
@@ -397,8 +409,25 @@ mod tests {
             tasks: vec![task.clone(), task],
         };
         assert_eq!(headline(Some(&plan), None), "2 agents");
-        let running = progress(&["Working", "Done", "Working"]);
+        use ProgressStatus::{Done, Working};
+        let running = progress(&[Working, Done, Working]);
         assert_eq!(headline(Some(&plan), Some(&running)), "2 working · 1 done");
+    }
+
+    #[test]
+    fn progress_is_matched_to_its_assignment_by_id_not_position() {
+        let mut running = progress(&[ProgressStatus::Working, ProgressStatus::Failed]);
+        running.reverse();
+        assert_eq!(
+            progress_of(Some(&running), "t0").map(|p| p.status),
+            Some(ProgressStatus::Working)
+        );
+        assert_eq!(
+            progress_of(Some(&running), "t1").map(|p| p.status),
+            Some(ProgressStatus::Failed)
+        );
+        assert!(progress_of(Some(&running), "missing").is_none());
+        assert!(progress_of(None, "t0").is_none());
     }
 
     #[test]

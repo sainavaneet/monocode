@@ -35,10 +35,12 @@ mod session_preview;
 mod session_shortcuts;
 mod settings;
 mod shortcuts;
-mod sidebar_list;
+pub(crate) mod sidebar_list;
 mod sidebar_peek;
 #[cfg(test)]
 mod task_lifecycle_tests;
+#[cfg(test)]
+mod task_monitor_tests;
 mod task_recovery;
 mod terminal_dock;
 mod title_tabs;
@@ -1299,6 +1301,7 @@ impl Shell {
                 }
                 this.sync_search_session(id, cx);
                 this.orchestration_session_changed(id, cx);
+                this.task_worker_changed(id, cx);
                 this.automation_session_changed(id, cx);
                 this.sync_review_locks(cx);
                 this.refresh_session_mark(id, cx);

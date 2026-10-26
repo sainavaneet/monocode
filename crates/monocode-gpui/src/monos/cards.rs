@@ -492,10 +492,7 @@ impl Monos {
             }
             "session" => {
                 if let Some(id) = value["sessionId"].as_i64() {
-                    self.route = Some(Route::Session(id));
-                    self.show_overview(cx);
-                    self.overview_tab = OverviewTab::Sessions;
-                    cx.notify();
+                    self.open_task_session(id, cx);
                 }
             }
             "document" => {

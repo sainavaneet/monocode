@@ -2,7 +2,11 @@
 use super::*;
 use gpui::{ListAlignment, ListState, list};
 use monocode_core::session_groups::Entry;
+use monocode_core::tasks::view::Badge;
 use std::cell::{Cell, RefCell};
+
+/// A long badge label truncates rather than pushing the Mono's name out.
+const TASK_BADGE_MAX_WIDTH: f32 = 128.;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
@@ -120,6 +124,42 @@ impl SidebarList {
         // Navigation and the Mono overview can change height independently.
         self.state.remeasure_items(0..self.rows.len().min(2));
     }
+}
+
+/// The badge on a Mono's sidebar row for its durable tasks: `2 working`,
+/// `Needs your decision`, `Reviewing`, `Recovering` or `Paused` (see
+/// `tasks::view::Badge` for which wins). The label is also in a nested
+/// debug selector, `mono-task-badge-<mono>:<label>`.
+pub(crate) fn task_badge(mono: &str, badge: Badge) -> AnyElement {
+    let label = badge.label();
+    let urgent = matches!(badge, Badge::NeedsDecision | Badge::Recovering);
+    let color = if urgent {
+        accent_color()
+    } else {
+        content(0.55)
+    };
+    let selector = format!("mono-task-badge-{mono}");
+    let text = format!("{selector}:{label}");
+    div()
+        .debug_selector(move || selector.clone())
+        .flex_shrink_0()
+        .max_w(px(TASK_BADGE_MAX_WIDTH))
+        .px(px(6.))
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(color.opacity(0.4))
+        .text_size(px(10.))
+        .text_color(color)
+        .child(
+            div()
+                .debug_selector(move || text.clone())
+                .truncate()
+                .child(label),
+        )
+        .into_any()
 }
 
 fn age_label(updated_at: u64, now: u64) -> &'static str {

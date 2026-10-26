@@ -1,4 +1,5 @@
 use super::*;
+use crate::conversation::task_monitor::LiveWorker;
 use monocode_core::agent::Settings;
 pub(crate) struct MonoSession {
     pub id: i64,
@@ -11,6 +12,15 @@ pub(crate) struct MonoSession {
     pub needs_input: bool,
     pub branch: Option<String>,
     pub model: SharedString,
+}
+impl From<&MonoSession> for LiveWorker {
+    fn from(session: &MonoSession) -> Self {
+        Self {
+            busy: session.busy,
+            needs_input: session.needs_input,
+            updated_at: session.updated_at,
+        }
+    }
 }
 impl Shell {
     pub(crate) fn mono_install_app(
@@ -62,23 +72,54 @@ impl Shell {
         self.order
             .iter()
             .chain(hidden)
-            .map(|&id| {
-                let metadata = self.session_metadata(id, cx);
-                let live = self.sessions.get(&id).map(|v| v.read(cx));
-                MonoSession {
-                    id,
-                    title: metadata.summary.title.clone(),
-                    cwd: metadata.summary.cwd.clone(),
-                    busy: metadata.busy || live.is_some_and(|v| v.mono_external_pending()),
-                    has_messages: metadata.summary.has_messages,
-                    archived: metadata.summary.archived,
-                    updated_at: metadata.summary.updated_at,
-                    needs_input: metadata.needs_approval(),
-                    branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
-                    model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
-                }
-            })
+            .map(|&id| self.mono_session_view(id, cx))
             .collect()
+    }
+    fn mono_session_view(&self, id: i64, cx: &App) -> MonoSession {
+        let metadata = self.session_metadata(id, cx);
+        let live = self.sessions.get(&id).map(|v| v.read(cx));
+        MonoSession {
+            id,
+            title: metadata.summary.title.clone(),
+            cwd: metadata.summary.cwd.clone(),
+            busy: metadata.busy || live.is_some_and(|v| v.mono_external_pending()),
+            has_messages: metadata.summary.has_messages,
+            archived: metadata.summary.archived,
+            updated_at: metadata.summary.updated_at,
+            needs_input: metadata.needs_approval(),
+            branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
+            model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
+        }
+    }
+    /// A session changed: a Mono's task card that shows it as a worker
+    /// updates now (busy, waiting on input, last activity).
+    pub(super) fn task_worker_changed(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(monos) = self.monos.clone() else {
+            return;
+        };
+        if !self.sessions.contains_key(&id) && !self.session_summaries.contains_key(&id) {
+            return;
+        }
+        let live = LiveWorker::from(&self.mono_session_view(id, cx));
+        monos.update(cx, |monos, cx| monos.task_worker_changed(id, live, cx));
+    }
+    /// An assignment's worktree changes, from a Mono's task card: the
+    /// Changes review of that checkout.
+    pub(crate) fn mono_open_changes(
+        &mut self,
+        cwd: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_review(
+            crate::review::ReviewTab::Changes {
+                cwd,
+                path: None,
+                staged: None,
+            },
+            window,
+            cx,
+        );
     }
     /// Load the sessions a Mono launched that the sidebar hides, so its panel
     /// can list and open them. They stay out of the sidebar.

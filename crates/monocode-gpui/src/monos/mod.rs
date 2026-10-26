@@ -24,6 +24,9 @@ mod search;
 #[cfg(all(target_os = "macos", not(test)))]
 mod status;
 #[cfg(test)]
+mod task_monitor_tests;
+mod task_overview;
+#[cfg(test)]
 mod task_tests;
 mod tasks;
 #[cfg(test)]
@@ -69,6 +72,8 @@ pub(crate) struct OverviewChrome {
     tab: OverviewTab,
     routed: bool,
     counts: (usize, usize, usize, usize),
+    /// Each Mono's task badge: a change redraws the sidebar rows.
+    task_badges: Vec<(String, monocode_core::tasks::view::Badge)>,
 }
 struct RunningHabit {
     mono: String,
@@ -163,6 +168,8 @@ pub(crate) struct Monos {
     task_sent: HashSet<String>,
     /// Decisions whose "did not answer" note was already shown.
     task_noted: HashSet<String>,
+    /// Each Mono's unfinished tasks as last read, for the sidebar badge.
+    task_monitors: HashMap<String, Vec<monocode_core::tasks::view::TaskMonitor>>,
     /// The Autonomy settings' scope, task list and account list.
     autonomy: autonomy::PanelState,
 }
@@ -391,6 +398,7 @@ impl Monos {
             pumping_tasks: false,
             task_sent: HashSet::new(),
             task_noted: HashSet::new(),
+            task_monitors: HashMap::new(),
             autonomy: autonomy::PanelState::default(),
         };
         if let Some(rx) = rx {
@@ -477,6 +485,7 @@ impl Monos {
             tab: self.overview_tab,
             routed: self.route.is_some(),
             counts,
+            task_badges: self.task_badges(),
         }
     }
     fn show_overview(&self, cx: &mut Context<Self>) {
@@ -772,6 +781,19 @@ impl Monos {
                             view.downgrade(),
                             cx,
                         )
+                    },
+                ));
+                this.observations.push(cx.subscribe(
+                    &view,
+                    |this,
+                     _,
+                     event: &crate::conversation::orchestration_card::OpenOrchestrationWorker,
+                     cx| { this.open_task_session(event.0, cx) },
+                ));
+                this.observations.push(cx.subscribe(
+                    &view,
+                    |this, _, event: &crate::conversation::task_monitor::OpenTaskChanges, cx| {
+                        this.open_task_changes(event.cwd.clone(), cx)
                     },
                 ));
                 let source = id.clone();
@@ -1315,6 +1337,11 @@ impl Monos {
                         if unread == 1 { "reply" } else { "replies" }
                     )
                 };
+                let badge = self.task_badge(&mono.id);
+                let label = match badge {
+                    Some(badge) => format!("{label}, {}", badge.label()),
+                    None => label,
+                };
                 let id = mono.id.clone();
                 let options = id.clone();
                 let context = id.clone();
@@ -1380,6 +1407,9 @@ impl Monos {
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .child(mono.label()),
                         )
+                    })
+                    .when_some(badge.filter(|_| !compact), |d, badge| {
+                        d.child(crate::shell::sidebar_list::task_badge(&mono.id, badge))
                     })
                     .when(unread > 0 && !compact, |d| {
                         d.child(
