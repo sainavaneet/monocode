@@ -13,7 +13,8 @@
 //!   concurrency, commit/merge/push/deploy authority, restart continuation,
 //!   provider fallback and the retry limit ([`Autonomy::restricted_by`]).
 //!   Running workers are never stopped by this; new disallowed actions are,
-//!   and a commit made after commit was revoked is sent back at review.
+//!   and while commit is revoked, review sends back work whose assignment
+//!   branch has commits since its base.
 //! - Everything else (more authority, the workspace preference, worktree
 //!   retention, API key billing) reaches an active task only through the
 //!   explicit [`apply`] step, which re-snapshots the live policy into the
@@ -207,10 +208,22 @@ static LIVE: RwLock<Option<HashMap<String, MonoAutonomy>>> = RwLock::new(None);
 /// is process-wide). Publishing tests use Mono ids no other test owns, so a
 /// reader of another Mono (such as the fixtures' `mono-1`) always sees the
 /// default whatever is published.
+/// It also empties the registry when dropped (still holding the lock),
+/// even when the test fails.
 #[cfg(test)]
-pub(crate) fn tests_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn tests_lock() -> Published {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    Published(LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+#[cfg(test)]
+pub(crate) struct Published(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for Published {
+    fn drop(&mut self) {
+        publish(HashMap::new());
+    }
 }
 
 /// Replaces the live policies (the app calls this whenever its preferences

@@ -144,7 +144,6 @@ fn mono_policy_commands_show_apply_and_unblock_only_the_owning_monos_tasks() {
         )
         .unwrap();
     assert_eq!(tasks.task("t").unwrap().unwrap().blocked_reason, None);
-    autonomy::publish(HashMap::new());
     // With the coordinator off, nothing is available.
     store
         .save_setting(crate::tasks::coordinator::FLAG, "off")

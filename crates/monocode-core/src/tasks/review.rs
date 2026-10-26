@@ -373,10 +373,13 @@ impl<P: Policy> Coordinator<P> {
                 let last = delivery.last_error.as_deref().unwrap_or("unknown error");
                 format!("Review failed {} times: {last}", delivery.retries)
             });
-            let commits_refused = matches!(
-                self.authorize(store, &task.id, Authority::Commit),
-                Err(TaskError::Invalid(_))
-            );
+            // Fail closed: an error reading the policy fails the pass (the
+            // next tick retries) rather than counting as authority.
+            let commits_refused = match self.authorize(store, &task.id, Authority::Commit) {
+                Ok(()) => false,
+                Err(TaskError::Invalid(_)) => true,
+                Err(error) => return Err(error),
+            };
             jobs.push(ReviewJob {
                 commits_refused,
                 superseded: superseded(&tasks, &task, &assignment, &attempt, claim.as_ref())?,

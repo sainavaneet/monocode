@@ -171,7 +171,7 @@ impl Monos {
             .child(work)
             .child(heading(
                 "Authority",
-                Some("Steps that change history beyond the task's worktree or ship it. Revoking one reaches running tasks too: new steps are refused, and commits made after commit is revoked are sent back at review."),
+                Some("Steps that change history beyond the task's worktree or ship it. Revoking one reaches running tasks too: new steps are refused, and while commit is revoked, review sends back work whose branch has commits."),
             ))
             .child(authority)
             .child(heading("Recovery and billing", None))

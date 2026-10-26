@@ -222,7 +222,6 @@ fn a_mono_policy_round_trips_and_a_project_overrides_it() {
     assert_eq!(live(Some("mono-autonomy-test"), "/repo/"), checkout);
     assert_eq!(live(Some("mono-autonomy-test"), "/other"), back.policy);
     assert_eq!(live(None, "/repo"), Autonomy::default());
-    publish(std::collections::HashMap::new());
 }
 
 #[test]
@@ -572,7 +571,6 @@ fn recovery_takes_its_retry_limit_and_provider_fallback_from_the_snapshot() {
             assert!(matches!(outcome, Outcome::Blocked(_)), "{outcome:?}");
         }
     }
-    publish(std::collections::HashMap::new());
 }
 
 #[test]
@@ -767,5 +765,4 @@ fn turning_provider_fallback_off_or_lowering_retries_reaches_running_tasks() {
     coordinator.tick(&store, &launcher, at).unwrap();
     assert_eq!(launcher.count(), 1, "no replacement past the lowered limit");
     assert_eq!(status(&store, "t", "a"), AssignmentState::Failed);
-    publish(std::collections::HashMap::new());
 }
