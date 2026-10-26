@@ -9,6 +9,8 @@ use crate::store::Store;
 
 /// Makes the monitoring view (`tasks::view::monitor`) fail, as a damaged
 /// verification table would, while the task inbox keeps working.
+/// Destructive and test-only: it drops and replaces a task table.
+#[doc(hidden)]
 pub fn break_monitor(store: &Store) -> Result<(), TaskError> {
     let conn = store.connection();
     conn.execute_batch(

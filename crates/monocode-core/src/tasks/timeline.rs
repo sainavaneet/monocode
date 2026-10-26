@@ -264,3 +264,124 @@ pub fn entries(events: &[Event], names: &Names) -> Vec<TimelineEntry> {
         .take(TIMELINE_LIMIT)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every event kind the task store writes (and a few it does not).
+    const WRITTEN: &[&str] = &[
+        "task.created",
+        "task.plan_saved",
+        "task.ready",
+        "task.implementing",
+        "task.reviewing",
+        "task.integrating",
+        "task.verifying",
+        "task.completed",
+        "task.active",
+        "task.waiting",
+        "task.paused",
+        "task.blocked",
+        "task.cancelled",
+        "task.resumed",
+        "task.replanning",
+        "task.policy",
+        "task.final_report",
+        "task.steered",
+        "task.steer_assess",
+        "task.sent_back",
+        "task.verified",
+        "task.verification_failed",
+        "task.verification_waiting",
+        "task.needs_integration",
+        "task.waiting_cause",
+        "task.restart_held",
+        "task.takeover_held",
+        "task.restart_reconciled",
+        "task.lease_taken_over",
+        "task.account_unavailable",
+        "task.workspace_failed",
+        "task.pause_requested",
+        "task.resume_requested",
+        "task.cancel_requested",
+        "assignment.queued",
+        "assignment.ready",
+        "assignment.running",
+        "assignment.requeued",
+        "assignment.waiting_for_decision",
+        "assignment.needs_review",
+        "assignment.accepted",
+        "assignment.failed",
+        "assignment.cancelled",
+        "assignment.reviewed",
+        "assignment.resumed",
+        "assignment.mono_note",
+        "attempt.created",
+        "attempt.reserved",
+        "attempt.launch_intent",
+        "attempt.briefed",
+        "attempt.starting",
+        "attempt.started",
+        "attempt.running",
+        "attempt.waiting",
+        "attempt.succeeded",
+        "attempt.failed",
+        "attempt.interrupted",
+        "attempt.cancelled",
+        "attempt.claim",
+        "attempt.blocked",
+        "attempt.failure",
+        "attempt.handoff",
+        "attempt.dispatch_failed",
+        "attempt.start_failed",
+        "attempt.stop_requested",
+        "attempt.parked",
+        "attempt.late_claim",
+        "attempt.held_owner",
+        "launch.unconfirmed",
+        "launch.orphaned",
+        "decision.requested",
+        "decision.provider_question",
+        "decision.escalated",
+        "decision.answered",
+        "decision.inherited",
+        "decision.resolved",
+        "recovery.blocked",
+        "recovery.exhausted",
+        "recovery.ended_without_result",
+        "recovery.stop_stalled",
+        "recovery.workspace_missing",
+        "recovery.stopped_by_user",
+        "recovery.block_reason",
+        "verification.invalidated",
+        "worker.result",
+        "mono.inbox",
+        "mono.inbox_failed",
+        "mono.inbox_abandoned",
+        "unknown.kind",
+    ];
+
+    fn event(kind: &str) -> Event {
+        Event {
+            seq: 1,
+            id: kind.into(),
+            task_id: "t".into(),
+            assignment_id: Some("a".into()),
+            attempt_id: None,
+            kind: kind.into(),
+            // The payload that makes conditional kinds produce an entry.
+            payload: serde_json::json!({"from": "accepted", "outcome": "accepted"}),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn every_kind_that_makes_an_entry_is_read_by_the_view() {
+        let names = Names::default();
+        for kind in WRITTEN.iter().chain(KINDS) {
+            let shown = entry(&event(kind), &names).is_some();
+            assert_eq!(shown, KINDS.contains(kind), "{kind}");
+        }
+    }
+}

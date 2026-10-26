@@ -46,7 +46,13 @@ fn all_text(view: &TaskMonitor) -> String {
     text.extend(view.recovery.iter().cloned());
     text.extend(view.control.reason.iter().cloned());
     text.push(view.control.title.clone());
-    text.extend(view.workers.iter().map(|w| w.title.clone()));
+    for worker in &view.workers {
+        text.push(worker.title.clone());
+        text.extend(worker.provider.iter().cloned());
+        text.extend(worker.account_id.iter().cloned());
+        text.extend(worker.workspace.iter().cloned());
+        text.extend(worker.branch.iter().cloned());
+    }
     text.join("\n")
 }
 
@@ -165,6 +171,12 @@ fn a_secret_in_a_worker_error_never_reaches_the_timeline() {
         [format!("Assignment {titled}")],
     )
     .unwrap();
+    // An account id that looks like a key is shown redacted too.
+    conn.execute(
+        "UPDATE native_task_attempts SET account_id=?1 WHERE id='x'",
+        [format!("acct-{token}")],
+    )
+    .unwrap();
     store
         .tasks()
         .unwrap()
@@ -196,6 +208,7 @@ fn a_secret_in_a_worker_error_never_reaches_the_timeline() {
     assert!(!text.contains(secret), "{text}");
     assert!(!text.contains("Zx81kQ2vB7nP0wLmT4yR"), "{text}");
     assert!(!text.contains(token), "{text}");
+    assert!(text.contains("acct-[redacted]"), "{text}");
     assert!(!text.contains(titled), "{text}");
     assert!(text.contains("Answered by mono [redacted]"), "{text}");
     assert!(view.recovering);

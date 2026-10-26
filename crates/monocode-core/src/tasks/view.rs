@@ -438,10 +438,10 @@ fn workers(
             attempt: latest.map(|a| a.status),
             session: current.and_then(|a| handle(&a.session_id)),
             detached,
-            provider: latest.map(|a| a.provider.clone()),
-            account_id: latest.and_then(|a| a.account_id.clone()),
-            workspace: workspace.map(|w| w.path.clone()),
-            branch: workspace.and_then(|w| w.branch.clone()),
+            provider: latest.map(|a| safe(&a.provider)),
+            account_id: latest.and_then(|a| a.account_id.as_deref().map(safe)),
+            workspace: workspace.map(|w| safe(&w.path)),
+            branch: workspace.and_then(|w| w.branch.as_deref().map(safe)),
         });
     }
     Ok((workers, names))
