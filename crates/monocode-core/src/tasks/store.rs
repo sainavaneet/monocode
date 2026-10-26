@@ -576,7 +576,7 @@ impl TaskStore<'_> {
 
     pub fn attempts(&self, task_id: &str, assignment_id: &str) -> Result<Vec<Attempt>, TaskError> {
         self.all(
-            &format!("SELECT {ATTEMPT} FROM native_task_attempts WHERE task_id=? AND assignment_id=? ORDER BY created_at,rowid"),
+            &format!("SELECT {ATTEMPT} FROM native_task_attempts WHERE task_id=? AND assignment_id=? ORDER BY rowid"),
             &[task_id, assignment_id],
             attempt,
         )

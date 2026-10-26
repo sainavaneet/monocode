@@ -654,3 +654,115 @@ fn paused_or_cancelled_tasks_neither_advance_nor_launch() {
         );
     }
 }
+
+#[test]
+fn the_latest_attempt_is_the_last_recorded_even_when_clocks_disagree() {
+    let store = memory();
+    let tasks = store.tasks().unwrap();
+    tasks.create_task(&new_task("t"), 1).unwrap();
+    tasks
+        .save_plan("t", 1, &plan(vec![assignment("a", &[])]), 1)
+        .unwrap();
+    let a = Subject::Assignment { task: "t", id: "a" };
+    tasks
+        .transition(
+            a,
+            State::Assignment(AssignmentState::Ready),
+            Requester::Coordinator,
+            1,
+            1,
+        )
+        .unwrap();
+    // Another process with a fast clock recorded the first attempt; this
+    // process's slower clock records the second one "earlier".
+    tasks
+        .create_attempt(&new_attempt("first", "t", "a"), 900)
+        .unwrap();
+    tasks
+        .create_attempt(&new_attempt("second", "t", "a"), 100)
+        .unwrap();
+    let ids: Vec<_> = tasks
+        .attempts("t", "a")
+        .unwrap()
+        .into_iter()
+        .map(|attempt| attempt.id)
+        .collect();
+    assert_eq!(ids, ["first", "second"]);
+    tasks
+        .transition(
+            a,
+            State::Assignment(AssignmentState::Running),
+            Requester::Coordinator,
+            revision(&store, a),
+            2,
+        )
+        .unwrap();
+    let run = |id: &str, last: AttemptState, requester| {
+        let x = Subject::Attempt(id);
+        for (state, by) in [
+            (AttemptState::Starting, Requester::Coordinator),
+            (AttemptState::Running, Requester::Coordinator),
+            (last, requester),
+        ] {
+            let rev = revision(&store, x);
+            tasks
+                .transition(x, State::Attempt(state), by, rev, 3)
+                .unwrap();
+        }
+    };
+    for id in ["first", "second"] {
+        let x = Subject::Attempt(id);
+        tasks
+            .bind_attempt_session(id, revision(&store, x), &format!("s-{id}"), 3)
+            .unwrap();
+    }
+    assert_eq!(
+        tasks.attempt_for_session("s-second").unwrap().unwrap().id,
+        "second"
+    );
+    // The older attempt's success is not the current run's claim.
+    run("first", AttemptState::Succeeded, Requester::Worker);
+    assert_eq!(status(&store, "t"), AssignmentState::Running);
+    run("second", AttemptState::Succeeded, Requester::Worker);
+    assert_eq!(status(&store, "t"), AssignmentState::NeedsReview);
+}
+
+#[test]
+fn a_paused_or_cancelled_task_cannot_send_accepted_work_back() {
+    let store = memory();
+    let tasks = store.tasks().unwrap();
+    tasks.create_task(&new_task("t"), 1).unwrap();
+    tasks
+        .save_plan("t", 1, &plan(vec![assignment("a", &[])]), 1)
+        .unwrap();
+    let a = Subject::Assignment { task: "t", id: "a" };
+    let queued = State::Assignment(AssignmentState::Queued);
+    for lifecycle in [TaskLifecycle::Paused, TaskLifecycle::Cancelled] {
+        force(&store, Subject::Task("t"), State::Lifecycle(lifecycle));
+        force(&store, a, State::Assignment(AssignmentState::Accepted));
+        assert_eq!(
+            tasks.transition(a, queued, Requester::Mono, revision(&store, a), 2),
+            Err(TaskError::Precondition(Precondition::TaskActive)),
+            "{lifecycle:?}"
+        );
+    }
+    // Other send-backs stay allowed while paused, so review can still settle.
+    force(
+        &store,
+        Subject::Task("t"),
+        State::Lifecycle(TaskLifecycle::Paused),
+    );
+    force(&store, a, State::Assignment(AssignmentState::NeedsReview));
+    tasks
+        .transition(a, queued, Requester::Mono, revision(&store, a), 2)
+        .unwrap();
+    force(
+        &store,
+        Subject::Task("t"),
+        State::Lifecycle(TaskLifecycle::Active),
+    );
+    force(&store, a, State::Assignment(AssignmentState::Accepted));
+    tasks
+        .transition(a, queued, Requester::Coordinator, revision(&store, a), 2)
+        .unwrap();
+}

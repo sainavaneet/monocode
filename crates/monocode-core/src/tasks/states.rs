@@ -289,7 +289,8 @@ pub static TRANSITIONS: &[Transition] = &[
     rule!(Lifecycle [Active] -> Completed, [C, M], [StageCompleted], "lifecycle", "task.completed", Ineligible, Never),
     // Assignment.
     rule!(Assignment [Queued] -> Ready, [C], [DependenciesAccepted], "status", "assignment.ready", Eligible, Resume),
-    rule!(Assignment [Ready, NeedsReview, Failed, Accepted] -> Queued, [C, M], [], "status", "assignment.queued", Unchanged, Resume),
+    rule!(Assignment [Ready, NeedsReview, Failed] -> Queued, [C, M], [], "status", "assignment.queued", Unchanged, Resume),
+    rule!(Assignment [Accepted] -> Queued, [C, M], [TaskActive], "status", "assignment.queued", Unchanged, Resume),
     rule!(Assignment [Ready] -> Running, [C], [TaskActive], "status", "assignment.running", Ineligible, Interrupt),
     rule!(Assignment [Running] -> WaitingForDecision, [W, C, M], [], "status", "assignment.waiting_for_decision", Ineligible, Wait),
     rule!(Assignment [WaitingForDecision] -> Running, [M, U, C], [NoOpenDecision], "status", "assignment.resumed", Ineligible, Interrupt),
@@ -479,7 +480,8 @@ pub(super) fn apply(
 }
 
 /// Whether `subject` is its assignment's newest attempt. A replaced attempt
-/// that finishes late must not start a review of the current run.
+/// that finishes late must not start a review of the current run. Newest is
+/// by insertion order: two processes sharing the file may disagree on time.
 pub(super) fn is_latest_attempt(
     conn: &Connection,
     subject: Subject<'_>,
@@ -490,7 +492,7 @@ pub(super) fn is_latest_attempt(
     let latest: String = conn.query_row(
         "SELECT l.id FROM native_task_attempts a JOIN native_task_attempts l
            ON l.task_id=a.task_id AND l.assignment_id=a.assignment_id
-         WHERE a.id=?1 ORDER BY l.created_at DESC, l.rowid DESC LIMIT 1",
+         WHERE a.id=?1 ORDER BY l.rowid DESC LIMIT 1",
         [id],
         |row| row.get(0),
     )?;
@@ -510,7 +512,7 @@ fn precondition_holds(
         Precondition::DependenciesAccepted => "SELECT NOT EXISTS(SELECT 1 FROM json_each((SELECT depends_on FROM native_task_assignments WHERE task_id=?1 AND id=?2)) d
             WHERE NOT EXISTS(SELECT 1 FROM native_task_assignments a WHERE a.task_id=?1 AND a.id=d.value AND a.status='accepted'))",
         Precondition::AttemptSucceeded => "SELECT status='succeeded' FROM native_task_attempts WHERE task_id=?1 AND assignment_id=?2
-            ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            ORDER BY rowid DESC LIMIT 1",
         Precondition::NoOpenDecision => "SELECT NOT EXISTS(SELECT 1 FROM native_task_decisions WHERE task_id=?1 AND assignment_id=?2 AND state='open')",
         Precondition::AssignmentsAccepted => "SELECT NOT EXISTS(SELECT 1 FROM native_task_assignments WHERE task_id=?1 AND status NOT IN ('accepted','cancelled'))
             AND EXISTS(SELECT 1 FROM native_task_assignments WHERE task_id=?1 AND status='accepted')",

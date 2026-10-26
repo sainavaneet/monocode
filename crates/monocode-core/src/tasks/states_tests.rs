@@ -180,6 +180,20 @@ fn completion_and_launch_carry_their_preconditions() {
     );
     assert_eq!(launch.preconditions, [Precondition::TaskActive]);
     assert_eq!(launch.recovery, Recovery::Interrupt);
+    // Reopening accepted work needs an active task; other send-backs do not.
+    let reopen = |from| {
+        rule(
+            State::Assignment(from),
+            State::Assignment(AssignmentState::Queued),
+        )
+    };
+    assert_eq!(
+        reopen(AssignmentState::Accepted).preconditions,
+        [Precondition::TaskActive]
+    );
+    assert!(reopen(AssignmentState::NeedsReview)
+        .preconditions
+        .is_empty());
     let cancel = authorize(
         State::Lifecycle(TaskLifecycle::Active),
         State::Lifecycle(TaskLifecycle::Cancelled),
