@@ -10,6 +10,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 #[cfg(test)]
+mod mono_task_tests;
+mod mono_tasks;
+pub use mono_tasks::{
+    mono_task_action, MAX_ALTERNATIVES, MAX_ALTERNATIVE_BYTES, MONO_TASK_ACTIONS,
+};
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod worker_tests;
@@ -609,7 +615,8 @@ fn worker_states(
 }
 
 /// Read-only: the bound task, assignment and attempt, decisions the worker
-/// asked for, and its claim if it reported one.
+/// asked for (or took over from the attempt it replaced) with their states
+/// and answers, and its claim if it reported one.
 fn worker_status(
     tasks: &crate::tasks::TaskStore<'_>,
     attempt: &crate::tasks::Attempt,
@@ -645,6 +652,7 @@ fn worker_status(
             "verification": assignment.verification, "status": assignment.status,
         },
         "attempt": {"id": attempt.id, "status": attempt.status},
+        "decisions": decisions.iter().map(|d| json!({"id":d.id,"question":d.question,"scope":d.scope,"state":d.state,"answer":d.answer})).collect::<Vec<_>>(),
         "answeredDecisions": listed(crate::tasks::DecisionState::Answered),
         "openDecisions": listed(crate::tasks::DecisionState::Open),
         "claim": claim,

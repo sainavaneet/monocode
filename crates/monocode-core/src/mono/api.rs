@@ -32,6 +32,12 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "tasks.worker.ask"=>"question context scope",
         "tasks.worker.result"=>"outcome summary workspace commits validation evidence remainingWork limitations",
         "tasks.worker.blocked"=>"reason",
+        "tasks.decisions.list"=>"",
+        "tasks.decisions.answer"=>"decisionId revision answer",
+        "tasks.decisions.escalate"=>"decisionId revision question why recommendation alternatives",
+        "tasks.review.accept"=>"taskId assignmentId revision",
+        "tasks.review.sendBack"=>"taskId assignmentId revision reason",
+        "tasks.criteria.verify"=>"taskId criterionId check assignmentId",
         _=>return Err("Unknown app action. Run app help".into()),
     };
     for (key, value) in input.as_object().ok_or("Input must be an object")? {
@@ -43,7 +49,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         {
             return Err(format!("{key} must be true or false"));
         }
-        if ["limit", "offset", "maxChars", "number"].contains(&key.as_str())
+        if ["limit", "offset", "maxChars", "number", "revision"].contains(&key.as_str())
             && value.as_u64().is_none()
         {
             return Err(format!("{key} must be a non-negative integer"));
@@ -68,6 +74,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "offset",
             "maxChars",
             "number",
+            "revision",
+            "alternatives",
             "id",
             "sessionId",
             "besideSessionId",
@@ -102,6 +110,21 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
                 "{key} must be an array of up to {WORKER_LIST_ITEMS} texts of up to {WORKER_LIST_ITEM_BYTES} bytes"
             ));
         }
+    }
+    if input.get("alternatives").is_some_and(|v| {
+        v.as_array().is_none_or(|a| {
+            a.len() > crate::app_access::MAX_ALTERNATIVES
+                || a.iter().any(|v| {
+                    v.as_str()
+                        .is_none_or(|s| s.len() > crate::app_access::MAX_ALTERNATIVE_BYTES)
+                })
+        })
+    }) {
+        return Err(format!(
+            "alternatives must be an array of up to {} texts of up to {} bytes",
+            crate::app_access::MAX_ALTERNATIVES,
+            crate::app_access::MAX_ALTERNATIVE_BYTES
+        ));
     }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
@@ -156,6 +179,36 @@ mod tests {
         assert!(validate(
             "sessions.start",
             &json!({"prompt":"x","project":"/code","draft":true})
+        )
+        .is_ok());
+    }
+    #[test]
+    fn mono_task_commands_validate_their_fields() {
+        let escalate = json!({"decisionId":"d","revision":2,"why":"w","recommendation":"r",
+            "alternatives":["a","b"],"question":"q"});
+        assert!(validate("tasks.decisions.escalate", &escalate).is_ok());
+        assert!(validate(
+            "tasks.decisions.answer",
+            &json!({"decisionId":"d","revision":-1})
+        )
+        .is_err());
+        assert!(validate("tasks.decisions.escalate", &json!({"alternatives":"a"})).is_err());
+        assert!(validate("tasks.decisions.escalate", &json!({"alternatives":[1]})).is_err());
+        let many = vec!["x"; crate::app_access::MAX_ALTERNATIVES + 1];
+        assert!(validate("tasks.decisions.escalate", &json!({"alternatives": many})).is_err());
+        assert!(validate(
+            "tasks.review.sendBack",
+            &json!({"taskId":"t","assignmentId":"a","revision":1,"reason":"r"})
+        )
+        .is_ok());
+        assert!(validate(
+            "tasks.review.accept",
+            &json!({"taskId":"t","attemptId":"x"})
+        )
+        .is_err());
+        assert!(validate(
+            "tasks.criteria.verify",
+            &json!({"taskId":"t","criterionId":"c","check":"true","assignmentId":"a"})
         )
         .is_ok());
     }

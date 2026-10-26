@@ -260,6 +260,89 @@ impl Protocol {
     }
 }
 
+/// A provider question as plain text, for someone who answers it elsewhere
+/// (Mono, for a task worker): each prompt with its options.
+pub fn describe(question: &Question) -> String {
+    let mut text = Vec::new();
+    for item in &question.items {
+        text.push(item.prompt.clone());
+        for option in &item.options {
+            if option.description.is_empty() {
+                text.push(format!("- {}", option.label));
+            } else {
+                text.push(format!("- {}: {}", option.label, option.description));
+            }
+        }
+        if !item.options.is_empty() && item.allow_custom {
+            text.push("- (or a written answer)".into());
+        }
+    }
+    text.join("\n")
+}
+
+/// One written answer as the per-item answers a provider reply takes: the
+/// option whose label or id matches it, otherwise the text itself.
+pub fn answers_from_text(question: &Question, text: &str) -> Vec<Vec<String>> {
+    let text = text.trim();
+    question
+        .items
+        .iter()
+        .map(|item| {
+            let chosen = item.options.iter().find(|option| {
+                option.label.eq_ignore_ascii_case(text) || option.id.eq_ignore_ascii_case(text)
+            });
+            vec![chosen.map_or_else(|| text.to_owned(), |option| option.label.clone())]
+        })
+        .collect()
+}
+
+/// The question as JSON, so a routed question survives in the task record.
+pub fn question_json(question: &Question) -> Value {
+    json!({
+        "id": question.id,
+        "title": question.title,
+        "items": question.items.iter().map(|item| json!({
+            "id": item.id, "prompt": item.prompt, "multiple": item.multiple,
+            "allowCustom": item.allow_custom,
+            "options": item.options.iter().map(|o| json!({"id": o.id, "label": o.label, "description": o.description})).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Reads [`question_json`] back.
+pub fn question_from_json(value: &Value) -> Option<Question> {
+    let text = |v: &Value, key: &str| v[key].as_str().map(str::to_owned);
+    let items = value["items"]
+        .as_array()?
+        .iter()
+        .map(|item| {
+            Some(QuestionItem {
+                id: text(item, "id")?,
+                prompt: text(item, "prompt")?,
+                multiple: item["multiple"] == true,
+                allow_custom: item["allowCustom"] == true,
+                options: item["options"]
+                    .as_array()?
+                    .iter()
+                    .map(|o| {
+                        Some(QuestionOption {
+                            id: text(o, "id")?,
+                            label: text(o, "label")?,
+                            description: text(o, "description").unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Option<_>>()?,
+            })
+        })
+        .collect::<Option<_>>()?;
+    Some(Question {
+        id: text(value, "id")?,
+        title: text(value, "title").unwrap_or_default(),
+        items,
+        auto_resolve_at: None,
+    })
+}
+
 pub(super) fn respond(
     stdin: &mut impl Write,
     wire: Value,

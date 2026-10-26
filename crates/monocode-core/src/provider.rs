@@ -50,6 +50,7 @@ pub fn forget_session(kind: Kind, provider_id: &str, account_id: &str, cwd: &Pat
     }
 }
 mod questions;
+pub use questions::{answers_from_text, describe, question_from_json, question_json};
 mod rewind;
 mod tasks;
 pub use rewind::{rewind_last_turn, supports_rewind, RewindError};

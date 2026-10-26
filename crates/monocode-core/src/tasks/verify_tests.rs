@@ -155,6 +155,25 @@ fn a_criterion_without_checks_waits_for_mono() {
 }
 
 #[test]
+fn a_round_waiting_for_mono_runs_again_when_its_evidence_goes_stale() {
+    let repo = repo();
+    let store = open(&repo);
+    let run = claimed_with(&store, &repo, scoped(&[CHECK]), &[], feature);
+    run.coordinator.review(&store, NOW + 10).unwrap();
+    let rounds = run.coordinator.verify(&store, NOW + 20).unwrap();
+    assert_eq!(rounds[0].outcome, RoundOutcome::NeedsMonoReview);
+    assert!(run.coordinator.verify(&store, NOW + 21).unwrap().is_empty());
+    // A later edit invalidates the review's verification: the waiting round
+    // is eligible again rather than resting on stale evidence.
+    std::fs::write(run.tree.join("src/feature.rs"), "pub fn changed() {}\n").unwrap();
+    let rounds = run.coordinator.verify(&store, NOW + 22).unwrap();
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    assert_eq!(rounds[0].outcome, RoundOutcome::NeedsMonoReview);
+    let tasks = store.tasks().unwrap();
+    assert_eq!(tasks.pending_deliveries(MONO_REVIEW).unwrap().len(), 2);
+}
+
+#[test]
 fn several_worktrees_wait_for_integration() {
     let store = memory();
     let tasks = store.tasks().unwrap();

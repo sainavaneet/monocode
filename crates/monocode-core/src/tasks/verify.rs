@@ -162,11 +162,12 @@ fn in_progress(tasks: &TaskStore<'_>) -> Result<Vec<String>, TaskError> {
     Ok(ids.collect::<Result<_, _>>()?)
 }
 
-/// A key that changes whenever the task, its verifications or its decisions
-/// change, so a round that waited is tried again only then.
+/// A key that changes whenever the task, its verifications (including one
+/// being invalidated by a later workspace change) or its decisions change,
+/// so a round that waited is tried again only then.
 fn round_key(tasks: &TaskStore<'_>, task: &Task) -> Result<String, TaskError> {
     let (verifications, decisions): (i64, i64) = tasks.conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM native_task_verifications WHERE task_id=?1),
+        "SELECT (SELECT COUNT(*)+COALESCE(SUM(invalidated),0) FROM native_task_verifications WHERE task_id=?1),
                 (SELECT COALESCE(SUM(revision),0) FROM native_task_decisions WHERE task_id=?1)",
         [&task.id],
         |row| Ok((row.get(0)?, row.get(1)?)),

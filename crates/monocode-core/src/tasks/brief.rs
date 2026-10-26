@@ -2,12 +2,12 @@
 //! conversation, so it carries everything: objective, workspace, scope,
 //! dependencies, expected checks and how to report.
 use super::review::{Review, ReviewOutcome};
-use super::{Assignment, Task, Workspace};
+use super::{Assignment, DecisionRequest, DecisionState, Task, Workspace};
 use crate::orchestration::WorkspaceMode;
 
 const REPORTING: &str = "Report through the app commands (`monocode-gpui app ACTION --json '{...}'`); the task and attempt come from this session:\n\
 - tasks.worker.status {} shows your assignment and answered decisions.\n\
-- tasks.worker.ask {question, context?, scope?} when you need a decision; then wait for the answer.\n\
+- tasks.worker.ask {question, context?, scope?} when you need a decision; then end your turn: the answer arrives as your next message. Do not report success while a question is unanswered.\n\
 - tasks.worker.blocked {reason} if you cannot continue.\n\
 - tasks.worker.result {outcome: \"succeeded\"|\"failed\", summary, workspace, commits, validation, evidence, remainingWork, limitations} once, when done. It is a claim Mono reviews against the acceptance criteria; it does not complete the task.";
 
@@ -41,15 +41,46 @@ fn correction_text(correction: Option<&Review>) -> String {
     )
 }
 
+/// The event that keeps Mono's reason for sending `attempt` back.
+pub fn mono_note_event(attempt: &str) -> String {
+    format!("mono-note:{attempt}")
+}
+
+/// Questions asked for this assignment, with their answers: a replacement
+/// worker takes over where the earlier one stopped.
+fn decisions_text(decisions: &[DecisionRequest]) -> String {
+    if decisions.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = decisions
+        .iter()
+        .map(|d| match (&d.answer, d.state) {
+            (Some(answer), DecisionState::Answered | DecisionState::Resolved) => {
+                format!("- Decision {}: {}\n  Answer: {answer}", d.id, d.question)
+            }
+            _ => format!(
+                "- Decision {}: {}\n  Not answered yet; the answer arrives as a message.",
+                d.id, d.question
+            ),
+        })
+        .collect();
+    format!(
+        "Questions already asked for this assignment and their answers:\n{}\n\n",
+        lines.join("\n")
+    )
+}
+
 /// The brief for `assignment` in `workspace`. A checkout workspace is the
 /// user's own working copy, so its worker only reads: the brief lists no
 /// writable files and forbids edits. `correction` is the review that sent
-/// the previous attempt back, if one did.
+/// the previous attempt back, if one did; `decisions` are the questions
+/// asked for the assignment so far.
 pub fn worker_brief(
     task: &Task,
     assignment: &Assignment,
     workspace: &Workspace,
     correction: Option<&Review>,
+    decisions: &[DecisionRequest],
 ) -> String {
     let (place, rules) = match workspace.mode {
         WorkspaceMode::Worktree => (
@@ -80,6 +111,7 @@ pub fn worker_brief(
          You do not have Mono's conversation; everything you need is here.\n\n\
          Objective:\n{prompt}\n\n\
          {corrections}\
+         {decisions}\
          Workspace: {place}\n\
          {rules}\n\
          Depends on (already accepted): {deps}\n\
@@ -90,6 +122,7 @@ pub fn worker_brief(
         title = assignment.title,
         prompt = assignment.prompt,
         corrections = correction_text(correction),
+        decisions = decisions_text(decisions),
         deps = list(&assignment.depends_on, "none"),
         checks = list(
             &assignment.verification,

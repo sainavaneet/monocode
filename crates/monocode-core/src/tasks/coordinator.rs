@@ -236,6 +236,13 @@ impl<P: Policy> Coordinator<P> {
             if active.len() >= limit {
                 break;
             }
+            // A question holds what its scope covers; the rest continues.
+            if tasks
+                .launch_blocked(&task.id, assignment, &assignments)?
+                .is_some()
+            {
+                continue;
+            }
             if active
                 .iter()
                 .any(|files| crate::orchestration::overlaps(files, &assignment.files))

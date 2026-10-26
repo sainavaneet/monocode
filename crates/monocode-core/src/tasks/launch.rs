@@ -14,11 +14,11 @@ use super::coordinator::{
 use super::events::append;
 use super::states::{apply, is_latest_attempt};
 use super::store::read_ms;
-use super::worker::{claim_event, event, settle};
+use super::worker::{claim_event, event, payload_of, settle};
 use super::workspaces::{self, PrepareError, Prepared};
 use super::{
-    Assignment, AssignmentState, Attempt, AttemptState, ClaimOutcome, NewAttempt, NewEvent,
-    Requester, State, Subject, Task, TaskError, TaskLifecycle, TaskStore, Workspace,
+    Assignment, AssignmentState, Attempt, AttemptState, ClaimOutcome, DecisionState, NewAttempt,
+    NewEvent, Requester, State, Subject, Task, TaskError, TaskLifecycle, TaskStore, Workspace,
 };
 use crate::agent::Settings;
 use crate::app_access;
@@ -81,6 +81,9 @@ impl<P: Policy> Coordinator<P> {
             }
         };
         let tx = tasks.begin()?;
+        // A replacement takes over the questions (and answers) of the attempt
+        // it replaces.
+        super::decisions::inherit(&tx, &attempt, now)?;
         append(&tx, &intent(&attempt, assignment, &prepared), now)?;
         let starting = State::Attempt(AttemptState::Starting);
         settle(
@@ -251,7 +254,33 @@ pub(super) fn reserve(
     let correction = tasks
         .latest_correction(&task.id, &assignment.id)
         .map_err(|e| e.to_string())?;
-    let prompt = super::brief::worker_brief(task, &assignment, &workspace, correction.as_ref());
+    let decisions = super::decisions::assignment_decisions(&tasks, &task.id, &assignment.id)
+        .map_err(|e| e.to_string())?;
+    let prompt = super::brief::worker_brief(
+        task,
+        &assignment,
+        &workspace,
+        correction.as_ref(),
+        &decisions,
+    );
+    // Mono's reason for sending the previous attempt back, if it did.
+    let previous = tasks
+        .attempts(&task.id, &assignment.id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .rev()
+        .find(|a| a.id != attempt.id);
+    let note = match previous {
+        Some(previous) => payload_of(tasks.conn, &super::brief::mono_note_event(&previous.id))
+            .map_err(|e| e.to_string())?
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+            .and_then(|p| p["reason"].as_str().map(str::to_owned)),
+        None => None,
+    };
+    let prompt = match note {
+        Some(reason) => format!("{prompt}\n\nMono sent the previous attempt back: {reason}"),
+        None => prompt,
+    };
     let title: String = format!("{}: {}", task.title, assignment.title)
         .chars()
         .take(TITLE_CHARS)
@@ -282,6 +311,21 @@ pub(super) fn reserve(
         store.prepare_app_prompt(session.id, &attempt.operation_id, &prompt)?;
         session.has_messages = true;
     }
+    // The answers this brief carries; confirming the start hands them over.
+    let carried: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.state == DecisionState::Answered)
+        .map(|d| json!({"id": d.id, "revision": d.revision}))
+        .collect();
+    let briefed = event(
+        attempt,
+        briefed_event(&attempt.id),
+        "attempt.briefed",
+        json!({"decisions": carried}),
+    );
+    tasks
+        .append_event(&briefed, attempt.updated_at)
+        .map_err(|e| e.to_string())?;
     Ok((session, settings, fresh))
 }
 
@@ -316,6 +360,35 @@ fn bind(store: &Store, attempt: &Attempt, session: i64, now: u64) -> Result<(), 
     );
     append(&tx, &receipt, now)?;
     tx.commit()?;
+    Ok(())
+}
+
+fn briefed_event(attempt: &str) -> String {
+    format!("briefed:{attempt}")
+}
+
+/// Resolves the answers the attempt's brief carried, if they are still
+/// current for it, now that the brief reached the worker.
+fn hand_over_briefed(conn: &Connection, attempt: &Attempt, now: u64) -> Result<(), TaskError> {
+    let tasks = TaskStore { conn };
+    let Some(briefed) = payload_of(conn, &briefed_event(&attempt.id))? else {
+        return Ok(());
+    };
+    let briefed: serde_json::Value = serde_json::from_str(&briefed)?;
+    for carried in briefed["decisions"].as_array().into_iter().flatten() {
+        let (Some(id), Some(revision)) = (carried["id"].as_str(), carried["revision"].as_u64())
+        else {
+            continue;
+        };
+        let current = tasks.decision(id)?.filter(|d| {
+            d.state == DecisionState::Answered
+                && d.revision == revision
+                && d.attempt_id.as_deref() == Some(attempt.id.as_str())
+        });
+        if let Some(decision) = current {
+            super::decisions::resolve(conn, &decision, &attempt.id, "brief", now)?;
+        }
+    }
     Ok(())
 }
 
@@ -363,6 +436,7 @@ pub fn confirm_started(store: &Store, session: i64, now: u64) -> Result<bool, Ta
     let running = State::Attempt(AttemptState::Running);
     let subject = Subject::Attempt(&attempt.id);
     settle(&tx, subject, running, Requester::Coordinator, now)?;
+    hand_over_briefed(&tx, &attempt, now)?;
     tx.commit()?;
     Ok(true)
 }

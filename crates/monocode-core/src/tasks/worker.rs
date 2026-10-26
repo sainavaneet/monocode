@@ -3,8 +3,9 @@
 //! The attempt is always the one bound to the caller's session; nothing here
 //! takes an identity from what a worker writes. Each report runs in one
 //! transaction with the transitions it asks for, checked against the table.
+use super::decisions::queue_for_mono;
 use super::events::{append, NewEvent};
-use super::model::{Attempt, DecisionRequest, DecisionScope, NewDecision};
+use super::model::{Attempt, DecisionRequest, DecisionScope, DecisionState, NewDecision};
 use super::states::{
     apply, is_latest_attempt, state_enum, AssignmentState, AttemptState, Requester, State, Subject,
 };
@@ -79,7 +80,7 @@ pub(super) fn event(
     }
 }
 
-fn payload_of(conn: &Connection, event_id: &str) -> Result<Option<String>, TaskError> {
+pub(super) fn payload_of(conn: &Connection, event_id: &str) -> Result<Option<String>, TaskError> {
     Ok(conn
         .query_row(
             "SELECT payload FROM native_task_events WHERE id=?1",
@@ -157,6 +158,16 @@ impl TaskStore<'_> {
         Ok(attempt)
     }
 
+    /// A worker that reported its result asks and blocks no more.
+    fn refuse_after_claim(&self, attempt_id: &str) -> Result<(), TaskError> {
+        if self.claim(attempt_id)?.is_some() {
+            return Err(TaskError::Invalid(
+                "This attempt already reported its result; it can no longer ask or report a blocker.".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Persists the worker's question, moves the attempt to Waiting and its
     /// assignment to WaitingForDecision. Asking again with the same id
     /// returns the stored request.
@@ -164,6 +175,19 @@ impl TaskStore<'_> {
         &self,
         attempt_id: &str,
         question: &WorkerQuestion,
+        now: u64,
+    ) -> Result<DecisionRequest, TaskError> {
+        self.ask_with(attempt_id, question, None, now)
+    }
+
+    /// As [`TaskStore::ask`], also keeping the provider-native question the
+    /// worker asked (`provider`), so its answer can go back as a reply. The
+    /// question is queued for the owning Mono in the same transaction.
+    pub fn ask_with(
+        &self,
+        attempt_id: &str,
+        question: &WorkerQuestion,
+        provider: Option<serde_json::Value>,
         now: u64,
     ) -> Result<DecisionRequest, TaskError> {
         let tx = self.begin()?;
@@ -191,7 +215,17 @@ impl TaskStore<'_> {
             scope: question.scope,
             asked_by: Requester::Worker,
         };
+        self.refuse_after_claim(attempt_id)?;
         insert_decision(&tx, &new, now)?;
+        queue_for_mono(&tx, &new.id, now)?;
+        if let Some(original) = provider {
+            let id = format!("provider-question:{}", new.id);
+            append(
+                &tx,
+                &event(&attempt, id, "decision.provider_question", original),
+                now,
+            )?;
+        }
         let waiting = State::Attempt(AttemptState::Waiting);
         settle(
             &tx,
@@ -246,6 +280,21 @@ impl TaskStore<'_> {
                 state: attempt.status.as_str().into(),
             });
         }
+        // Success cannot slip past a question: the answer must reach the
+        // worker (and resolve) first.
+        if claim.outcome == ClaimOutcome::Succeeded {
+            let pending = self
+                .attempt_decisions(attempt_id)?
+                .into_iter()
+                .find(|d| d.state != DecisionState::Resolved);
+            if let Some(decision) = pending {
+                return Err(TaskError::Invalid(format!(
+                    "Decision {} is not resolved yet ({}); wait for its answer before reporting success.",
+                    decision.id,
+                    decision.state.as_str()
+                )));
+            }
+        }
         let payload = serde_json::to_value(claim)?;
         let claimed = event(&attempt, claim_event(attempt_id), "attempt.claim", payload);
         append(&tx, &claimed, now)?;
@@ -277,6 +326,7 @@ impl TaskStore<'_> {
     ) -> Result<Attempt, TaskError> {
         let tx = self.begin()?;
         let attempt = self.current_attempt(attempt_id)?;
+        self.refuse_after_claim(attempt_id)?;
         let id = format!("blocked:{attempt_id}:{key}");
         let payload = json!({ "reason": reason });
         if let Some(existing) = payload_of(&tx, &id)? {
