@@ -18,16 +18,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const NOW: u64 = 1_000_000;
-const CHECK: &str = "test -f src/feature.rs";
+pub(in crate::tasks) const NOW: u64 = 1_000_000;
+pub(in crate::tasks) const CHECK: &str = "test -f src/feature.rs";
 
-struct Repo {
+pub(in crate::tasks) struct Repo {
     _dir: tempfile::TempDir,
-    root: PathBuf,
+    pub(in crate::tasks) root: PathBuf,
     db: PathBuf,
 }
 
-fn git(cwd: &Path, args: &[&str]) -> String {
+pub(in crate::tasks) fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(cwd)
         .args(args)
@@ -41,7 +41,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-fn repo() -> Repo {
+pub(in crate::tasks) fn repo() -> Repo {
     let dir = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(dir.path()).unwrap();
     let root = base.join("project");
@@ -61,7 +61,7 @@ fn repo() -> Repo {
     }
 }
 
-fn open(repo: &Repo) -> Store {
+pub(in crate::tasks) fn open(repo: &Repo) -> Store {
     let store = Store::open(&repo.db).unwrap();
     store
         .save_setting(crate::tasks::coordinator::FLAG, "enabled")
@@ -69,7 +69,7 @@ fn open(repo: &Repo) -> Store {
     store
 }
 
-fn scoped(checks: &[&str]) -> crate::tasks::Assignment {
+pub(in crate::tasks) fn scoped(checks: &[&str]) -> crate::tasks::Assignment {
     crate::tasks::Assignment {
         files: vec!["src".into()],
         workspace: Some(WorkspaceMode::Worktree),
@@ -79,8 +79,8 @@ fn scoped(checks: &[&str]) -> crate::tasks::Assignment {
 }
 
 #[derive(Default)]
-struct FakeLauncher {
-    started: RefCell<Vec<Session>>,
+pub(in crate::tasks) struct FakeLauncher {
+    pub(in crate::tasks) started: RefCell<Vec<Session>>,
 }
 
 impl Launcher for FakeLauncher {
@@ -92,16 +92,27 @@ impl Launcher for FakeLauncher {
 
 /// Task `t` with one assignment, launched into its worktree, where `work`
 /// changes files before the worker claims success and review is requested.
-struct Claimed {
-    coordinator: Coordinator,
-    launcher: FakeLauncher,
-    tree: PathBuf,
+pub(in crate::tasks) struct Claimed {
+    pub(in crate::tasks) coordinator: Coordinator,
+    pub(in crate::tasks) launcher: FakeLauncher,
+    pub(in crate::tasks) tree: PathBuf,
 }
 
-fn claimed(
+pub(in crate::tasks) fn claimed(
     store: &Store,
     repo: &Repo,
     assignment: crate::tasks::Assignment,
+    work: impl FnOnce(&Path),
+) -> Claimed {
+    claimed_with(store, repo, assignment, &[], work)
+}
+
+/// As [`claimed`], with criterion `c1` demonstrated by `criterion_checks`.
+pub(in crate::tasks) fn claimed_with(
+    store: &Store,
+    repo: &Repo,
+    assignment: crate::tasks::Assignment,
+    criterion_checks: &[&str],
     work: impl FnOnce(&Path),
 ) -> Claimed {
     let tasks = store.tasks().unwrap();
@@ -117,6 +128,7 @@ fn claimed(
                     id: "c1".into(),
                     description: "The feature exists".into(),
                     required: true,
+                    checks: criterion_checks.iter().map(|c| (*c).to_owned()).collect(),
                 }],
             },
             NOW,
@@ -155,11 +167,11 @@ fn claimed(
     }
 }
 
-fn feature(tree: &Path) {
+pub(in crate::tasks) fn feature(tree: &Path) {
     std::fs::write(tree.join("src/feature.rs"), "pub fn feature() {}\n").unwrap();
 }
 
-fn stage_to(store: &Store, stage: TaskStage) {
+pub(in crate::tasks) fn stage_to(store: &Store, stage: TaskStage) {
     let tasks = store.tasks().unwrap();
     let t = Subject::Task("t");
     let revision = tasks.revision(t).unwrap();
@@ -168,7 +180,7 @@ fn stage_to(store: &Store, stage: TaskStage) {
         .unwrap();
 }
 
-fn status(store: &Store) -> AssignmentState {
+pub(in crate::tasks) fn status(store: &Store) -> AssignmentState {
     store
         .tasks()
         .unwrap()
@@ -178,12 +190,12 @@ fn status(store: &Store) -> AssignmentState {
         .status
 }
 
-fn events(store: &Store, kind: &str) -> Vec<crate::tasks::Event> {
+pub(in crate::tasks) fn events(store: &Store, kind: &str) -> Vec<crate::tasks::Event> {
     let all = store.tasks().unwrap().events_after(0, 10_000).unwrap();
     all.into_iter().filter(|e| e.kind == kind).collect()
 }
 
-fn evidence(v: &crate::tasks::Verification) -> serde_json::Value {
+pub(in crate::tasks) fn evidence(v: &crate::tasks::Verification) -> serde_json::Value {
     serde_json::from_str(&v.evidence).unwrap()
 }
 
@@ -425,6 +437,31 @@ fn checks_that_need_a_shell_or_are_prose_go_to_mono_unrun() {
         .unwrap()
         .is_empty());
     assert_eq!(status(&store), AssignmentState::NeedsReview);
+
+    // A plain command, runnable on its own, never runs in the user's
+    // checkout: investigations go to Mono unchecked.
+    let repo = super::tests::repo();
+    let store = open(&repo);
+    let investigation = crate::tasks::Assignment {
+        workspace: Some(WorkspaceMode::Checkout),
+        ..scoped(&["touch ran-sentinel"])
+    };
+    let run = claimed(&store, &repo, investigation, |_| {});
+    assert_eq!(run.tree, repo.root);
+    let reviews = run.coordinator.review(&store, NOW + 10).unwrap();
+    assert_eq!(reviews[0].outcome, ReviewOutcome::NeedsMonoReview);
+    let unchecked = reviews[0].findings.last();
+    assert!(matches!(unchecked, Some(Finding::NotChecked { .. })));
+    assert!(
+        !repo.root.join("ran-sentinel").exists(),
+        "ran in the checkout"
+    );
+    assert!(reviews[0].checkpoint.is_none());
+    let refs = git(&repo.root, &["for-each-ref", "refs/monocode"]);
+    assert!(
+        refs.is_empty(),
+        "no snapshot in the user's repository: {refs}"
+    );
 }
 
 #[test]
@@ -526,6 +563,7 @@ fn completion_needs_criteria_no_open_decision_and_a_final_report() {
         id: "c1".into(),
         description: "The feature exists".into(),
         required: true,
+        checks: Vec::new(),
     };
     tasks
         .update_criteria("t", tasks.revision(t).unwrap(), &[required], NOW + 12)

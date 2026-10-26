@@ -4,7 +4,8 @@
 //! split with shell quoting rules (`shlex`) and executed directly in the
 //! workspace, so a step that needs a shell (pipes, `&&`, redirection,
 //! variables, globs) or is prose (`Run the tests`) cannot run: review hands it
-//! to Mono instead of guessing.
+//! to Mono instead of guessing. A program named by path must stay inside the
+//! workspace.
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,6 +17,9 @@ pub const CHECK_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 /// failures are reported.
 pub const CHECK_OUTPUT_BYTES: usize = 8 * 1024;
 const POLL: Duration = Duration::from_millis(25);
+/// How long output readers may outlive the check before they are abandoned
+/// (a daemonised descendant can keep the pipes open).
+const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 /// Tokens that only mean something to a shell.
 const SHELL_TOKENS: &[&str] = &["&&", "||", "|", ";", "&", ">", ">>", "<", "<<", "2>&1"];
 const SHELL_CHARS: &[char] = &['$', '`', '*', '?', '~', '>', '<', '|', ';'];
@@ -53,25 +57,37 @@ pub fn command_line(check: &str, cwd: &Path) -> Result<(PathBuf, Vec<String>), S
     {
         return Err("It needs a shell; checks run without one.".into());
     }
-    let program = resolve(&argv[0], cwd).ok_or_else(|| {
-        format!(
-            "`{}` is not a program in the workspace or on PATH.",
-            argv[0]
-        )
-    })?;
+    let program = resolve(&argv[0], cwd)?;
     Ok((program, argv))
 }
 
-fn resolve(name: &str, cwd: &Path) -> Option<PathBuf> {
-    if name.contains('/') {
-        let path = cwd.join(name);
-        return is_executable(&path).then_some(path);
+/// A bare name is looked up on PATH; a path must be relative and resolve
+/// inside the workspace.
+fn resolve(name: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let missing = || format!("`{name}` is not a program in the workspace or on PATH.");
+    if name.contains('/') || name.contains('\\') {
+        if Path::new(name).is_absolute() {
+            return Err(format!(
+                "`{name}` is outside the workspace; name a program inside it or on PATH."
+            ));
+        }
+        let root = cwd.canonicalize().map_err(|e| e.to_string())?;
+        let path = root.join(name).canonicalize().map_err(|_| missing())?;
+        if !path.starts_with(&root) {
+            return Err(format!("`{name}` resolves outside the workspace."));
+        }
+        return if is_executable(&path) {
+            Ok(path)
+        } else {
+            Err(missing())
+        };
     }
     let search = crate::scm::shell::cached_gui_search_path();
     std::env::split_paths(std::ffi::OsStr::new(&search))
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(name))
         .find(|path| is_executable(path))
+        .ok_or_else(missing)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -127,8 +143,13 @@ pub fn run(check: &str, cwd: &Path, timeout: Duration) -> Result<CheckRun, Strin
         }
     };
     crate::process::terminate(&mut child);
-    let (out, out_cut) = stdout.join().unwrap_or_default();
-    let (err, err_cut) = stderr.join().unwrap_or_default();
+    let grace = Instant::now() + OUTPUT_GRACE;
+    let collect = |pipe: std::sync::mpsc::Receiver<(String, bool)>| {
+        pipe.recv_timeout(grace.saturating_duration_since(Instant::now()))
+            .unwrap_or((String::new(), true))
+    };
+    let (out, out_cut) = collect(stdout);
+    let (err, err_cut) = collect(stderr);
     let joined = [out, err]
         .into_iter()
         .filter(|text| !text.is_empty())
@@ -146,11 +167,15 @@ pub fn run(check: &str, cwd: &Path, timeout: Duration) -> Result<CheckRun, Strin
     })
 }
 
-/// Reads a pipe to its end on a thread, keeping only the last bytes.
-fn tail(pipe: Option<Box<dyn Read + Send>>) -> std::thread::JoinHandle<(String, bool)> {
+/// Reads a pipe to its end on a thread, keeping only the last bytes. The
+/// result arrives on the channel; a reader stuck on an inherited pipe is
+/// abandoned after [`OUTPUT_GRACE`].
+fn tail(pipe: Option<Box<dyn Read + Send>>) -> std::sync::mpsc::Receiver<(String, bool)> {
+    let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let Some(mut pipe) = pipe else {
-            return (String::new(), false);
+            let _ = send.send((String::new(), false));
+            return;
         };
         let mut kept = Vec::new();
         let mut cut = false;
@@ -165,8 +190,61 @@ fn tail(pipe: Option<Box<dyn Read + Send>>) -> std::thread::JoinHandle<(String, 
                 cut = true;
             }
         }
-        (String::from_utf8_lossy(&kept).into_owned(), cut)
-    })
+        let _ = send.send((String::from_utf8_lossy(&kept).into_owned(), cut));
+    });
+    receive
+}
+
+/// The checks of one review or verification round and what they did to
+/// the workspace.
+#[derive(Debug, Default)]
+pub struct Batch {
+    /// One per check, in order: the run, or why it could not run.
+    pub results: Vec<Result<CheckRun, String>>,
+    /// Files the checks changed relative to the snapshot taken before them.
+    pub modified: Vec<String>,
+    /// Git could not snapshot the workspace after the checks.
+    pub error: Option<String>,
+}
+
+impl Batch {
+    /// Whether the runs describe the snapshot taken before them: nothing
+    /// changed the workspace while they ran.
+    pub fn trustworthy(&self) -> bool {
+        self.modified.is_empty() && self.error.is_none()
+    }
+}
+
+/// Runs `checks` in the workspace at `path`, whose snapshot before them is
+/// `before`, then snapshots it again at `after_ref` and reports any change.
+pub fn run_batch(path: &str, checks: &[String], before: &str, after_ref: &str) -> Batch {
+    let timeout = Duration::from_millis(CHECK_TIMEOUT_MS);
+    let mut batch = Batch {
+        results: checks
+            .iter()
+            .map(|check| run(check, Path::new(path), timeout))
+            .collect(),
+        ..Batch::default()
+    };
+    if !batch.results.iter().any(Result::is_ok) {
+        return batch;
+    }
+    let after = crate::checkpoint::snapshot_workspace(path, after_ref).and_then(|after| {
+        if crate::checkpoint::same_snapshot(path, before, &after)? {
+            return Ok(Vec::new());
+        }
+        let files = crate::checkpoint::changed_paths(path, before, &after)?;
+        Ok(if files.is_empty() {
+            vec!["(the workspace)".into()]
+        } else {
+            files
+        })
+    });
+    match after {
+        Ok(modified) => batch.modified = modified,
+        Err(error) => batch.error = Some(error),
+    }
+    batch
 }
 
 /// The last [`CHECK_OUTPUT_BYTES`] of `text`, on a character boundary.

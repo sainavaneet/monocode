@@ -9,9 +9,9 @@
 //! live verification, no unresolved decision, and a final report persisted in
 //! the same transaction. The report states implemented, committed, merged,
 //! pushed and deployed from evidence only, never from a worker's words.
-use super::checks::{self, CheckRun, CHECK_TIMEOUT_MS};
+use super::checks::{self, CheckRun};
 use super::events::{append, NewEvent};
-use super::review::ref_part;
+use super::findings::task_ref;
 use super::states::apply;
 use super::{
     AssignmentState, Requester, State, Subject, TaskError, TaskLifecycle, TaskStage, Verification,
@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
 
 /// The record kind of a persisted final report; its event id is
 /// `final_report:<task>`.
@@ -100,21 +99,24 @@ pub fn verify_criterion(
             "Task {task_id} has no criterion {criterion_id}."
         )));
     }
-    let reference = format!(
-        "refs/monocode/tasks/{}/criteria/{}",
-        ref_part(task_id),
-        ref_part(criterion_id)
-    );
-    let checkpoint = checkpoint::snapshot_workspace(&workspace.path, &reference)
+    let run_id = crate::mono::new_id();
+    let reference = |side: &str| task_ref(task_id, &["criteria", criterion_id, &run_id, side]);
+    let checkpoint = checkpoint::snapshot_workspace(&workspace.path, &reference("before"))
         .map_err(|e| TaskError::Invalid(format!("The workspace could not be snapshotted: {e}")))?;
-    let timeout = Duration::from_millis(CHECK_TIMEOUT_MS);
-    let run =
-        checks::run(check, Path::new(&workspace.path), timeout).map_err(TaskError::Invalid)?;
+    let checks = [check.to_owned()];
+    let mut batch = checks::run_batch(&workspace.path, &checks, &checkpoint, &reference("after"));
+    if let Some(error) = batch.error.take() {
+        return Err(TaskError::Invalid(error));
+    }
+    if !batch.modified.is_empty() {
+        return Err(TaskError::Invalid(format!(
+            "`{check}` modified the workspace ({}), so it verifies nothing.",
+            batch.modified.join(", ")
+        )));
+    }
+    let run = batch.results.remove(0).map_err(TaskError::Invalid)?;
     let verification = Verification {
-        id: format!(
-            "criterion:{task_id}:{criterion_id}:{}",
-            crate::mono::new_id()
-        ),
+        id: format!("criterion:{task_id}:{criterion_id}:{run_id}"),
         task_id: task_id.into(),
         assignment_id: workspace.assignment_id.clone(),
         criterion_id: Some(criterion_id.into()),
@@ -151,11 +153,7 @@ pub fn refresh_verifications(
         };
         let snapshot = current.entry(path.to_owned()).or_insert_with(|| {
             let workspace = place["workspace"].as_str().unwrap_or(path);
-            let reference = format!(
-                "refs/monocode/tasks/{}/current/{}",
-                ref_part(task_id),
-                ref_part(workspace)
-            );
+            let reference = task_ref(task_id, &["refresh", workspace]);
             checkpoint::snapshot_workspace(path, &reference).ok()
         });
         let same = snapshot.as_deref().is_some_and(|now| {

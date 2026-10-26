@@ -21,6 +21,7 @@ pub(in crate::tasks) fn new_task(id: &str) -> NewTask {
             id: "c1".into(),
             description: "Tests pass".into(),
             required: true,
+            checks: Vec::new(),
         }],
     }
 }
@@ -285,6 +286,7 @@ fn stale_revisions_are_rejected_without_changes() {
         id: "c2".into(),
         description: "Docs updated".into(),
         required: false,
+        checks: vec!["cargo doc".into()],
     }];
     stale(tasks.update_criteria("t", 1, &criteria, 3), 2);
     assert_eq!(tasks.update_criteria("t", 2, &criteria, 3).unwrap(), 3);

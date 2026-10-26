@@ -6,8 +6,7 @@ use crate::orchestration::WorkspaceMode;
 use crate::store::{Session, Store};
 use crate::tasks::store::tests::{assignment, plan};
 use crate::tasks::{
-    confirm_started, start_failed, AcceptanceCriterion, AssignmentState, AttemptState, NewTask,
-    Subject,
+    confirm_started, start_failed, AssignmentState, AttemptState, NewTask, Subject,
 };
 use serde_json::json;
 use std::cell::{Cell, RefCell};
@@ -73,11 +72,7 @@ fn started(store: &Store, repo: &Repo, assignments: Vec<crate::tasks::Assignment
                 project: repo.root.to_string_lossy().into_owned(),
                 title: "Ship it".into(),
                 request: "Implement the feature".into(),
-                criteria: vec![AcceptanceCriterion {
-                    id: "c1".into(),
-                    description: "Tests pass".into(),
-                    required: true,
-                }],
+                criteria: crate::tasks::store::tests::new_task("t").criteria,
             },
             NOW,
         )

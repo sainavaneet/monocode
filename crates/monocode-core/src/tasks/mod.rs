@@ -8,11 +8,13 @@ pub mod checks;
 pub mod completion;
 pub mod coordinator;
 pub mod events;
+pub mod findings;
 mod launch;
 pub mod model;
 pub mod review;
 pub mod states;
 pub mod store;
+pub mod verify;
 pub mod worker;
 pub mod workspaces;
 
@@ -29,6 +31,7 @@ pub use states::{
     State, Subject, TaskLifecycle, TaskStage, Transition, TRANSITIONS,
 };
 pub use store::TaskStore;
+pub use verify::{Round, RoundOutcome};
 pub use worker::{Claim, ClaimOutcome, WorkerQuestion};
 
 /// Why a task store operation was refused.

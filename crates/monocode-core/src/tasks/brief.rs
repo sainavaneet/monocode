@@ -1,7 +1,7 @@
 //! The first prompt of a task worker. Workers do not inherit Mono's
 //! conversation, so it carries everything: objective, workspace, scope,
 //! dependencies, expected checks and how to report.
-use super::review::Review;
+use super::review::{Review, ReviewOutcome};
 use super::{Assignment, Task, Workspace};
 use crate::orchestration::WorkspaceMode;
 
@@ -29,8 +29,13 @@ fn correction_text(correction: Option<&Review>) -> String {
         .iter()
         .map(|finding| format!("- {}", finding.describe()))
         .collect();
+    let how = if review.outcome == ReviewOutcome::Correction {
+        "Review sent back the previous attempt"
+    } else {
+        "Mono sent back the previous attempt after reviewing it"
+    };
     format!(
-        "Review sent back the previous attempt ({}). Address these findings first:\n{}\n\n",
+        "{how} ({}). Address these findings first:\n{}\n\n",
         review.attempt_id,
         findings.join("\n")
     )

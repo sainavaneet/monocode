@@ -15,6 +15,10 @@ pub struct AcceptanceCriterion {
     pub id: String,
     pub description: String,
     pub required: bool,
+    /// Command lines that demonstrate the criterion, run like plan checks
+    /// (no shell) on the task's result. None: Mono verifies it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

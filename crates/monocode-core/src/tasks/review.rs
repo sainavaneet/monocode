@@ -6,14 +6,18 @@
 //! current run of the current requirements, snapshot the actual workspace
 //! (`checkpoint`), flag files changed outside the assignment's scope, compare
 //! the reported validation with the plan's checks, run those checks in the
-//! workspace, and then accept, send back with a durable correction, or hand
-//! the claim to Mono when it cannot be decided mechanically. Collecting jobs
-//! and recording outcomes need the store; inspecting (Git and the checks)
-//! does not, so the app can run it without holding the store lock.
-use super::checks::{self, CheckRun, CHECK_TIMEOUT_MS};
+//! worktree, snapshot again to catch checks that change it, and then accept,
+//! send back with a durable correction, or hand the claim to Mono when it
+//! cannot be decided mechanically. Investigations in the user's checkout are
+//! never snapshotted or checked here; Mono judges them. Collecting jobs and
+//! recording outcomes need the store; inspecting (Git and the checks) does
+//! not, so the app can run it without holding the store lock.
+use super::checks::{self, Batch};
 use super::completion::evidence;
 use super::coordinator::{Coordinator, Policy, REVIEW};
 use super::events::{append, PendingDelivery};
+use super::findings::{out_of_scope, task_ref};
+pub use super::findings::{Finding, Review, ReviewOutcome};
 use super::states::{apply, is_latest_attempt};
 use super::store::Key;
 use super::worker::event;
@@ -24,162 +28,17 @@ use super::{
 use crate::checkpoint;
 use crate::orchestration::WorkspaceMode;
 use rusqlite::{Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
-use std::time::Duration;
 
 /// Corrections an assignment may receive before review stops re-queueing it
 /// and hands the next claim to Mono.
 pub const MAX_CORRECTIONS: usize = 3;
-/// Failed inspections (Git errors) before review hands the claim to Mono.
+/// Failed inspections or recordings before review hands the claim to Mono.
 pub const REVIEW_RETRY_LIMIT: u32 = 3;
-/// Where claims that need judgement wait for Mono's review.
+/// Where claims and tasks that need judgement wait for Mono.
 pub const MONO_REVIEW: &str = "mono_review";
-const REVIEWED: &str = "assignment.reviewed";
-/// How much failing output a worker brief repeats.
-const BRIEF_OUTPUT_CHARS: usize = 1_500;
-
-/// Something review found in a claim, its workspace or its checks.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum Finding {
-    /// The claim no longer belongs to the current run of the assignment.
-    Superseded {
-        reason: String,
-    },
-    /// The assignment's requirements changed after the attempt started.
-    StaleRevision {
-        reason: String,
-    },
-    OutOfScope {
-        path: String,
-    },
-    FailedCheck {
-        check: String,
-        exit_code: Option<i32>,
-        timed_out: bool,
-        output: String,
-    },
-    /// The step needs a shell or a reader; it was not run.
-    UnrunnableCheck {
-        check: String,
-        reason: String,
-    },
-    /// A plan check the worker's validation does not mention. Informational:
-    /// review runs every check itself.
-    UnreportedCheck {
-        check: String,
-    },
-    /// The plan gives no check, so nothing could verify the work.
-    NoChecks,
-    /// The worker claimed success but listed work still to do.
-    RemainingWork {
-        item: String,
-    },
-    Workspace {
-        reason: String,
-    },
-    CorrectionLimit {
-        corrections: usize,
-    },
-}
-
-impl Finding {
-    /// Mechanically wrong: the work goes back to a worker.
-    fn is_corrective(&self) -> bool {
-        matches!(
-            self,
-            Self::StaleRevision { .. } | Self::OutOfScope { .. } | Self::FailedCheck { .. }
-        )
-    }
-
-    /// Not decidable without judgement.
-    fn needs_mono(&self) -> bool {
-        matches!(
-            self,
-            Self::UnrunnableCheck { .. }
-                | Self::NoChecks
-                | Self::RemainingWork { .. }
-                | Self::Workspace { .. }
-                | Self::CorrectionLimit { .. }
-        )
-    }
-
-    /// One line for the next worker's brief.
-    pub fn describe(&self) -> String {
-        match self {
-            Self::Superseded { reason } => format!("The claim was superseded: {reason}"),
-            Self::StaleRevision { reason } => reason.clone(),
-            Self::OutOfScope { path } => {
-                format!("{path} was changed outside the files you may change.")
-            }
-            Self::FailedCheck {
-                check,
-                exit_code,
-                timed_out,
-                output,
-            } => {
-                let how = match (timed_out, exit_code) {
-                    (true, _) => "timed out".to_owned(),
-                    (false, Some(code)) => format!("failed with exit code {code}"),
-                    (false, None) => "was killed".to_owned(),
-                };
-                if output.is_empty() {
-                    return format!("`{check}` {how} with no output.");
-                }
-                let start = output.chars().count().saturating_sub(BRIEF_OUTPUT_CHARS);
-                let end: String = output.chars().skip(start).collect();
-                format!("`{check}` {how}. End of its output:\n{end}")
-            }
-            Self::UnrunnableCheck { check, reason } => {
-                format!("`{check}` could not be run: {reason}")
-            }
-            Self::UnreportedCheck { check } => {
-                format!("`{check}` was not in the validation you reported.")
-            }
-            Self::NoChecks => "The plan gave no check to verify the work.".into(),
-            Self::RemainingWork { item } => format!("You reported remaining work: {item}"),
-            Self::Workspace { reason } => format!("The workspace could not be inspected: {reason}"),
-            Self::CorrectionLimit { corrections } => {
-                format!("The work was already sent back {corrections} times.")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewOutcome {
-    /// Every check ran and passed on the inspected snapshot.
-    Accepted,
-    /// Sent back to Queued with the findings for the next attempt.
-    Correction,
-    /// Left in NeedsReview for Mono's judgement (a `mono_review` delivery).
-    NeedsMonoReview,
-    /// The claim is no longer current; nothing changed.
-    Superseded,
-}
-
-/// One attempt's review, persisted as event `reviewed:<attempt>` (kind
-/// `assignment.reviewed`). A correction is a review with that outcome.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Review {
-    pub attempt_id: String,
-    pub assignment_id: String,
-    pub outcome: ReviewOutcome,
-    /// The workspace snapshot inspected and checked.
-    pub checkpoint: Option<String>,
-    pub changed_files: Vec<String>,
-    pub findings: Vec<Finding>,
-    /// The verification records of the checks that ran.
-    pub verifications: Vec<String>,
-}
+pub(super) const REVIEWED: &str = "assignment.reviewed";
+const CHECKOUT: &str = "Investigations work in the user's checkout, so review neither snapshots nor runs checks there; Mono judges the findings.";
 
 /// Everything a review needs, read from the store.
 pub struct ReviewJob {
@@ -191,16 +50,18 @@ pub struct ReviewJob {
     workspace: Option<Workspace>,
     superseded: Option<String>,
     stale: Option<String>,
+    /// The last error once inspecting or recording failed too often.
+    exhausted: Option<String>,
     corrections: usize,
 }
 
 /// What inspecting the workspace found; no store access.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Inspection {
     checkpoint: Option<String>,
     changed_files: Vec<String>,
     findings: Vec<Finding>,
-    runs: Vec<CheckRun>,
+    batch: Batch,
     /// Git could not inspect the workspace; the review is retried.
     error: Option<String>,
 }
@@ -219,31 +80,39 @@ pub(super) fn requirements(a: &Assignment) -> String {
     format!("{:x}", Sha256::digest(fields.to_string().as_bytes()))
 }
 
-/// A Git ref component from a record id.
-pub(super) fn ref_part(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-fn in_scope(path: &str, files: &[String]) -> bool {
-    files
-        .iter()
-        .any(|scope| scope == "." || Path::new(path).starts_with(scope))
+/// Findings for checks that failed or could not run.
+pub(super) fn check_findings(checks: &[String], batch: &Batch) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for (check, result) in checks.iter().zip(&batch.results) {
+        match result {
+            Ok(run) if !run.passed() => findings.push(Finding::FailedCheck {
+                check: check.clone(),
+                exit_code: run.exit_code,
+                timed_out: run.timed_out,
+                output: run.output.clone(),
+            }),
+            Ok(_) => {}
+            Err(reason) => findings.push(Finding::UnrunnableCheck {
+                check: check.clone(),
+                reason: reason.clone(),
+            }),
+        }
+    }
+    if !batch.modified.is_empty() {
+        findings.push(Finding::ModifiedByCheck {
+            files: batch.modified.clone(),
+        });
+    }
+    findings
 }
 
 impl ReviewJob {
-    /// Snapshots the workspace, checks the scope and runs the plan's checks.
-    /// Touches no store, so it may run without the store lock.
+    /// Snapshots the workspace, checks the scope, runs the plan's checks and
+    /// snapshots again. Touches no store, so it may run without the store
+    /// lock.
     pub fn inspect(&self) -> Inspection {
         let mut found = Inspection::default();
-        if self.superseded.is_some() {
+        if self.superseded.is_some() || self.exhausted.is_some() {
             return found;
         }
         if let Some(reason) = &self.stale {
@@ -271,61 +140,57 @@ impl ReviewJob {
             });
             return found;
         };
-        let reference = format!(
-            "refs/monocode/tasks/{}/{}/{}",
-            ref_part(&self.task.id),
-            ref_part(&self.assignment.id),
-            ref_part(&self.attempt.id)
-        );
-        let snapshot = checkpoint::snapshot_workspace(&workspace.path, &reference);
-        let checkpoint = match snapshot {
-            Ok(commit) => commit,
+        if workspace.mode == WorkspaceMode::Checkout {
+            found.findings.push(Finding::NotChecked {
+                reason: CHECKOUT.into(),
+            });
+            return found;
+        }
+        let Some(base) = workspace.base_commit.as_deref() else {
+            found.findings.push(Finding::Workspace {
+                reason:
+                    "No base commit is recorded for the worktree, so its changes cannot be scoped."
+                        .into(),
+            });
+            return found;
+        };
+        let refs = ["attempts", &self.assignment.id, &self.attempt.id];
+        let before_ref = task_ref(&self.task.id, &[&refs[..], &["before"]].concat());
+        let checkpoint = match checkpoint::snapshot_workspace(&workspace.path, &before_ref)
+            .and_then(|commit| {
+                let changed = checkpoint::changed_paths(&workspace.path, base, &commit)?;
+                Ok((commit, changed))
+            }) {
+            Ok((commit, changed)) => {
+                found.changed_files = changed;
+                commit
+            }
             Err(error) => {
                 found.error = Some(error);
                 return found;
             }
         };
-        if workspace.mode == WorkspaceMode::Worktree {
-            let base = workspace.base_commit.as_deref().unwrap_or("HEAD");
-            match checkpoint::changed_paths(&workspace.path, base, &checkpoint) {
-                Ok(paths) => found.changed_files = paths,
-                Err(error) => {
-                    found.error = Some(error);
-                    return found;
-                }
-            }
-            for path in &found.changed_files {
-                if !in_scope(path, &self.assignment.files) {
-                    found
-                        .findings
-                        .push(Finding::OutOfScope { path: path.clone() });
-                }
-            }
+        match out_of_scope(&found.changed_files, &self.assignment.files) {
+            Ok(paths) => found
+                .findings
+                .extend(paths.into_iter().map(|path| Finding::OutOfScope { path })),
+            Err(reason) => found.findings.push(Finding::NotChecked { reason }),
         }
-        found.checkpoint = Some(checkpoint);
         if self.assignment.verification.is_empty() {
             found.findings.push(Finding::NoChecks);
         }
-        let timeout = Duration::from_millis(CHECK_TIMEOUT_MS);
-        for check in &self.assignment.verification {
-            match checks::run(check, Path::new(&workspace.path), timeout) {
-                Ok(run) => {
-                    if !run.passed() {
-                        found.findings.push(Finding::FailedCheck {
-                            check: check.clone(),
-                            exit_code: run.exit_code,
-                            timed_out: run.timed_out,
-                            output: run.output.clone(),
-                        });
-                    }
-                    found.runs.push(run);
-                }
-                Err(reason) => found.findings.push(Finding::UnrunnableCheck {
-                    check: check.clone(),
-                    reason,
-                }),
-            }
-        }
+        let after_ref = task_ref(&self.task.id, &[&refs[..], &["after"]].concat());
+        found.batch = checks::run_batch(
+            &workspace.path,
+            &self.assignment.verification,
+            &checkpoint,
+            &after_ref,
+        );
+        found.error = found.batch.error.clone();
+        found
+            .findings
+            .extend(check_findings(&self.assignment.verification, &found.batch));
+        found.checkpoint = Some(checkpoint);
         found
     }
 
@@ -338,7 +203,7 @@ impl ReviewJob {
             });
             return (ReviewOutcome::Superseded, findings);
         }
-        if let Some(reason) = &inspection.error {
+        if let Some(reason) = self.exhausted.as_ref().or(inspection.error.as_ref()) {
             findings.push(Finding::Workspace {
                 reason: reason.clone(),
             });
@@ -352,11 +217,21 @@ impl ReviewJob {
             });
             return (ReviewOutcome::NeedsMonoReview, findings);
         }
-        let verified = inspection.runs.iter().any(CheckRun::passed);
+        let verified = inspection.batch.trustworthy()
+            && inspection
+                .batch
+                .results
+                .iter()
+                .any(|r| r.as_ref().is_ok_and(|run| run.passed()));
         if findings.iter().any(Finding::needs_mono) || !verified {
             return (ReviewOutcome::NeedsMonoReview, findings);
         }
         (ReviewOutcome::Accepted, findings)
+    }
+
+    /// The review request this job answers.
+    pub fn delivery_id(&self) -> &str {
+        &self.delivery.id
     }
 }
 
@@ -415,7 +290,7 @@ fn stale(
         }))
 }
 
-fn acknowledge(conn: &Connection, id: &str, now: u64) -> Result<(), TaskError> {
+pub(super) fn acknowledge(conn: &Connection, id: &str, now: u64) -> Result<(), TaskError> {
     let key = Key::new("native_task_deliveries", "id=?", vec![id], "delivery");
     let revision = key.revision(conn)?;
     key.bump(conn, revision, "state=?", vec![&"acknowledged"], now)?;
@@ -470,9 +345,14 @@ impl<P: Policy> Coordinator<P> {
                 .iter()
                 .filter(|r| r.outcome == ReviewOutcome::Correction)
                 .count();
+            let exhausted = (delivery.retries >= REVIEW_RETRY_LIMIT).then(|| {
+                let last = delivery.last_error.as_deref().unwrap_or("unknown error");
+                format!("Review failed {} times: {last}", delivery.retries)
+            });
             jobs.push(ReviewJob {
                 superseded: superseded(&tasks, &task, &assignment, &attempt, claim.as_ref())?,
                 stale: stale(&tasks, &attempt, &assignment)?,
+                exhausted,
                 delivery,
                 task,
                 assignment,
@@ -483,6 +363,25 @@ impl<P: Policy> Coordinator<P> {
             });
         }
         Ok(jobs)
+    }
+
+    /// Counts a failure to inspect or record `job` against its request; after
+    /// [`REVIEW_RETRY_LIMIT`] the next review hands the claim to Mono.
+    pub fn review_failed(
+        &self,
+        store: &crate::store::Store,
+        job: &ReviewJob,
+        error: &str,
+        now: u64,
+    ) -> Result<(), TaskError> {
+        let tasks = store.tasks()?;
+        if let Some(d) = tasks.delivery(&job.delivery.id)? {
+            if d.state == super::DeliveryState::Pending {
+                let failed = DeliveryOutcome::Failed(error.into());
+                tasks.record_delivery(&d.id, d.revision, failed, now)?;
+            }
+        }
+        Ok(())
     }
 
     /// Records the decision for an inspected job in one transaction: the
@@ -503,10 +402,8 @@ impl<P: Policy> Coordinator<P> {
             other => other?,
         }
         if let Some(error) = &inspection.error {
-            let delivery = tasks.delivery(&job.delivery.id)?;
-            if let Some(d) = delivery.filter(|d| d.retries + 1 < REVIEW_RETRY_LIMIT) {
-                let failed = DeliveryOutcome::Failed(error.clone());
-                tasks.record_delivery(&d.id, d.revision, failed, now)?;
+            if job.delivery.retries + 1 < REVIEW_RETRY_LIMIT {
+                self.review_failed(store, job, error, now)?;
                 return Ok(None);
             }
         }
@@ -572,7 +469,8 @@ impl<P: Policy> Coordinator<P> {
     }
 }
 
-/// One verification per check that ran, against the inspected snapshot.
+/// One verification per check that ran against the inspected snapshot;
+/// none when a check changed the workspace.
 fn record_checks(
     tasks: &TaskStore<'_>,
     job: &ReviewJob,
@@ -582,8 +480,14 @@ fn record_checks(
     let (Some(checkpoint), Some(workspace)) = (&inspection.checkpoint, &job.workspace) else {
         return Ok(Vec::new());
     };
+    if !inspection.batch.trustworthy() {
+        return Ok(Vec::new());
+    }
     let mut ids = Vec::new();
-    for (index, run) in inspection.runs.iter().enumerate() {
+    for (index, result) in inspection.batch.results.iter().enumerate() {
+        let Ok(run) = result else {
+            continue;
+        };
         let id = format!("check:{}:{index}", job.attempt.id);
         tasks.record_verification(&Verification {
             id: id.clone(),
@@ -631,8 +535,9 @@ impl TaskStore<'_> {
             .collect()
     }
 
-    /// The assignment's latest review, when it sent the work back: what the
-    /// next attempt must address.
+    /// The assignment's latest review unless it accepted the work: what the
+    /// next attempt must address, whether review sent the work back itself
+    /// or Mono did after judging it.
     pub fn latest_correction(
         &self,
         task_id: &str,
@@ -641,10 +546,14 @@ impl TaskStore<'_> {
         Ok(self
             .reviews(task_id, assignment_id)?
             .pop()
-            .filter(|review| review.outcome == ReviewOutcome::Correction))
+            .filter(|review| review.outcome != ReviewOutcome::Accepted))
     }
 }
 
 #[cfg(test)]
 #[path = "review_tests.rs"]
-mod tests;
+pub(super) mod tests;
+
+#[cfg(test)]
+#[path = "review_guard_tests.rs"]
+mod guard_tests;
