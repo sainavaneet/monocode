@@ -179,21 +179,37 @@ pub fn next_batch(store: &Store, mono: &str, now: u64) -> Result<Option<Batch>, 
 /// delivery reached it more than [`REMIND_AFTER_MS`] ago: queue it again (at
 /// most [`MAX_REMINDERS`] times). Covers a Mono turn that failed after the
 /// batch was acknowledged. Inside the caller's transaction.
+/// Each delivery of an open question to Mono (the first and every
+/// reminder): its state and when it last changed.
+fn sent(tasks: &TaskStore<'_>, decision: &str) -> Result<Vec<(String, u64)>, TaskError> {
+    let reference = format!("decision:{decision}");
+    let mut statement = tasks.conn.prepare(
+        "SELECT state,updated_at FROM native_task_deliveries
+         WHERE destination=?1 AND payload_ref=?2 ORDER BY rowid",
+    )?;
+    let sent = statement
+        .query_map([MONO_DECISION, reference.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, super::store::read_ms(row, 1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(sent)
+}
+
+/// Mono received the question and all [`MAX_REMINDERS`] reminders and
+/// still has not answered it: no further reminder will come, and the
+/// question waits until Mono or the user acts.
+pub(super) fn reminders_stopped(tasks: &TaskStore<'_>, decision: &str) -> Result<bool, TaskError> {
+    let sent = sent(tasks, decision)?;
+    Ok(sent.len() > MAX_REMINDERS && sent.iter().all(|(state, _)| state == "acknowledged"))
+}
+
 fn remind(tasks: &TaskStore<'_>, mono: &str, now: u64) -> Result<(), TaskError> {
     for decision in tasks.mono_decisions(mono)? {
         if decision.state != DecisionState::Open || tasks.escalation(&decision.id)?.is_some() {
             continue;
         }
         let reference = format!("decision:{}", decision.id);
-        let mut statement = tasks.conn.prepare(
-            "SELECT state,updated_at FROM native_task_deliveries
-             WHERE destination=?1 AND payload_ref=?2 ORDER BY rowid",
-        )?;
-        let sent = statement
-            .query_map([MONO_DECISION, reference.as_str()], |row| {
-                Ok((row.get::<_, String>(0)?, super::store::read_ms(row, 1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let sent = sent(tasks, &decision.id)?;
         let settled = sent.iter().all(|(state, _)| state == "acknowledged");
         let last = sent.iter().map(|(_, at)| *at).max().unwrap_or(0);
         if sent.is_empty() || !settled || sent.len() > MAX_REMINDERS {
