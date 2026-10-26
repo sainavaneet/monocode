@@ -1,6 +1,13 @@
 use super::{Session, Store};
 use serde_json::{json, Value};
 
+fn app_launch_key(caller: i64, request: &str) -> String {
+    format!(
+        "operator-app-launch:{caller}:{}",
+        crate::mono::files::content_hash(request)
+    )
+}
+
 impl Store {
     /// A launch is recoverable as an unsent draft if the app exits before its
     /// provider accepts it. Queue delivery uses this same stable message ID.
@@ -29,10 +36,7 @@ impl Store {
         provider: &str,
         project: &str,
     ) -> Result<(Session, bool), String> {
-        let key = format!(
-            "operator-app-launch:{caller}:{}",
-            crate::mono::files::content_hash(request)
-        );
+        let key = app_launch_key(caller, request);
         let previous = self
             .setting(&key)?
             .map(|raw| serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string()))
@@ -75,6 +79,20 @@ impl Store {
         )?;
         transaction.commit().map_err(|e| e.to_string())?;
         Ok((session, true))
+    }
+
+    /// The session `caller`'s request `request` created, if it reserved one,
+    /// without creating anything.
+    pub fn app_session_for_request(
+        &self,
+        caller: i64,
+        request: &str,
+    ) -> Result<Option<i64>, String> {
+        Ok(self
+            .setting(&app_launch_key(caller, request))?
+            .map(|raw| serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string()))
+            .transpose()?
+            .and_then(|v| v["sessionId"].as_i64()))
     }
 
     pub fn app_conversation(

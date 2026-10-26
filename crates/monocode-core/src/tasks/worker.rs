@@ -59,11 +59,16 @@ pub struct WorkerQuestion {
 
 /// The claim is an event with a stable id per attempt, so an attempt has at
 /// most one and a replayed result finds it.
-fn claim_event(attempt: &str) -> String {
+pub(super) fn claim_event(attempt: &str) -> String {
     format!("claim:{attempt}")
 }
 
-fn event(attempt: &Attempt, id: String, kind: &str, payload: serde_json::Value) -> NewEvent {
+pub(super) fn event(
+    attempt: &Attempt,
+    id: String,
+    kind: &str,
+    payload: serde_json::Value,
+) -> NewEvent {
     NewEvent {
         id,
         task_id: attempt.task_id.clone(),
@@ -85,7 +90,7 @@ fn payload_of(conn: &Connection, event_id: &str) -> Result<Option<String>, TaskE
 }
 
 /// Moves `subject` to `to` unless it is already there.
-fn settle(
+pub(super) fn settle(
     conn: &Connection,
     subject: Subject<'_>,
     to: State,
@@ -107,7 +112,7 @@ impl TaskStore<'_> {
             .conn
             .query_row(
                 "SELECT id FROM native_task_attempts WHERE session_id=?1
-                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                 ORDER BY rowid DESC LIMIT 1",
                 [session_id],
                 |row| row.get(0),
             )

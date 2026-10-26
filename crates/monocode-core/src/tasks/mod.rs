@@ -3,11 +3,14 @@
 //! Records live in `native_task*` tables beside the native sessions. Every
 //! mutation names the revision it read and fails on a stale one, so a stale
 //! writer cannot overwrite newer requirements or resolve a superseded decision.
+pub mod coordinator;
 pub mod events;
+mod launch;
 pub mod model;
 pub mod states;
 pub mod store;
 pub mod worker;
+pub mod workspaces;
 
 pub use events::{DeliveryOutcome, DeliveryState, Event, Lease, NewEvent, PendingDelivery};
 pub use model::{

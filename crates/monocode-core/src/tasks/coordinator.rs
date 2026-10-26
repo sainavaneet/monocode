@@ -1,0 +1,274 @@
+//! The execution coordinator: one core service per process that turns
+//! started tasks into worker sessions and observes what the workers report.
+//!
+//! Each tick, for every task that may have work: take or renew the task's
+//! database lease (the other app sharing monocode.db is the competing
+//! coordinator), reconcile each assignment's latest attempt (finish a launch
+//! whose intent was persisted, bind a session a retried launch already
+//! started, classify a failed claim, request one review of a succeeded one),
+//! then launch Ready assignments the policy and file scopes allow. A launch
+//! persists its intent before any external effect, so every step is
+//! at-least-once and idempotent. It does nothing unless [`FLAG`] is enabled.
+use super::{
+    AssignmentState, Attempt, AttemptState, Requester, State, Subject, Task, TaskError,
+    TaskLifecycle, TaskStage, TaskStore,
+};
+use crate::agent::Settings;
+use crate::store::{Session, Store};
+
+/// The `native_settings` key that turns the coordinator on. Off unless its
+/// value is `enabled`, because the desktop file is shared with live agents.
+pub const FLAG: &str = "native-task-coordinator";
+/// How long a lease outlives its holder's last tick.
+pub const LEASE_TTL_MS: u64 = 30_000;
+/// How often a running app ticks; well inside the lease's lifetime.
+pub const TICK_INTERVAL_MS: u64 = 5_000;
+/// The destination of review requests for succeeded claims.
+pub const REVIEW: &str = "review";
+
+/// Whether the coordinator may act in this database.
+pub fn enabled(store: &Store) -> bool {
+    store
+        .setting(FLAG)
+        .ok()
+        .flatten()
+        .is_some_and(|value| value.trim() == "enabled")
+}
+
+/// The lease that lets one coordinator act on a task.
+pub fn lease_resource(task_id: &str) -> String {
+    format!("task:{task_id}")
+}
+
+/// What a Mono allows the coordinator to do on its own. The defaults launch
+/// only tasks Mono or the user explicitly started, one worker at a time.
+pub trait Policy {
+    /// Whether a Ready task may move into Implementing without an explicit
+    /// start.
+    fn automatic_execution(&self, _task: &Task) -> bool {
+        false
+    }
+    /// How many of a task's assignments may run at once.
+    fn worker_limit(&self, _task: &Task) -> usize {
+        1
+    }
+    /// The provider that runs the task's workers.
+    fn worker_provider(&self, _task: &Task) -> String {
+        "codex".into()
+    }
+}
+
+/// The default policy: nothing automatic.
+pub struct ExplicitStart;
+impl Policy for ExplicitStart {}
+
+/// Starts a worker session the coordinator already reserved and configured
+/// through `sessions.start`'s durable steps. The GUI installs and submits it;
+/// tests record it.
+pub trait Launcher {
+    fn start(&self, session: &Session, settings: &Settings) -> Result<(), String>;
+}
+
+/// What one tick did, by attempt or task id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tick {
+    /// False when the flag is off and nothing was read or written.
+    pub enabled: bool,
+    pub launched: Vec<String>,
+    /// Attempts whose already-started session was bound without a relaunch.
+    pub bound: Vec<String>,
+    pub failed: Vec<String>,
+    /// Attempts whose succeeded claim was queued for review.
+    pub reviews: Vec<String>,
+    pub leased_elsewhere: Vec<String>,
+    /// Per-task errors; the next tick retries.
+    pub errors: Vec<String>,
+}
+
+pub struct Coordinator<P: Policy = ExplicitStart> {
+    pub(super) holder: String,
+    pub(super) policy: P,
+}
+
+impl<P: Policy> Coordinator<P> {
+    /// `holder` names this process in leases; it must differ per process.
+    pub fn new(holder: impl Into<String>, policy: P) -> Self {
+        Self {
+            holder: holder.into(),
+            policy,
+        }
+    }
+
+    pub fn holder(&self) -> &str {
+        &self.holder
+    }
+
+    /// One pass over every task that may have work. `now` is Unix ms.
+    pub fn tick(
+        &self,
+        store: &Store,
+        launcher: &dyn Launcher,
+        now: u64,
+    ) -> Result<Tick, TaskError> {
+        let mut tick = Tick::default();
+        if !enabled(store) {
+            return Ok(tick);
+        }
+        tick.enabled = true;
+        let tasks = store.tasks()?;
+        for id in candidates(&tasks)? {
+            match self.lease(&tasks, &id, now) {
+                Err(TaskError::LeaseHeld { .. }) => tick.leased_elsewhere.push(id),
+                Err(error) => tick.errors.push(format!("{id}: {error}")),
+                Ok(()) => {
+                    if let Err(error) = self.step(store, &id, launcher, now, &mut tick) {
+                        tick.errors.push(format!("{id}: {error}"));
+                    }
+                }
+            }
+        }
+        Ok(tick)
+    }
+
+    /// Takes or renews the task's lease. Called again right before each
+    /// dispatch, so a holder that lost it never starts a worker.
+    pub(super) fn lease(&self, tasks: &TaskStore<'_>, id: &str, now: u64) -> Result<(), TaskError> {
+        tasks
+            .acquire_lease(&lease_resource(id), &self.holder, LEASE_TTL_MS, now)
+            .map(|_| ())
+    }
+
+    fn step(
+        &self,
+        store: &Store,
+        id: &str,
+        launcher: &dyn Launcher,
+        now: u64,
+        tick: &mut Tick,
+    ) -> Result<(), TaskError> {
+        let tasks = store.tasks()?;
+        let Some(mut task) = tasks.task(id)? else {
+            return Ok(());
+        };
+        if task.stage == TaskStage::Ready {
+            if task.lifecycle != TaskLifecycle::Active || !self.policy.automatic_execution(&task) {
+                return Ok(());
+            }
+            let implementing = State::Stage(TaskStage::Implementing);
+            tasks.transition(
+                Subject::Task(id),
+                implementing,
+                Requester::Coordinator,
+                task.revision,
+                now,
+            )?;
+            task = tasks
+                .task(id)?
+                .ok_or_else(|| TaskError::NotFound(format!("task:{id}")))?;
+        }
+        for assignment in tasks.assignments(id)? {
+            self.reconcile(store, &task, &assignment, launcher, now, tick)?;
+        }
+        if task.lifecycle == TaskLifecycle::Active {
+            self.schedule(store, &task, launcher, now, tick)?;
+        }
+        Ok(())
+    }
+
+    /// Launches Ready assignments up to the policy's limit, never two with
+    /// overlapping file scopes at once. Queued ones become Ready once their
+    /// dependencies are accepted.
+    fn schedule(
+        &self,
+        store: &Store,
+        task: &Task,
+        launcher: &dyn Launcher,
+        now: u64,
+        tick: &mut Tick,
+    ) -> Result<(), TaskError> {
+        let tasks = store.tasks()?;
+        let ready = State::Assignment(AssignmentState::Ready);
+        for assignment in tasks.assignments(&task.id)? {
+            if assignment.status != AssignmentState::Queued {
+                continue;
+            }
+            let subject = Subject::Assignment {
+                task: &task.id,
+                id: &assignment.id,
+            };
+            match tasks.transition(
+                subject,
+                ready,
+                Requester::Coordinator,
+                assignment.revision,
+                now,
+            ) {
+                Ok(_) | Err(TaskError::Precondition(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let assignments = tasks.assignments(&task.id)?;
+        let mut active: Vec<&[String]> = assignments
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    AssignmentState::Running | AssignmentState::WaitingForDecision
+                )
+            })
+            .map(|a| a.files.as_slice())
+            .collect();
+        let limit = self.policy.worker_limit(task);
+        for assignment in assignments
+            .iter()
+            .filter(|a| a.status == AssignmentState::Ready)
+        {
+            if active.len() >= limit {
+                break;
+            }
+            if active
+                .iter()
+                .any(|files| crate::orchestration::overlaps(files, &assignment.files))
+            {
+                continue;
+            }
+            let Some(attempt) = self.begin_launch(store, task, assignment, now)? else {
+                return Ok(());
+            };
+            self.dispatch(store, task, &attempt, launcher, now, tick)?;
+            active.push(&assignment.files);
+        }
+        Ok(())
+    }
+}
+
+/// Tasks that may have work to launch or results to observe.
+fn candidates(tasks: &TaskStore<'_>) -> Result<Vec<String>, TaskError> {
+    let mut statement = tasks.conn.prepare(
+        "SELECT id FROM native_tasks WHERE stage IN ('ready','implementing')
+           AND lifecycle NOT IN ('cancelled','completed') ORDER BY rowid",
+    )?;
+    let ids = statement.query_map([], |row| row.get(0))?;
+    Ok(ids.collect::<Result<_, _>>()?)
+}
+
+/// The assignment's newest attempt by insertion order.
+pub(super) fn latest_attempt(
+    tasks: &TaskStore<'_>,
+    task_id: &str,
+    assignment_id: &str,
+) -> Result<Option<Attempt>, TaskError> {
+    Ok(tasks.attempts(task_id, assignment_id)?.pop())
+}
+
+/// Whether the attempt's launch has not reached a session yet.
+pub(super) fn in_flight(attempt: &Attempt) -> bool {
+    matches!(
+        attempt.status,
+        AttemptState::Created | AttemptState::Starting
+    )
+}
+
+#[cfg(test)]
+#[path = "coordinator_tests.rs"]
+mod tests;
