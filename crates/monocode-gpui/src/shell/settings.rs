@@ -370,8 +370,25 @@ impl Shell {
             });
         }
         self.usage_footer.update(cx, |footer, cx| {
-            footer.set_remaining(self.workspace.preferences.show_remaining_usage, cx)
+            footer.set_remaining(self.workspace.preferences.show_remaining_usage, cx);
+            footer.set_api_keys(self.workspace.preferences.api_key_enabled.clone(), cx);
         });
+    }
+    /// The footer's API button and the Mono settings switch change the same
+    /// preference the Settings page edits.
+    pub(crate) fn set_api_key_billing(&mut self, kind: Kind, on: bool, cx: &mut Context<Self>) {
+        if self.workspace.preferences.api_key_enabled(kind) == on {
+            return;
+        }
+        self.workspace
+            .preferences
+            .api_key_enabled
+            .insert(kind.id().to_owned(), on);
+        self.apply_preferences(cx);
+        self.persist(cx);
+        self.sync_settings(cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
     }
     fn choose_chat_background(&mut self, cx: &mut Context<Self>) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {

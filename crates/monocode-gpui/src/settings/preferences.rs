@@ -1,5 +1,6 @@
 //! App-wide preferences the Settings pages edit. Defaults are the React
 //! app's (`settings.ts`, `appearance.ts`, `displayPrefs.ts`, `sounds.ts`).
+use monocode_core::provider::Kind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -85,6 +86,16 @@ pub(crate) struct Preferences {
     pub show_archived: bool,
     // Keybindings: a changed shortcut, or `None` for a disabled one.
     pub keybindings: HashMap<String, Option<String>>,
+    /// "Use API key" per provider id: turns bill the saved key, not the login.
+    pub api_key_enabled: HashMap<String, bool>,
+}
+impl Preferences {
+    pub(crate) fn api_key_enabled(&self, kind: Kind) -> bool {
+        self.api_key_enabled
+            .get(kind.id())
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 pub(crate) const UI_SCALE_PERCENTS: [u32; 16] = [
@@ -159,6 +170,7 @@ impl Default for Preferences {
             mono_menu_bar_icon: true,
             show_archived: false,
             keybindings: HashMap::new(),
+            api_key_enabled: HashMap::new(),
         }
     }
 }
@@ -221,5 +233,23 @@ impl Preferences {
         hidden.sort();
         hidden.dedup();
         hidden
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monocode_core::provider::Kind;
+
+    #[test]
+    fn api_key_billing_is_off_until_a_provider_is_switched_on() {
+        let mut prefs = Preferences::default();
+        assert!(!prefs.api_key_enabled(Kind::Claude));
+        prefs.api_key_enabled.insert("claude".into(), true);
+        assert!(prefs.api_key_enabled(Kind::Claude));
+        assert!(!prefs.api_key_enabled(Kind::Codex));
+        let restored: Preferences =
+            serde_json::from_str(r#"{"api_key_enabled":{"codex":true}}"#).unwrap();
+        assert!(restored.api_key_enabled(Kind::Codex));
     }
 }

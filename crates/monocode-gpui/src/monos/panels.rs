@@ -1716,12 +1716,65 @@ impl Monos {
                     self.switch("mono-show-started",mono.show_started_sessions_in_sidebar,false,|m,on|m.show_started_sessions_in_sidebar=on,cx)))
                 .child(switch_setting("Group in a folder",&format!("Sessions it starts go in a “{}” folder in your project sidebar.",mono.label()),!mono.show_started_sessions_in_sidebar,
                     self.switch("mono-group-started",mono.show_started_sessions_in_sidebar&&mono.use_sidebar_folders,!mono.show_started_sessions_in_sidebar,|m,on|m.use_sidebar_folders=on,cx))
-                    .border_t_1().border_color(content(0.04))))
+                    .border_t_1().border_color(content(0.04)))
+                .children(self.api_key_setting(Kind::from_id(&provider), cx)))
             .child(heading("Conversation",None))
             .child(card().child(setting("Reset conversation",Some("Clear all messages and start fresh. Its soul, memory and habits stay."),
                 div().id("mono-reset").role(Role::Button).aria_label("Reset").flex().items_center().px_3().py_1p5().rounded_md().text_size(px(12.)).border_1().border_color(content(0.04)).text_color(rgb(0xff6467)).hover(|s|s.bg(rgb(0xfb2c36).opacity(0.1))).child("Reset")
                     .on_click(cx.listener(move |this,_,w,cx|this.reset_conversation(&reset,w,cx))).into_any_element())))
             .into_any_element()
+    }
+    /// "Use <provider> API key": the same global switch as the footer and
+    /// Settings › Providers, so this Mono's next turn bills the saved key.
+    fn api_key_setting(&self, kind: Kind, cx: &mut Context<Self>) -> Option<Div> {
+        if !monocode_core::api_keys::supports(kind) {
+            return None;
+        }
+        let configured = monocode_core::api_keys::status(kind).is_ok_and(|s| s.configured);
+        let on = configured && self.prefs.api_key_enabled(kind);
+        let description = if configured {
+            "Bills the saved key instead of the login for every conversation on this provider, including this Mono, on its next turn.".to_owned()
+        } else {
+            format!(
+                "Save a {} API key in Settings › Providers to use API billing.",
+                kind.label()
+            )
+        };
+        let control = div()
+            .id("mono-use-api-key")
+            .debug_selector(|| "mono-use-api-key".into())
+            .role(Role::Switch)
+            .aria_label(format!("Use {} API key", kind.label()))
+            .aria_selected(on)
+            .w(px(36.))
+            .h(px(20.))
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(if on { accent_color() } else { content(0.2) })
+            .child(
+                div()
+                    .size(px(16.))
+                    .mt(px(2.))
+                    .ml(px(if on { 18. } else { 2. }))
+                    .rounded_full()
+                    .bg(gpui::white()),
+            )
+            .on_click(cx.listener(move |_, _, _, cx| {
+                if configured {
+                    cx.emit(ApiKeyToggled(kind, !on));
+                }
+            }))
+            .into_any_element();
+        Some(
+            switch_setting(
+                &format!("Use {} API key", kind.label()),
+                &description,
+                !configured,
+                control,
+            )
+            .border_t_1()
+            .border_color(content(0.04)),
+        )
     }
     fn switch(
         &self,

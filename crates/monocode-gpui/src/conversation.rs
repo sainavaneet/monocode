@@ -1072,6 +1072,9 @@ impl Conversation {
         settings.disable_claude_hooks = cx
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|p| !p.claude_hooks);
+        settings.use_api_key = cx
+            .try_global::<crate::settings::Preferences>()
+            .is_some_and(|p| p.api_key_enabled(Kind::from_id(&self.summary.provider)));
         settings.model = self.model.clone();
         settings.environment.extend(self.app_environment.clone());
         if settings.remote_action.as_ref().is_none_or(|action| {

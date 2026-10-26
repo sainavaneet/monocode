@@ -40,6 +40,13 @@ fn index(kind: Kind) -> usize {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum UsageFooterEvent {
+    /// The API button beside the chip: bill the saved key, or the login again.
+    ApiKey { kind: Kind, on: bool },
+}
+impl gpui::EventEmitter<UsageFooterEvent> for UsageFooter {}
+const API_KEY_MISSING: &str = "Add an API key in Settings → Providers first.";
 /// Its own cached surface: clock ticks and probe completions don't rebuild chat.
 pub(crate) struct UsageFooter {
     kind: Kind,
@@ -60,6 +67,10 @@ pub(crate) struct UsageFooter {
     /// UsageFooter's `footer` variant: the classic layout's bordered strip.
     classic: bool,
     show_remaining: bool,
+    /// "Use API key" per provider id, mirrored from the preferences.
+    api_keys: std::collections::HashMap<String, bool>,
+    /// Why the API button did not switch on, until dismissed.
+    api_key_note: Option<String>,
     _clock: gpui::Task<()>,
 }
 impl UsageFooter {
@@ -79,6 +90,7 @@ impl UsageFooter {
             self.kind = kind;
             self.key = key;
             self.open = false;
+            self.api_key_note = None;
             self.show_accounts = false;
             self.confirm_reset = None;
             self.cache[index(kind)] = Default::default();
@@ -152,10 +164,117 @@ impl UsageFooter {
             open: false,
             classic: false,
             show_remaining: false,
+            api_keys: Default::default(),
+            api_key_note: None,
             _clock: clock,
         };
         this.refresh(false, cx);
         this
+    }
+    pub(crate) fn set_api_keys(
+        &mut self,
+        keys: std::collections::HashMap<String, bool>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.api_keys != keys {
+            self.api_keys = keys;
+            cx.notify();
+        }
+    }
+    fn api_key_enabled(&self) -> bool {
+        self.api_keys.get(self.kind.id()).copied().unwrap_or(false)
+    }
+    /// Switching on needs a saved key; otherwise the chat would quietly stay
+    /// on the login. Switching off never needs one.
+    fn toggle_api_key(&mut self, cx: &mut Context<Self>) {
+        let kind = self.kind;
+        if self.api_key_enabled() {
+            self.api_key_note = None;
+            cx.emit(UsageFooterEvent::ApiKey { kind, on: false });
+        } else {
+            match monocode_core::api_keys::status(kind) {
+                Ok(status) if status.configured => {
+                    self.api_key_note = None;
+                    cx.emit(UsageFooterEvent::ApiKey { kind, on: true });
+                }
+                Ok(_) => self.api_key_note = Some(API_KEY_MISSING.into()),
+                Err(error) => self.api_key_note = Some(error),
+            }
+        }
+        cx.notify();
+    }
+    fn api_key_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let on = self.api_key_enabled();
+        let label = format!("Use {} API key", self.kind.label());
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .id("api-key-toggle")
+                    .debug_selector(|| "api-key-toggle".into())
+                    .role(Role::Button)
+                    .aria_label(label)
+                    .aria_description(if on {
+                        "API billing on. Click to use the plan for this provider's chats and Monos on their next turn."
+                    } else {
+                        "API billing off. Click to use the saved API key for this provider's chats and Monos on their next turn."
+                    })
+                    .h(px(20.))
+                    .px(px(6.))
+                    .rounded_md()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .text_size(px(10.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .map(|d| {
+                        if on {
+                            d.bg(content(0.12)).text_color(content(0.95))
+                        } else {
+                            d.text_color(content(0.4)).hover(|s| s.bg(content(0.08)))
+                        }
+                    })
+                    .child(
+                        div()
+                            .size(px(4.))
+                            .rounded_full()
+                            .bg(content(if on { 0.95 } else { 0.25 })),
+                    )
+                    .child("API")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_api_key(cx))),
+            )
+            .when_some(self.api_key_note.clone(), |d, note| {
+                d.child(
+                    div()
+                        .id("api-key-note")
+                        .debug_selector(|| "api-key-note".into())
+                        .role(Role::Alert)
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .text_size(px(10.))
+                        .text_color(content(0.7))
+                        .child(note)
+                        .child(
+                            div()
+                                .id("dismiss-api-key-note")
+                                .role(Role::Button)
+                                .aria_label("Dismiss API key message")
+                                .cursor_pointer()
+                                .text_color(content(0.45))
+                                .child("×")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.api_key_note = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .into_any_element()
     }
     pub(crate) fn set_remaining(&mut self, remaining: bool, cx: &mut Context<Self>) {
         if self.show_remaining != remaining {
@@ -187,6 +306,7 @@ impl UsageFooter {
     pub(crate) fn provider(&mut self, kind: Kind, cx: &mut Context<Self>) {
         if self.kind != kind {
             self.kind = kind;
+            self.api_key_note = None;
             self.key = Key::new(kind, Default::default(), None);
             self.open = false;
             self.refresh(false, cx);
@@ -948,6 +1068,9 @@ impl Render for UsageFooter {
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(true, cx)))
                     .on_action(cx.listener(|this, _: &RefreshUsage, _, cx| this.refresh(true, cx))),
             )
+            .when(monocode_core::api_keys::supports(self.kind), |d| {
+                d.child(self.api_key_button(cx))
+            })
             .when(self.open, |d| {
                 d.child(
                     popover("usage-details", Anchor::Slot(self.anchor.clone()))
@@ -972,6 +1095,88 @@ impl Render for UsageFooter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::RefCell, rc::Rc};
+
+    #[gpui::test]
+    fn api_key_toggle_needs_a_saved_key_and_reports_the_change(cx: &mut gpui::TestAppContext) {
+        use monocode_core::api_keys;
+        cx.update(bind);
+        api_keys::init(
+            std::env::temp_dir().join(format!("monocode-api-keys-{}", std::process::id())),
+        );
+        api_keys::clear(Kind::Codex).unwrap();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| UsageFooter::new(Kind::Codex, cx))
+            })
+            .unwrap()
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        window
+            .update(cx, |_, _, cx| {
+                let footer = cx.entity();
+                cx.subscribe(&footer, move |_, _, event: &UsageFooterEvent, _| {
+                    sink.borrow_mut().push(event.clone());
+                })
+                .detach();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        let toggle = visual.debug_bounds("api-key-toggle").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        assert!(
+            events.borrow().is_empty(),
+            "no key saved, so nothing switches on"
+        );
+        assert!(
+            visual.debug_bounds("api-key-note").is_some(),
+            "the refusal explains where to add a key"
+        );
+
+        api_keys::set(Kind::Codex, "sk-test-1234").unwrap();
+        let toggle = visual.debug_bounds("api-key-toggle").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(
+            events.borrow().as_slice(),
+            [UsageFooterEvent::ApiKey {
+                kind: Kind::Codex,
+                on: true
+            }]
+        );
+        assert!(visual.debug_bounds("api-key-note").is_none());
+
+        window
+            .update(visual, |footer, _, cx| {
+                footer.set_api_keys([("codex".to_owned(), true)].into_iter().collect(), cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        let toggle = visual.debug_bounds("api-key-toggle").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(
+            events.borrow().last(),
+            Some(&UsageFooterEvent::ApiKey {
+                kind: Kind::Codex,
+                on: false
+            })
+        );
+
+        window
+            .update(visual, |footer, _, cx| footer.provider(Kind::Pi, cx))
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(
+            visual.debug_bounds("api-key-toggle").is_none(),
+            "Pi has no API key billing"
+        );
+        api_keys::clear(Kind::Codex).unwrap();
+    }
+
     #[gpui::test]
     fn details_open_with_keyboard_escape_restores_focus_and_provider_caches_stay_separate(
         cx: &mut gpui::TestAppContext,

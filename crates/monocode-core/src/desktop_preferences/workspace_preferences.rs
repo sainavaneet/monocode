@@ -271,6 +271,21 @@ impl DesktopPreferences {
             .map(|v| v["showArchived"] == true)
             .unwrap_or_else(|| self.flag("sessionsShowArchived").unwrap_or(false));
         reconcile_preference(target, baseline, next, "show_archived", json!(archived));
+        let mut api_keys = Map::new();
+        for provider in ["claude", "codex"] {
+            if let Some(on) = self.flag(&format!("apiKeyEnabled.{provider}")) {
+                api_keys.insert(provider.to_owned(), json!(on));
+            }
+        }
+        if !api_keys.is_empty() {
+            reconcile_preference(
+                target,
+                baseline,
+                next,
+                "api_key_enabled",
+                Value::Object(api_keys),
+            );
+        }
         let keys: Map<String, Value> = self
             .json("monocode.keybindingOverrides")
             .as_ref()
@@ -675,11 +690,15 @@ mod tests {
                 "monocode.keybindingOverrides",
                 r#"{"App: Search":{"shortcut":"Command+KeyJ"},"App: Settings":{"disabled":true}}"#,
             ),
+            ("monocode.apiKeyEnabled.codex", "1"),
+            ("monocode.apiKeyEnabled.claude", "0"),
         ]);
         let mut workspace = json!({});
         preferences.apply_workspace(&mut workspace);
         let settings = &workspace["preferences"];
         assert_eq!(settings["sounds"], false);
+        assert_eq!(settings["api_key_enabled"]["codex"], true);
+        assert_eq!(settings["api_key_enabled"]["claude"], false);
         assert_eq!(settings["theme"], "light");
         assert_eq!(settings["workspace_theme"], "tidepool");
         assert_eq!(settings["sidebar_opacity"], 42);

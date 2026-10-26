@@ -52,6 +52,8 @@ use std::{
 pub(crate) struct Changed;
 pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
+/// The General settings "Use API key" switch: the shared preference changes.
+pub(crate) struct ApiKeyToggled(pub Kind, pub bool);
 pub(crate) use notifications::{NotificationChanged, NotificationFinished};
 #[derive(Clone, PartialEq)]
 pub(crate) struct OverviewChrome {
@@ -151,6 +153,7 @@ pub(crate) struct Monos {
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
+impl EventEmitter<ApiKeyToggled> for Monos {}
 impl Monos {
     pub(crate) fn resource_sessions(
         &self,

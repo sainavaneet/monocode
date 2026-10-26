@@ -1,13 +1,159 @@
 use crate::{
+    input::Input,
     settings::{
         SettingsView,
         widgets::{note, secondary_button},
     },
     theme::*,
 };
-use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
-use monocode_core::provider::Kind;
+use gpui::{AnyElement, Context, Entity, SharedString, div, prelude::*, px};
+use monocode_core::{api_keys, provider::Kind};
+/// Static ids for the API key rows: row, toggle, input, save, clear.
+fn api_key_ids(
+    kind: Kind,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    match kind {
+        Kind::Codex => (
+            "api-key-codex",
+            "api-key-codex",
+            "settings-api-key-codex-input",
+            "api-key-codex-save",
+            "api-key-codex-clear",
+        ),
+        _ => (
+            "api-key-claude",
+            "api-key-claude",
+            "settings-api-key-claude-input",
+            "api-key-claude-save",
+            "api-key-claude-clear",
+        ),
+    }
+}
 impl SettingsView {
+    pub(crate) fn api_key_input(&mut self, kind: Kind, cx: &mut Context<Self>) -> Entity<Input> {
+        self.api_key_inputs
+            .entry(kind)
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    let mut field = Input::field(
+                        format!("{} API key", kind.label()),
+                        "Paste key",
+                        content(0.4),
+                        cx,
+                    );
+                    field.set_secret(true);
+                    field
+                })
+            })
+            .clone()
+    }
+    fn save_api_key(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        let input = self.api_key_input(kind, cx);
+        let key = input.read(cx).content.to_string();
+        match api_keys::set(kind, &key) {
+            Ok(status) => {
+                self.api_key_notice = None;
+                input.update(cx, |input, cx| input.set_text(String::new(), cx));
+                if !status.configured && self.prefs.api_key_enabled(kind) {
+                    self.update(cx, |p| {
+                        p.api_key_enabled.insert(kind.id().to_owned(), false);
+                    });
+                }
+            }
+            Err(error) => self.api_key_notice = Some((kind, error)),
+        }
+        cx.notify();
+    }
+    fn clear_api_key(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        match api_keys::clear(kind) {
+            Ok(_) => {
+                self.api_key_notice = None;
+                // Never leave the switch on without a key behind it.
+                self.update(cx, |p| {
+                    p.api_key_enabled.insert(kind.id().to_owned(), false);
+                });
+            }
+            Err(error) => self.api_key_notice = Some((kind, error)),
+        }
+        cx.notify();
+    }
+    fn api_key_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let p = self.prefs.clone();
+        let mut rows = Vec::new();
+        for (ix, kind) in [Kind::Claude, Kind::Codex].into_iter().enumerate() {
+            let status = api_keys::status(kind);
+            let configured = status.as_ref().is_ok_and(|s| s.configured);
+            let summary = match (&self.api_key_notice, &status) {
+                (Some((noted, text)), _) if *noted == kind => text.clone(),
+                (_, Ok(s)) if s.configured => format!(
+                    "Key ending in …{}. Set as {}.",
+                    s.hint.clone().unwrap_or_default(),
+                    api_keys::env_var(kind).unwrap_or_default()
+                ),
+                (_, Ok(_)) => format!(
+                    "No key saved. The CLI keeps using your {} login.",
+                    kind.label()
+                ),
+                (_, Err(error)) => error.clone(),
+            };
+            let (row_id, toggle_id, input_id, save_id, clear_id) = api_key_ids(kind);
+            let input = self.api_key_input(kind, cx);
+            let mut controls = vec![
+                self.toggle(
+                    toggle_id,
+                    format!("Use {} API key", kind.label()),
+                    configured && p.api_key_enabled(kind),
+                    !configured,
+                    cx,
+                    move |this, on, cx| {
+                        this.update(cx, |p| {
+                            p.api_key_enabled.insert(kind.id().to_owned(), on);
+                        })
+                    },
+                ),
+                div()
+                    .id(input_id)
+                    .debug_selector(move || input_id.into())
+                    .w(px(208.))
+                    .h(px(28.))
+                    .px_2()
+                    .rounded_md()
+                    .bg(content(0.05))
+                    .flex()
+                    .items_center()
+                    .child(input)
+                    .into_any_element(),
+                secondary_button(save_id, "Save", false, false)
+                    .debug_selector(move || format!("settings-{save_id}"))
+                    .child("Save")
+                    .on_click(cx.listener(move |this, _, _, cx| this.save_api_key(kind, cx)))
+                    .into_any_element(),
+            ];
+            if configured {
+                controls.push(
+                    secondary_button(clear_id, "Clear", true, false)
+                        .debug_selector(move || format!("settings-{clear_id}"))
+                        .child("Clear")
+                        .on_click(cx.listener(move |this, _, _, cx| this.clear_api_key(kind, cx)))
+                        .into_any_element(),
+                );
+            }
+            let label = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(provider_icon(kind.id(), 16.))
+                .child(format!("{} API key", kind.label()));
+            rows.push(self.row(Some(row_id), ix == 0, label, Some(summary.into()), controls));
+        }
+        rows
+    }
     pub(super) fn providers_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = self.prefs.clone();
         let accounts = if let Some(center) = crate::accounts::get(cx) {
@@ -77,6 +223,7 @@ impl SettingsView {
                 cx.notify();
             },
         );
+        let api_key_rows = self.api_key_rows(cx);
         let binaries = self.discovery.binaries.clone();
         let mut clis = Vec::new();
         for (index, kind) in Kind::ALL.into_iter().enumerate() {
@@ -292,6 +439,14 @@ impl SettingsView {
                 accounts,
             ),
             self.group(None, false, "Usage and privacy", None, None, usage),
+            self.group(
+                Some("api-keys"),
+                false,
+                "API keys",
+                Some("Bill a provider's API key instead of its subscription login. Saved keys stay on this Mac in a file only you can read and are handed to the CLI as an environment variable. Use API key takes effect on a conversation's next turn and keeps the same conversation.".into()),
+                None,
+                api_key_rows,
+            ),
             self.group(
                 Some("agent-clis"),
                 false,

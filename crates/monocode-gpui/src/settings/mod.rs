@@ -232,6 +232,10 @@ pub(crate) struct SettingsView {
     mcp_show_all: bool,
     mcp_remove_scopes: HashMap<String, String>,
     mcp_busy: bool,
+    /// Masked key fields on the Providers page, one per API-key provider.
+    api_key_inputs: HashMap<monocode_core::provider::Kind, Entity<Input>>,
+    /// The last save or clear error for a provider's key row.
+    api_key_notice: Option<(monocode_core::provider::Kind, String)>,
     mcp_health: Option<Task<()>>,
     discovery: data::Discovery,
     discovery_loading: bool,
@@ -367,6 +371,8 @@ impl SettingsView {
             mcp_show_all: false,
             mcp_remove_scopes: HashMap::new(),
             mcp_busy: false,
+            api_key_inputs: HashMap::new(),
+            api_key_notice: None,
             mcp_health: None,
             discovery: data::Discovery::default(),
             discovery_loading: false,

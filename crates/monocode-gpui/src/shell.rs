@@ -1111,6 +1111,20 @@ impl Shell {
         );
         this.observations.push(cx.subscribe(
             &monos,
+            |this, _, event: &crate::monos::ApiKeyToggled, cx| {
+                this.set_api_key_billing(event.0, event.1, cx);
+            },
+        ));
+        let footer = this.usage_footer.clone();
+        this.observations.push(cx.subscribe(
+            &footer,
+            |this, _, event: &crate::usage_footer::UsageFooterEvent, cx| {
+                let crate::usage_footer::UsageFooterEvent::ApiKey { kind, on } = event;
+                this.set_api_key_billing(*kind, *on, cx);
+            },
+        ));
+        this.observations.push(cx.subscribe(
+            &monos,
             |this, _, opened: &crate::monos::TabOpened, cx| {
                 this.mono_opened(opened.0.clone(), cx);
             },
@@ -8689,6 +8703,57 @@ mod tests {
         assert!(visual.debug_bounds("resource-dialog").is_none());
         assert!(visual.debug_bounds("resource-pressure-chip").is_some());
     }
+    #[gpui::test]
+    fn footer_api_key_toggle_updates_and_persists_the_preference(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(!shell.workspace.preferences.api_key_enabled(Kind::Claude));
+                shell.usage_footer.update(cx, |_, cx| {
+                    cx.emit(crate::usage_footer::UsageFooterEvent::ApiKey {
+                        kind: Kind::Claude,
+                        on: true,
+                    })
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.workspace.preferences.api_key_enabled(Kind::Claude));
+                assert!(
+                    cx.global::<crate::settings::Preferences>()
+                        .api_key_enabled(Kind::Claude)
+                );
+                let saved = locked(&shell.store).unwrap().ui_state().unwrap().unwrap();
+                assert!(saved.contains("\"api_key_enabled\""));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn mono_settings_api_key_switch_updates_the_shared_preference(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let monos = shell.monos.clone().expect("monos are enabled by default");
+                monos.update(cx, |_, cx| {
+                    cx.emit(crate::monos::ApiKeyToggled(Kind::Codex, true))
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.workspace.preferences.api_key_enabled(Kind::Codex));
+                assert!(
+                    cx.global::<crate::settings::Preferences>()
+                        .api_key_enabled(Kind::Codex)
+                );
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn usage_footer_follows_active_tabs_and_provider_changes(cx: &mut TestAppContext) {
         let (window, a, b) = window(cx);

@@ -194,3 +194,92 @@ fn mono_mascot_is_beside_name_and_sidebar_switch_stays_visible(cx: &mut TestAppC
     assert_eq!(switch.size, size(px(36.), px(20.)));
     assert!(switch.right() <= px(700.));
 }
+
+#[gpui::test]
+fn providers_page_saves_clears_and_enables_api_keys(cx: &mut TestAppContext) {
+    use monocode_core::{api_keys, provider::Kind};
+    use std::{cell::RefCell, rc::Rc};
+    api_keys::init(std::env::temp_dir().join(format!("monocode-api-keys-{}", std::process::id())));
+    api_keys::clear(Kind::Claude).unwrap();
+    let window = window(Section::Providers, cx);
+    let changes = Rc::new(RefCell::new(Vec::new()));
+    let sink = changes.clone();
+    window
+        .update(cx, |_, _, cx| {
+            let view = cx.entity();
+            cx.subscribe(&view, move |_, _, event: &SettingsEvent, _| {
+                if let SettingsEvent::Changed(prefs) = event {
+                    sink.borrow_mut().push(*prefs.clone());
+                }
+            })
+            .detach();
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    assert!(
+        visual
+            .debug_bounds("settings-api-key-claude-input")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("settings-api-key-claude-clear")
+            .is_none(),
+        "nothing to clear yet"
+    );
+
+    window
+        .update(visual, |view, _, cx| {
+            let input = view.api_key_input(Kind::Claude, cx);
+            input.update(cx, |input, cx| {
+                input.set_text("sk-ant-test-9876".into(), cx)
+            });
+        })
+        .unwrap();
+    visual.refresh().unwrap();
+    let save = visual.debug_bounds("settings-api-key-claude-save").unwrap();
+    visual.simulate_click(save.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(
+        api_keys::status(Kind::Claude).unwrap().hint.as_deref(),
+        Some("9876")
+    );
+    window
+        .update(visual, |view, _, cx| {
+            assert_eq!(
+                view.api_key_input(Kind::Claude, cx).read(cx).content,
+                "",
+                "the field clears after saving"
+            );
+        })
+        .unwrap();
+
+    let toggle = visual
+        .debug_bounds("settings-toggle-api-key-claude")
+        .unwrap();
+    visual.simulate_click(toggle.center(), Default::default());
+    visual.run_until_parked();
+    assert!(
+        changes
+            .borrow()
+            .last()
+            .unwrap()
+            .api_key_enabled(Kind::Claude)
+    );
+
+    let clear = visual
+        .debug_bounds("settings-api-key-claude-clear")
+        .unwrap();
+    visual.simulate_click(clear.center(), Default::default());
+    visual.run_until_parked();
+    assert!(!api_keys::status(Kind::Claude).unwrap().configured);
+    assert!(
+        !changes
+            .borrow()
+            .last()
+            .unwrap()
+            .api_key_enabled(Kind::Claude),
+        "clearing the key switches billing back to the login"
+    );
+}
