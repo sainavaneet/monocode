@@ -63,7 +63,7 @@ fn review_claims(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> 
 /// acceptance criteria, again running the checks without the store lock.
 fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> Result<(), String> {
     let now = monocode_core::time::now_ms;
-    let jobs = {
+    let (jobs, errors) = {
         let store = locked(store)?;
         if !tasks::coordinator::enabled(&store) {
             return Ok(());
@@ -72,11 +72,21 @@ fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> R
             .verify_jobs(&store, now())
             .map_err(|e| e.to_string())?
     };
+    // A task that could not be prepared is skipped; the others still run.
+    for error in errors {
+        eprintln!("Task coordinator verification {error}");
+    }
+    // Each failure to record counts toward the round's retry limit, after
+    // which Mono gets the task instead of the checks running again.
     for job in jobs {
         let inspection = job.inspect();
         let store = locked(store)?;
         if let Err(error) = coordinator.record_round(&store, &job, inspection, now()) {
             eprintln!("Task coordinator verification: {error}");
+            let error = error.to_string();
+            if let Err(failed) = coordinator.round_failed(&store, &job, &error, now()) {
+                eprintln!("Task coordinator verification: {failed}");
+            }
         }
     }
     Ok(())
