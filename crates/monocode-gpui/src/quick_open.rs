@@ -277,6 +277,18 @@ impl QuickOpen {
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         scored.into_iter().map(|(_, row)| row).collect()
     }
+    /// Only file search waits on the listing; the other modes are in memory.
+    fn empty_message(&self, cx: &App) -> String {
+        if self.mode(cx) == Mode::Files {
+            if self.loading {
+                return "Loading project files…".to_owned();
+            }
+            if let Some(error) = &self.error {
+                return error.clone();
+            }
+        }
+        "No results".to_owned()
+    }
     fn is_active_project(&self, ix: usize) -> bool {
         self.rows
             .get(ix)
@@ -419,11 +431,7 @@ impl Render for QuickOpen {
                                 .py_6()
                                 .text_size(px(13.))
                                 .text_color(content(0.45))
-                                .child(if self.loading {
-                                    "Loading project files…".to_owned()
-                                } else {
-                                    self.error.clone().unwrap_or_else(|| "No results".into())
-                                }),
+                                .child(self.empty_message(cx)),
                         )
                     }),
             )
@@ -563,6 +571,23 @@ mod tests {
             "@"
         );
         assert_eq!(placeholder(&picker, cx), "Switch project…");
+    }
+
+    #[gpui::test]
+    fn an_unmatched_project_query_says_no_results_not_loading(cx: &mut TestAppContext) {
+        let picker = open(Mode::Projects, vec![row("/a", "alpha", false)], cx);
+        set(&picker, "@zzz", cx);
+        assert!(labels(&picker, cx).is_empty());
+        assert_eq!(
+            cx.update(|cx| picker.read(cx).empty_message(cx)),
+            "No results"
+        );
+        // File mode still reports a listing that is in flight.
+        let files = open(Mode::Files, Vec::new(), cx);
+        assert_eq!(
+            cx.update(|cx| files.read(cx).empty_message(cx)),
+            "Loading project files…"
+        );
     }
 
     #[gpui::test]
