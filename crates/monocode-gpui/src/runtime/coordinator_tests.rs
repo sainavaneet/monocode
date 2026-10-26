@@ -411,11 +411,14 @@ fn startup_interrupts_workers_that_died_with_the_last_run() {
     let store = Store::open(Path::new(":memory:")).unwrap();
     store.save_setting(FLAG, "enabled").unwrap();
     monocode_core::tasks::fixtures::running_worker(&store, "mono-1", "/work/monocode").unwrap();
-    // The run that quit held the task's lease; it has long expired.
+    // The run that quit held the task's lease; its process has exited.
+    let mut quit = Command::new("true").spawn().unwrap();
+    let pid = quit.id();
+    quit.wait().unwrap();
     store
         .tasks()
         .unwrap()
-        .acquire_lease("task:t", "monocode-native:quit", 1, 0)
+        .acquire_lease("task:t", &format!("monocode-native:{pid}:quit"), 1, 0)
         .unwrap();
     let store: Database = std::sync::Arc::new(std::sync::Mutex::new(store));
     super::coordinator::reconcile_startup(store.clone())

@@ -77,6 +77,26 @@ impl Conversation {
         .detach();
     }
 
+    /// Shows, once loaded (also after a restart), whether this session is a
+    /// task worker its task no longer owns.
+    pub(crate) fn refresh_detached(&mut self, cx: &mut Context<Self>) {
+        if self.settings.mono.is_some() || self.is_remote() {
+            return;
+        }
+        let store = self.store.clone();
+        let session = self.summary.id;
+        let work = cx.background_executor().spawn(async move {
+            let store = locked(&store)?;
+            lifecycle::detached(&store, session).map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(notice)) = work.await {
+                let _ = this.update(cx, |this, cx| this.show_detached(notice, cx));
+            }
+        })
+        .detach();
+    }
+
     /// Shows that this worker session no longer belongs to its task.
     pub(crate) fn show_detached(&mut self, notice: String, cx: &mut Context<Self>) {
         if self.busy {

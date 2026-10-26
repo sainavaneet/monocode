@@ -819,6 +819,7 @@ impl Conversation {
                         this.sync_review(cx);
                         this.run_history_actions(cx);
                         this.pump_follow_ups(cx);
+                        this.refresh_detached(cx);
                     }
                     Err(e) => this.status = e,
                 }

@@ -12,6 +12,7 @@ use monocode_core::tasks;
 use monocode_core::tasks::coordinator::{Coordinator, ExplicitStart, Launcher, TICK_INTERVAL_MS};
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Where coordinator launches are installed (the latest Shell to start its
@@ -240,16 +241,13 @@ fn coordinator() -> &'static Coordinator<ExplicitStart> {
 /// Interrupted, check recorded worktrees, restore waiting decisions, and
 /// leave paused tasks paused. The ticker then resumes what the policy allows.
 pub(crate) fn reconcile_startup(store: Database) -> Option<std::thread::JoinHandle<()>> {
+    STARTING.store(true, Ordering::SeqCst);
     let spawned = std::thread::Builder::new()
         .name("task-startup".into())
         .spawn(move || {
-            let now = monocode_core::time::now_ms();
-            let startup = locked(&store).and_then(|store| {
-                coordinator()
-                    .startup(&store, now)
-                    .map_err(|e| e.to_string())
-            });
-            match startup {
+            let result = run_startup(&store);
+            STARTING.store(false, Ordering::SeqCst);
+            match result {
                 Ok(startup) if startup.enabled => {
                     if !startup.errors.is_empty() {
                         eprintln!("Task startup: {}", startup.errors.join("; "));
@@ -266,9 +264,31 @@ pub(crate) fn reconcile_startup(store: Database) -> Option<std::thread::JoinHand
             }
         });
     spawned
-        .map_err(|error| eprintln!("Task startup could not start: {error}"))
+        .map_err(|error| {
+            STARTING.store(false, Ordering::SeqCst);
+            eprintln!("Task startup could not start: {error}")
+        })
         .ok()
 }
+
+/// The startup sequence with the store locked only to read and write: the
+/// Git checks of recorded workspaces run unlocked, so the first window can
+/// open meanwhile.
+fn run_startup(store: &Database) -> Result<tasks::restart::Startup, String> {
+    let now = monocode_core::time::now_ms;
+    let (mut startup, pending) = coordinator()
+        .startup_prepare(&*locked(store)?, now())
+        .map_err(|e| e.to_string())?;
+    let problems = tasks::restart::check_pending(&pending);
+    coordinator()
+        .startup_finish(&*locked(store)?, &mut startup, problems, now())
+        .map_err(|e| e.to_string())?;
+    Ok(startup)
+}
+
+/// True while startup reconciliation runs; the ticker waits for it, so no
+/// task resumes before its workspaces were checked.
+static STARTING: AtomicBool = AtomicBool::new(false);
 
 /// Registers the coordinator once per process; later calls only retarget the
 /// Shell that installs launched workers.
@@ -380,6 +400,9 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                 executor
                     .timer(Duration::from_millis(TICK_INTERVAL_MS))
                     .await;
+                if STARTING.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let tick = locked(&store).map_err(|e| e.to_string()).and_then(|store| {
                     coordinator
                         .tick(&store, &launcher, monocode_core::time::now_ms())

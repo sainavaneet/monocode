@@ -20,18 +20,20 @@ pub(crate) struct TaskControl {
 }
 impl EventEmitter<TaskControl> for Conversation {}
 
-/// The controls a task in `display` offers, as (action, label).
-pub(crate) fn offered(display: Display) -> Vec<(&'static str, &'static str)> {
+/// The controls a task row offers, as (action, label): only actions the
+/// transition table and `tasks.resume` accept in its state. Resume appears
+/// when the task is paused or held after a restart or takeover (`resumable`),
+/// never for a wait on a question or a block.
+pub(crate) fn offered(row: &ControlRow) -> Vec<(&'static str, &'static str)> {
     let mut actions = Vec::new();
-    match display {
+    match row.display {
         Display::Active | Display::Waiting | Display::Blocked => {
             actions.push(("tasks.pause", "Pause"))
         }
-        Display::Pausing | Display::Paused => actions.push(("tasks.resume", "Resume")),
+        Display::Pausing | Display::Paused => {}
         Display::Cancelling | Display::Cancelled | Display::Completed => return actions,
     }
-    if display == Display::Waiting {
-        // A task held after a restart resumes; a question answers itself out.
+    if row.resumable {
         actions.push(("tasks.resume", "Resume"));
     }
     actions.push(("tasks.steer", "Steer"));
@@ -108,7 +110,7 @@ impl Conversation {
             return None;
         }
         let rows = self.task_controls.iter().map(|row| {
-            let buttons = offered(row.display).into_iter().map(|(action, label)| {
+            let buttons = offered(row).into_iter().map(|(action, label)| {
                 let control = TaskControl {
                     task_id: row.task_id.clone(),
                     revision: row.revision,
@@ -173,19 +175,38 @@ impl Conversation {
 mod tests {
     use super::*;
 
+    fn row(display: Display, resumable: bool) -> ControlRow {
+        ControlRow {
+            task_id: "t".into(),
+            title: "T".into(),
+            revision: 1,
+            display,
+            reason: None,
+            resumable,
+        }
+    }
+
     #[test]
     fn each_state_offers_only_the_controls_that_apply() {
-        let actions = |d| offered(d).into_iter().map(|(a, _)| a).collect::<Vec<_>>();
+        let actions = |d, r| {
+            offered(&row(d, r))
+                .into_iter()
+                .map(|(a, _)| a)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            actions(Display::Active),
+            actions(Display::Active, false),
             ["tasks.pause", "tasks.steer", "tasks.cancel"]
         );
         assert_eq!(
-            actions(Display::Pausing),
+            actions(Display::Pausing, true),
             ["tasks.resume", "tasks.steer", "tasks.cancel"]
         );
-        assert!(actions(Display::Waiting).contains(&"tasks.resume"));
-        assert!(actions(Display::Cancelling).is_empty());
-        assert!(actions(Display::Completed).is_empty());
+        // Waiting on a question: no resume; held after a restart: resume.
+        assert!(!actions(Display::Waiting, false).contains(&"tasks.resume"));
+        assert!(actions(Display::Waiting, true).contains(&"tasks.resume"));
+        assert!(!actions(Display::Blocked, false).contains(&"tasks.resume"));
+        assert!(actions(Display::Cancelling, false).is_empty());
+        assert!(actions(Display::Completed, false).is_empty());
     }
 }

@@ -133,3 +133,35 @@ fn a_stopped_workers_session_shows_it_is_detached_from_its_task(cx: &mut gpui::T
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_detached_worker_session_says_so_when_it_is_opened(cx: &mut gpui::TestAppContext) {
+    let (window, _, _) = super::tests::window(cx);
+    let view = window
+        .update(cx, |shell, _, cx| {
+            let session = running_worker(shell);
+            let revision = task(shell).revision;
+            let store = locked(&shell.store).unwrap();
+            lifecycle::pause(&store, "t", revision, Requester::User, 10).unwrap();
+            let summary = store
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == session)
+                .unwrap();
+            drop(store);
+            // Opened later (as after a restart), with no turn ending here.
+            shell.add(summary, cx);
+            let view = shell.ensure_session(session, cx).unwrap();
+            view.update(cx, |view, cx| view.load(cx));
+            view
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |_, _, cx| {
+            let status = view.read(cx).status_for_test().to_owned();
+            assert!(status.contains("Detached from task"), "{status}");
+        })
+        .unwrap();
+}

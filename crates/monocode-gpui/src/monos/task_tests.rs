@@ -378,3 +378,65 @@ fn an_escalated_decision_is_a_card_in_monos_chat_that_the_user_answers(cx: &mut 
     assert!(cx.update(|cx| s.manager.read(cx).error.is_some()));
     assert_no_provider_started(before);
 }
+
+/// Habit timeouts (`habits::TIMEOUT_MS`, `APPROVAL_WAIT_MS`) act on habit
+/// runs and their launches only: a habit run that started long ago times
+/// out, while a task worker running just as long is untouched.
+#[gpui::test]
+fn habit_timeouts_never_stop_a_task_worker(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let worker = worker(&s);
+    let long_ago = 1;
+    let summary = locked(&s.store)
+        .unwrap()
+        .sessions()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == worker)
+        .unwrap();
+    let store = s.store.clone();
+    let worker_view = cx.new(|cx| Conversation::new(summary, store, cx));
+    cx.update(|cx| worker_view.update(cx, |v, _| v.busy = true));
+    cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            let habit_session = locked(&s.store)
+                .unwrap()
+                .create("codex", &s.project)
+                .unwrap();
+            let store = s.store.clone();
+            let view = cx.new(|cx| Conversation::new(habit_session, store, cx));
+            m.running.insert(
+                99,
+                RunningHabit {
+                    mono: s.id.clone(),
+                    habit: "nightly".into(),
+                    view,
+                    started: long_ago,
+                    launched: long_ago,
+                    failure: None,
+                    waiting_since: None,
+                    cards: Vec::new(),
+                    mailbox: Vec::new(),
+                },
+            );
+            m.check_habits(cx);
+            // The habit run timed out (well past TIMEOUT_MS) and was
+            // finished...
+            assert!(m.running.get(&99).is_none_or(|r| r.failure.is_some()));
+        })
+    });
+    cx.run_until_parked();
+    // ...while the task worker keeps running and its attempt is unchanged.
+    cx.update(|cx| {
+        assert!(worker_view.read(cx).turn_running());
+        assert!(!worker_view.read(cx).follow_ups_paused());
+    });
+    let db = locked(&s.store).unwrap();
+    let attempt = db.tasks().unwrap().attempt("x").unwrap().unwrap();
+    assert_eq!(attempt.status, monocode_core::tasks::AttemptState::Running);
+    assert!(
+        monocode_core::tasks::recovery::pending_stops(&db)
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -47,6 +47,17 @@ pub(crate) fn apply_task_control(
             input["requirements"] = serde_json::json!(requirements);
         }
         let store = locked(&store)?;
+        // Act on the task as it is now: routine coordinator updates bump its
+        // revision between the card's refreshes; the table still refuses a
+        // control its current state does not allow.
+        if let Some(task) = store
+            .tasks()
+            .map_err(|e| e.to_string())?
+            .task(&request.task_id)
+            .map_err(|e| e.to_string())?
+        {
+            input["revision"] = serde_json::json!(task.revision);
+        }
         monocode_core::app_access::task_control(
             &store,
             &request.task_id,

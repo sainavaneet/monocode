@@ -1215,7 +1215,7 @@ impl Monos {
         self.pump_tasks(cx);
         cx.notify();
     }
-    fn check_habits(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn check_habits(&mut self, cx: &mut Context<Self>) {
         let now = now_ms();
         if let Some(id) = self.active.clone() {
             self.refresh_work(&id, cx);
