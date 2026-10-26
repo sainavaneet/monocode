@@ -313,6 +313,32 @@ pub(super) fn event_for(
     }
 }
 
+/// Inserts an Open decision and its `decision.requested` event inside the
+/// caller's transaction.
+pub(super) fn insert_decision(
+    conn: &Connection,
+    new: &NewDecision,
+    now: u64,
+) -> Result<(), TaskError> {
+    conn.execute(
+        "INSERT INTO native_task_decisions(id,task_id,assignment_id,attempt_id,question,context,scope,asked_by,state,revision,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'open',1,?9,?9)",
+        params![new.id, new.task_id, new.assignment_id, new.attempt_id, new.question, new.context,
+            new.scope.as_str(), new.asked_by.as_str(), ms(now)],
+    )?;
+    let mut event = event_for(
+        &new.task_id,
+        &format!("decision:{}", new.id),
+        1,
+        "decision.requested",
+        json!({"scope": new.scope}),
+    );
+    event.assignment_id.clone_from(&new.assignment_id);
+    event.attempt_id.clone_from(&new.attempt_id);
+    append(conn, &event, now)?;
+    Ok(())
+}
+
 impl TaskStore<'_> {
     pub(super) fn begin(&self) -> Result<Transaction<'_>, TaskError> {
         Ok(Transaction::new_unchecked(
@@ -602,22 +628,7 @@ impl TaskStore<'_> {
         now: u64,
     ) -> Result<DecisionRequest, TaskError> {
         let tx = self.begin()?;
-        tx.execute(
-            "INSERT INTO native_task_decisions(id,task_id,assignment_id,attempt_id,question,context,scope,asked_by,state,revision,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'open',1,?9,?9)",
-            params![new.id, new.task_id, new.assignment_id, new.attempt_id, new.question, new.context,
-                new.scope.as_str(), new.asked_by.as_str(), ms(now)],
-        )?;
-        let mut event = event_for(
-            &new.task_id,
-            &format!("decision:{}", new.id),
-            1,
-            "decision.requested",
-            json!({"scope": new.scope}),
-        );
-        event.assignment_id.clone_from(&new.assignment_id);
-        event.attempt_id.clone_from(&new.attempt_id);
-        append(&tx, &event, now)?;
+        insert_decision(&tx, new, now)?;
         tx.commit()?;
         self.decision(&new.id)?
             .ok_or_else(|| TaskError::NotFound(format!("decision:{}", new.id)))

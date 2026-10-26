@@ -7,6 +7,7 @@ pub mod events;
 pub mod model;
 pub mod states;
 pub mod store;
+pub mod worker;
 
 pub use events::{DeliveryOutcome, DeliveryState, Event, Lease, NewEvent, PendingDelivery};
 pub use model::{
@@ -18,6 +19,7 @@ pub use states::{
     State, Subject, TaskLifecycle, TaskStage, Transition, TRANSITIONS,
 };
 pub use store::TaskStore;
+pub use worker::{Claim, ClaimOutcome, WorkerQuestion};
 
 /// Why a task store operation was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]

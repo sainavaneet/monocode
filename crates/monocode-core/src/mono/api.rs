@@ -1,4 +1,15 @@
 use serde_json::Value;
+/// The worker result's reference lists: commits, checks, evidence, remaining
+/// work and limitations.
+pub const WORKER_LISTS: [&str; 5] = [
+    "commits",
+    "validation",
+    "evidence",
+    "remainingWork",
+    "limitations",
+];
+pub const WORKER_LIST_ITEMS: usize = 50;
+pub const WORKER_LIST_ITEM_BYTES: usize = 4_000;
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let fields=match action{
@@ -17,6 +28,10 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "memory.add"=>"fact topic until","memory.replace"=>"find fact topic until","memory.remove"=>"find topic",
         "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"=>"id",
         "chat.card"=>"type repo number note sessionId options name instructions schedule",
+        "tasks.worker.status"=>"",
+        "tasks.worker.ask"=>"question context scope",
+        "tasks.worker.result"=>"outcome summary workspace commits validation evidence remainingWork limitations",
+        "tasks.worker.blocked"=>"reason",
         _=>return Err("Unknown app action. Run app help".into()),
     };
     for (key, value) in input.as_object().ok_or("Input must be an object")? {
@@ -62,6 +77,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "options",
         ]
         .contains(&key.as_str())
+            && !WORKER_LISTS.contains(&key.as_str())
             && !value.is_string()
         {
             return Err(format!("{key} must be text"));
@@ -73,6 +89,31 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             .is_none_or(|values| values.values().any(|v| !v.is_string()))
     }) {
         return Err("modelSettings must be an object of strings".into());
+    }
+    for key in WORKER_LISTS {
+        if input.get(key).is_some_and(|v| {
+            v.as_array().is_none_or(|a| {
+                a.len() > WORKER_LIST_ITEMS
+                    || a.iter()
+                        .any(|v| v.as_str().is_none_or(|s| s.len() > WORKER_LIST_ITEM_BYTES))
+            })
+        }) {
+            return Err(format!(
+                "{key} must be an array of up to {WORKER_LIST_ITEMS} texts of up to {WORKER_LIST_ITEM_BYTES} bytes"
+            ));
+        }
+    }
+    if input
+        .get("scope")
+        .is_some_and(|v| !matches!(v.as_str(), Some("assignment" | "dependents" | "task")))
+    {
+        return Err("scope must be assignment, dependents or task".into());
+    }
+    if input
+        .get("outcome")
+        .is_some_and(|v| !matches!(v.as_str(), Some("succeeded" | "failed")))
+    {
+        return Err("outcome must be succeeded or failed".into());
     }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
@@ -129,5 +170,25 @@ mod tests {
             &json!({"prompt":"x","project":"/code","draft":true})
         )
         .is_ok());
+    }
+    #[test]
+    fn worker_commands_validate_their_fields_and_never_take_ids() {
+        assert!(validate("tasks.worker.status", &json!({})).is_ok());
+        assert!(validate("tasks.worker.status", &json!({"attemptId":"x"})).is_err());
+        assert!(validate(
+            "tasks.worker.ask",
+            &json!({"question":"?","context":"why","scope":"dependents"})
+        )
+        .is_ok());
+        assert!(validate("tasks.worker.ask", &json!({"question":"?","scope":"all"})).is_err());
+        assert!(validate("tasks.worker.ask", &json!({"question":"?","taskId":"t"})).is_err());
+        let result = json!({"outcome":"failed","summary":"s","workspace":"/w","commits":["a"],
+            "validation":["v"],"evidence":["e"],"remainingWork":["r"],"limitations":["l"]});
+        assert!(validate("tasks.worker.result", &result).is_ok());
+        assert!(validate("tasks.worker.result", &json!({"outcome":"maybe"})).is_err());
+        assert!(validate("tasks.worker.result", &json!({"commits":"abc"})).is_err());
+        assert!(validate("tasks.worker.result", &json!({"limitations":[3]})).is_err());
+        assert!(validate("tasks.worker.blocked", &json!({"reason":"r"})).is_ok());
+        assert!(validate("tasks.worker.blocked", &json!({"reason":7})).is_err());
     }
 }

@@ -35,6 +35,9 @@ soul.read {}; soul.update {text,expectedHash}
 memory.read {topic?}; memory.search {query,since?}; memory.add {fact,topic?,until?}; memory.replace {find,fact,topic?,until?}; memory.remove {find,topic?}
 habits.list {}; habits.add {name,instructions,schedule:{kind,time?,minute?,dayOfWeek?}}; habits.update {id,name?,instructions?,schedule?,enabled?}; habits.run {id}; habits.remove {id}
 chat.card {type:"pr",repo?,number,note?} / {type:"session",sessionId,note?} / {type:"choices",options:[text]} / {type:"habit",name,instructions,schedule}
+tasks.worker.status {}; tasks.worker.ask {question,context?,scope?:"assignment"|"dependents"|"task"}; tasks.worker.blocked {reason}
+tasks.worker.result {outcome:"succeeded"|"failed",summary,workspace?,commits?:[text],validation?:[text],evidence?:[text],remainingWork?:[text],limitations?:[text]}
+tasks.worker actions are for task workers only. The task, assignment and attempt come from this session's binding; never pass their IDs. status is read-only and returns answered decisions. ask waits the assignment for Mono (scope defaults to assignment). result is a claim for review, never completion; one per attempt, and repeating it returns the same claim. blocked records why you cannot continue.
 Ordinary Operator sessions are visible in project history. Mono launches follow its Show started sessions preference. reveal defaults to false and controls navigation, not history visibility. placement right/down explicitly opens a split beside besideSessionId (or the caller).
 sessions.read returns up to three prose exchanges and nextBefore for older turns; pass that turn ID as before.
 notes.write requires body for a new note; existing notes accept title, body or tags independently.

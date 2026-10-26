@@ -11,6 +11,8 @@ use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod worker_tests;
 
 pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     if !matches!(
@@ -459,4 +461,169 @@ pub fn notes_action(
         finalize_slug: true,
     })?;
     Ok(json!(note))
+}
+
+/// The worker protocol. Workers Mono launched for a task report through these.
+pub const WORKER_ACTIONS: [&str; 4] = [
+    "tasks.worker.status",
+    "tasks.worker.ask",
+    "tasks.worker.result",
+    "tasks.worker.blocked",
+];
+const NOT_A_WORKER: &str = "This session is not bound to a task attempt; tasks.worker actions are only for workers Mono launched for a task.";
+const MAX_QUESTION: usize = 8_000;
+const MAX_CONTEXT: usize = 20_000;
+const MAX_SUMMARY: usize = 20_000;
+const MAX_WORKSPACE: usize = 4_096;
+const MAX_REASON: usize = 8_000;
+
+fn task_error(error: crate::tasks::TaskError) -> String {
+    error.to_string()
+}
+
+/// Runs a worker action for the authenticated app session `caller`. The task,
+/// assignment and attempt come only from the attempt bound to that session;
+/// a session without one is refused, and the request carries no ids.
+pub fn worker_action(
+    store: &Store,
+    caller: i64,
+    request: &str,
+    action: &str,
+    input: &Value,
+    now: u64,
+) -> Result<Value, String> {
+    if !WORKER_ACTIONS.contains(&action) {
+        return Err("Unknown worker action. Run app help".into());
+    }
+    crate::mono::api::validate(action, input)?;
+    let session = store
+        .persisted_session_id(caller)
+        .map_err(|_| NOT_A_WORKER.to_owned())?;
+    let tasks = store.tasks().map_err(task_error)?;
+    let attempt = tasks
+        .attempt_for_session(&session)
+        .map_err(task_error)?
+        .ok_or(NOT_A_WORKER)?;
+    let key = crate::mono::files::content_hash(request);
+    match action {
+        "tasks.worker.status" => worker_status(&tasks, &attempt),
+        "tasks.worker.ask" => {
+            let scope = input["scope"].as_str().unwrap_or("assignment");
+            let question = crate::tasks::WorkerQuestion {
+                id: format!("ask-{}-{key}", attempt.id),
+                question: text(input, "question", MAX_QUESTION)?,
+                context: optional_text(input, "context", MAX_CONTEXT)?.unwrap_or_default(),
+                scope: crate::tasks::DecisionScope::parse(scope)
+                    .ok_or("scope must be assignment, dependents or task")?,
+            };
+            let decision = tasks.ask(&attempt.id, &question, now).map_err(task_error)?;
+            let mut states = worker_states(&tasks, &attempt)?;
+            states["decision"] =
+                json!({"id":decision.id,"scope":decision.scope,"state":decision.state});
+            Ok(states)
+        }
+        "tasks.worker.result" => {
+            let (claim, recorded) = tasks
+                .claim_result(&attempt.id, &worker_claim(input)?, now)
+                .map_err(task_error)?;
+            let mut states = worker_states(&tasks, &attempt)?;
+            states["claim"] = json!(claim);
+            states["duplicate"] = json!(!recorded);
+            Ok(states)
+        }
+        _ => {
+            let reason = text(input, "reason", MAX_REASON)?;
+            tasks
+                .report_blocked(&attempt.id, &key, &reason, now)
+                .map_err(task_error)?;
+            let mut states = worker_states(&tasks, &attempt)?;
+            states["reason"] = json!(reason);
+            Ok(states)
+        }
+    }
+}
+
+fn worker_claim(input: &Value) -> Result<crate::tasks::Claim, String> {
+    let list = |key: &str| -> Vec<String> {
+        input[key]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(crate::tasks::Claim {
+        outcome: input["outcome"]
+            .as_str()
+            .and_then(crate::tasks::ClaimOutcome::parse)
+            .ok_or("Provide outcome: succeeded or failed.")?,
+        summary: text(input, "summary", MAX_SUMMARY)?,
+        workspace: optional_text(input, "workspace", MAX_WORKSPACE)?,
+        commits: list("commits"),
+        validation: list("validation"),
+        evidence: list("evidence"),
+        remaining_work: list("remainingWork"),
+        limitations: list("limitations"),
+    })
+}
+
+/// The attempt's and its assignment's current states.
+fn worker_states(
+    tasks: &crate::tasks::TaskStore<'_>,
+    attempt: &crate::tasks::Attempt,
+) -> Result<Value, String> {
+    let current = tasks
+        .attempt(&attempt.id)
+        .map_err(task_error)?
+        .ok_or("The attempt no longer exists")?;
+    let assignment = tasks
+        .assignment(&attempt.task_id, &attempt.assignment_id)
+        .map_err(task_error)?
+        .ok_or("The assignment no longer exists")?;
+    Ok(json!({
+        "attempt": {"id": current.id, "status": current.status},
+        "assignment": {"id": assignment.id, "status": assignment.status},
+    }))
+}
+
+/// Read-only: the bound task, assignment and attempt, decisions the worker
+/// asked for, and its claim if it reported one.
+fn worker_status(
+    tasks: &crate::tasks::TaskStore<'_>,
+    attempt: &crate::tasks::Attempt,
+) -> Result<Value, String> {
+    let task = tasks
+        .task(&attempt.task_id)
+        .map_err(task_error)?
+        .ok_or("The task no longer exists")?;
+    let assignment = tasks
+        .assignment(&attempt.task_id, &attempt.assignment_id)
+        .map_err(task_error)?
+        .ok_or("The assignment no longer exists")?;
+    let decisions = tasks.attempt_decisions(&attempt.id).map_err(task_error)?;
+    let listed = |state: crate::tasks::DecisionState| -> Vec<Value> {
+        decisions
+            .iter()
+            .filter(|d| d.state == state)
+            .map(|d| json!({"id":d.id,"question":d.question,"scope":d.scope,"answer":d.answer}))
+            .collect()
+    };
+    Ok(json!({
+        "task": {"id": task.id, "title": task.title, "stage": task.stage, "lifecycle": task.lifecycle},
+        "assignment": {
+            "id": assignment.id, "title": assignment.title, "prompt": assignment.prompt,
+            "files": assignment.files, "dependsOn": assignment.depends_on,
+            "verification": assignment.verification, "status": assignment.status,
+        },
+        "attempt": {"id": attempt.id, "status": attempt.status},
+        "answeredDecisions": listed(crate::tasks::DecisionState::Answered),
+        "openDecisions": listed(crate::tasks::DecisionState::Open),
+        "claim": tasks.claim(&attempt.id).map_err(task_error)?,
+    }))
 }

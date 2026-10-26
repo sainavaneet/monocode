@@ -429,7 +429,7 @@ fn owners(
     })
 }
 
-fn apply(
+pub(super) fn apply(
     conn: &Connection,
     subject: Subject<'_>,
     to: State,
@@ -478,7 +478,10 @@ fn apply(
 
 /// Whether `subject` is its assignment's newest attempt. A replaced attempt
 /// that finishes late must not start a review of the current run.
-fn is_latest_attempt(conn: &Connection, subject: Subject<'_>) -> Result<bool, TaskError> {
+pub(super) fn is_latest_attempt(
+    conn: &Connection,
+    subject: Subject<'_>,
+) -> Result<bool, TaskError> {
     let Subject::Attempt(id) = subject else {
         return Ok(false);
     };
