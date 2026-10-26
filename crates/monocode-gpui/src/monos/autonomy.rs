@@ -309,6 +309,19 @@ impl Monos {
             call,
             mono.id,
             move |store| {
+                // Unblocking checks worktrees with Git; only collecting and
+                // recording hold the store lock.
+                if action == "tasks.unblock" {
+                    let prepared = app::mono_unblock_prepare(&*locked(&store)?, &id, &input)?;
+                    let problems = prepared.0.problems();
+                    return app::mono_unblock_finish(
+                        &*locked(&store)?,
+                        &prepared,
+                        &problems,
+                        now_ms(),
+                    )
+                    .map(|value| (value, Effect::None));
+                }
                 let store = locked(&store)?;
                 app::mono_policy_action(&store, &id, &action, &input, now_ms())
                     .map(|value| (value, Effect::None))
@@ -465,11 +478,25 @@ impl Monos {
     pub(super) fn unblock_task(&mut self, standing: &Standing, cx: &mut Context<Self>) {
         let task = standing.task.id.clone();
         let revision = standing.task.revision;
-        self.autonomy_work(
+        // The worktree check runs with Git, between two short store locks.
+        self.autonomy_work_with(
             move |store| {
-                store
+                let check = locked(store)?
                     .tasks()
-                    .and_then(|tasks| tasks.unblock(&task, revision, Requester::User, now_ms()))
+                    .and_then(|tasks| tasks.unblock_check(&task))
+                    .map_err(|e| e.to_string())?;
+                let problems = check.problems();
+                locked(store)?
+                    .tasks()
+                    .and_then(|tasks| {
+                        tasks.unblock_checked(
+                            &check,
+                            &problems,
+                            revision,
+                            Requester::User,
+                            now_ms(),
+                        )
+                    })
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             },
@@ -484,10 +511,18 @@ impl Monos {
         work: impl FnOnce(&Store) -> Result<(), String> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.autonomy_work_with(move |store| work(&*locked(store)?), cx);
+    }
+
+    /// As [`Self::autonomy_work`], for work that takes the store lock
+    /// itself (and releases it around Git).
+    fn autonomy_work_with(
+        &mut self,
+        work: impl FnOnce(&Database) -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.store.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { work(&*locked(&store)?) });
+        let work = cx.background_executor().spawn(async move { work(&store) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {

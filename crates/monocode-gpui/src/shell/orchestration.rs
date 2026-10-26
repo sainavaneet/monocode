@@ -146,13 +146,18 @@ impl Shell {
             cx.notify();
             return;
         }
-        // With the task coordinator on, the plan becomes a persisted task
-        // and the coordinator schedules it (dependencies, file scopes,
-        // workspace ownership and the Mono's worker limit).
-        if locked(&self.store).is_ok_and(|store| monocode_core::tasks::coordinator::enabled(&store))
-        {
+        // With the task coordinator on, a Mono-owned chat's plan becomes a
+        // persisted task with that Mono's policy, and the coordinator
+        // schedules it (dependencies, file scopes, workspace ownership and
+        // the Mono's worker limit). A chat no Mono owns has no Mono to take
+        // its decisions or reviews, so it keeps the in-app scheduler.
+        let mono = self.owning_mono(lead, cx);
+        if let Some(mono) = mono.filter(|_| {
+            locked(&self.store)
+                .is_ok_and(|store| monocode_core::tasks::coordinator::enabled(&store))
+        }) {
             let provider = conversation.summary.provider.clone();
-            self.start_native_orchestration(lead, plan, cwd, provider, cx);
+            self.start_native_orchestration(lead, plan, cwd, provider, mono, cx);
             return;
         }
         let mut settings = conversation.settings.clone();
@@ -188,7 +193,7 @@ impl Shell {
         self.schedule_orchestration(lead, cx);
     }
     /// The Mono that owns `lead` (its chat or one of its launches), whose
-    /// policy the task takes; None for a session no Mono started.
+    /// policy a coordinator task takes; None for a session no Mono started.
     fn owning_mono(&self, lead: i64, cx: &App) -> Option<String> {
         let monos = self.monos.as_ref()?.read(cx);
         monos
@@ -206,6 +211,7 @@ impl Shell {
         plan: Plan,
         cwd: String,
         provider: String,
+        mono: String,
         cx: &mut Context<Self>,
     ) {
         use monocode_core::tasks::{NewTask, Requester, policy};
@@ -216,7 +222,7 @@ impl Shell {
                 policy::plan_task_prefix(lead),
                 monocode_core::mono::new_id()
             ),
-            mono_id: self.owning_mono(lead, cx),
+            mono_id: Some(mono),
             project: cwd,
             title: plan.title.clone(),
             request: if plan.summary.trim().is_empty() {
@@ -563,6 +569,22 @@ mod tests {
                 shell.sessions[&lead].update(cx, |v, cx| {
                     v.install_transfer(Settings::default(), None, cx)
                 });
+                // A Mono launched this chat.
+                shell.mono_manager().update(cx, |monos, _| {
+                    monos.roster.create(vec!["/work/monocode".into()]);
+                    let mono = monos.roster.monos.last_mut().unwrap();
+                    mono.launches.push(monocode_core::mono::Launch {
+                        session_id: lead,
+                        cwd: "/work/monocode".into(),
+                        title: "Lead".into(),
+                        harness: "claude".into(),
+                        model: None,
+                        origin_turn: 0,
+                        notify_on_complete: false,
+                        completed: false,
+                        dismissed: false,
+                    });
+                });
                 let part = |id: &str, file: &str, deps: &[&str]| Task {
                     id: id.into(),
                     title: format!("Part {id}"),
@@ -596,6 +618,16 @@ mod tests {
                     (TaskStage::Implementing, TaskLifecycle::Active)
                 );
                 assert_eq!(task.project, "/work/monocode");
+                let owner = shell
+                    .mono_manager()
+                    .read(cx)
+                    .roster
+                    .monos
+                    .last()
+                    .unwrap()
+                    .id
+                    .clone();
+                assert_eq!(task.mono_id.as_deref(), Some(owner.as_str()));
                 assert_eq!(task.criteria.len(), 2, "each part's checks are a criterion");
                 let tasks = store.tasks().unwrap();
                 let assignments = tasks.assignments(&task.id).unwrap();
@@ -617,6 +649,47 @@ mod tests {
             })
             .unwrap();
     }
+    #[gpui::test]
+    fn with_the_coordinator_on_a_chat_no_mono_owns_keeps_the_in_app_scheduler(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, lead) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                locked(&shell.store)
+                    .unwrap()
+                    .save_setting(monocode_core::tasks::coordinator::FLAG, "enabled")
+                    .unwrap();
+                shell.sessions[&lead].update(cx, |v, cx| {
+                    v.install_transfer(Settings::default(), None, cx)
+                });
+                let plan = Plan {
+                    title: "Review".into(),
+                    summary: String::new(),
+                    tasks: vec![Task {
+                        id: "a".into(),
+                        title: "A".into(),
+                        prompt: "Inspect and report".into(),
+                        files: vec!["src".into()],
+                        ..Task::default()
+                    }],
+                };
+                shell.start_orchestration(lead, plan, cx);
+                // Today's in-app path: a run, no persisted task.
+                assert!(shell.orchestrations.contains_key(&lead));
+                shell.stop_orchestration(lead, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let store = locked(&shell.store).unwrap();
+                let started = monocode_core::tasks::policy::started_plans(&store, lead).unwrap();
+                assert!(started.is_empty());
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn reviewed_dispatch_caps_workers_serializes_scopes_and_stops_before_launch(
         cx: &mut TestAppContext,
