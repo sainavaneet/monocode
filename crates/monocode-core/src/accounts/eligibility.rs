@@ -342,6 +342,15 @@ pub fn record_failure(
     }
 }
 
+/// Whether the app still knows an account (it may have been removed).
+pub fn known_accounts(store: &Store) -> Result<impl Fn(&AllowedAccount) -> bool + 'static, String> {
+    let book = store.provider_accounts()?;
+    Ok(move |account: &AllowedAccount| {
+        crate::provider::Kind::parse(&account.provider)
+            .is_some_and(|kind| book.exists(kind, &account.account_id))
+    })
+}
+
 /// The candidates and what is known about them.
 pub struct Pool<'a> {
     pub allowlist: &'a Allowlist,

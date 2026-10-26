@@ -74,7 +74,7 @@ impl<P: Policy> Coordinator<P> {
             _ => {
                 // The task's snapshot decides the account (account ids only).
                 let policy = policy::capture(store, task, &self.policy.worker_provider(task), now)?;
-                let account = match policy::launch_choice(store, &policy, now)? {
+                let account = match policy::launch_choice(store, task, &policy, now)? {
                     LaunchAccount::Use(account) => account,
                     LaunchAccount::Wait => return Ok(None),
                     LaunchAccount::Block(reason) => {

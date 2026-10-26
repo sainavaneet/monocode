@@ -20,6 +20,7 @@
 use super::coordinator;
 use super::events::{append, NewEvent};
 use super::launch::fail_assignment;
+use super::policy::Candidates;
 use super::review::MONO_REVIEW;
 use super::states::{apply, is_latest_attempt};
 use super::store::{ms, read_ms};
@@ -28,7 +29,7 @@ use super::{
     policy, AttemptState, DeliveryState, Requester, State, Subject, Task, TaskError, TaskLifecycle,
     TaskStore,
 };
-use crate::accounts::eligibility::{self, AccountPlan, AllowedAccount, Pool};
+use crate::accounts::eligibility::{self, AccountPlan, AllowedAccount};
 use crate::store::Store;
 use crate::usage::Failure;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -47,6 +48,8 @@ pub const ENDED_WITHOUT_RESULT: &str = "ended_without_result";
 
 pub(super) const SCHEDULED: &str = "scheduled";
 pub(super) const BLOCKED: &str = "blocked";
+/// Blocked while the task was paused; the task is blocked when it resumes.
+pub(super) const BLOCK_PENDING: &str = "block_pending";
 pub(super) const EXHAUSTED: &str = "exhausted";
 pub(super) const REPLACED: &str = "replaced";
 const MONO: &str = "mono";
@@ -226,24 +229,13 @@ impl Next {
     }
 }
 
-/// The candidates recovery may choose from for `policy`.
-pub(super) fn pool_parts(
-    store: &Store,
-) -> Result<(eligibility::HealthBook, impl Fn(&AllowedAccount) -> bool), TaskError> {
-    let health = eligibility::health(store).map_err(TaskError::Storage)?;
-    Ok((health, policy::known(store)?))
-}
-
-#[allow(clippy::too_many_arguments)]
 fn decide(
-    store: &Store,
     tasks: &TaskStore<'_>,
-    policy: &policy::TaskPolicy,
+    candidates: &Candidates,
     failure: Failure,
     failed: &AllowedAccount,
     (root, used): (&str, u32),
-    reason: &str,
-    resets_at: Option<u64>,
+    (reason, resets_at): (&str, Option<u64>),
     now: u64,
 ) -> Result<Next, TaskError> {
     if failure == Failure::Unknown && unknowns(tasks, root)? >= 1 {
@@ -252,13 +244,7 @@ fn decide(
             super::handoff::redact(reason)
         )));
     }
-    let (health, exists) = pool_parts(store)?;
-    let pool = Pool {
-        allowlist: &policy.accounts,
-        health: &health,
-        exists: &exists,
-        exhausted_until: &|_| None,
-    };
+    let pool = candidates.pool();
     let retry = |due: u64, provider: &str, account: &str, waiting: bool| {
         if used >= RETRY_BUDGET {
             Next::Exhausted
@@ -365,24 +351,25 @@ pub fn interrupt(
     }
     let task = task(&tasks, &attempt.task_id)?;
     let policy = policy::capture(store, &task, &attempt.provider, now)?;
-    let failed = policy.entry(&attempt.provider, attempt.account_id.as_deref());
-    // What the failure says about the account holds whatever happens next.
-    eligibility::record_failure(store, &policy.accounts, &failed, failure, resets_at, now)
-        .map_err(TaskError::Storage)?;
     let line = lineage(&tasks, &attempt.id)?;
     settle_failure(store, attempt_id, failure.as_str(), reason, now, |task| {
+        // Read the live allowlist; record what the failure says about the
+        // account (only now that the interrupt is certain), then decide.
+        let before = Candidates::read(store, task, &policy)?;
+        let failed = before.entry(&attempt.provider, attempt.account_id.as_deref());
+        eligibility::record_failure(store, &before.allowlist, &failed, failure, resets_at, now)
+            .map_err(TaskError::Storage)?;
         if task.lifecycle == TaskLifecycle::Cancelled {
             return Ok(Next::Abandon);
         }
+        let candidates = Candidates::read(store, task, &policy)?;
         decide(
-            store,
             &tasks,
-            &policy,
+            &candidates,
             failure,
             &failed,
             (&line.0, line.1),
-            reason,
-            resets_at,
+            (reason, resets_at),
             now,
         )
     })
@@ -410,16 +397,17 @@ fn settle_failure(
         return Ok(Outcome::Ignored);
     };
     let task = task(&tasks, &found.task_id)?;
-    let next = next(&task)?;
     let tx = tasks.begin()?;
     let inside = TaskStore { conn: &tx };
-    // Re-read under the write lock: a concurrent report may have won.
+    // Re-read under the write lock: a concurrent report may have won. Only
+    // then is anything (the account's standing included) recorded.
     let Some(attempt) = inside.attempt(attempt_id)? else {
         return Ok(Outcome::Ignored);
     };
     if !live(&inside, &attempt)? {
         return Ok(Outcome::Ignored);
     }
+    let next = next(&task)?;
     let reason = super::handoff::redact(reason);
     let failed = event(
         &attempt,
@@ -447,6 +435,14 @@ fn settle_failure(
             now,
         )?;
     }
+    // A paused task keeps its pause; it is blocked when it resumes.
+    let blocked = match &next {
+        Next::Block(why) => {
+            append(&tx, &block_reason_event(&attempt, why), now)?;
+            block(&tx, &task.id, why, now)?
+        }
+        _ => false,
+    };
     let (state, due, provider, account, retries) = match &next {
         Next::Schedule {
             due,
@@ -461,7 +457,8 @@ fn settle_failure(
             Some(account.as_str()),
             *retries,
         ),
-        Next::Block(_) => (BLOCKED, now, None, None, 0),
+        Next::Block(_) if blocked => (BLOCKED, now, None, None, 0),
+        Next::Block(_) => (BLOCK_PENDING, now, None, None, 0),
         Next::Exhausted => (EXHAUSTED, now, None, None, 0),
         Next::Mono => (MONO, now, None, None, 0),
         Next::Abandon => (ABANDONED, now, None, None, 0),
@@ -495,8 +492,7 @@ fn settle_failure(
         ],
     )?;
     match &next {
-        Next::Block(why) => {
-            block(&tx, &task.id, why, now)?;
+        Next::Block(why) if blocked => {
             notify_mono(&tx, &attempt, "recovery.blocked", why, 1, now)?;
         }
         Next::Exhausted => {
@@ -515,7 +511,7 @@ fn settle_failure(
                 now,
             )?;
         }
-        Next::Schedule { .. } | Next::Abandon => {}
+        Next::Block(_) | Next::Schedule { .. } | Next::Abandon => {}
     }
     tx.commit()?;
     Ok(next.outcome())
@@ -528,7 +524,7 @@ pub(super) fn block(
     task: &str,
     reason: &str,
     now: u64,
-) -> Result<(), TaskError> {
+) -> Result<bool, TaskError> {
     let tasks = TaskStore { conn };
     let subject = Subject::Task(task);
     let blocked = State::Lifecycle(TaskLifecycle::Blocked);
@@ -537,7 +533,7 @@ pub(super) fn block(
         current,
         State::Lifecycle(TaskLifecycle::Active | TaskLifecycle::Waiting)
     ) {
-        return Ok(());
+        return Ok(false);
     }
     let revision = tasks.revision(subject)?;
     apply(
@@ -552,7 +548,23 @@ pub(super) fn block(
         "UPDATE native_tasks SET blocked_reason=?2 WHERE id=?1",
         [task, reason],
     )?;
-    Ok(())
+    Ok(true)
+}
+
+/// Keeps why recovery blocks the attempt's lineage, for a task that was
+/// paused at the time and is blocked when it resumes.
+fn block_reason_event(attempt: &super::Attempt, why: &str) -> NewEvent {
+    let id = format!("block-reason:{}", attempt.id);
+    event(attempt, id, "recovery.block_reason", json!({"reason": why}))
+}
+
+/// The reason recorded by [`block_reason_event`].
+pub(super) fn block_reason(conn: &Connection, attempt: &str) -> Result<Option<String>, TaskError> {
+    Ok(
+        super::worker::payload_of(conn, &format!("block-reason:{attempt}"))?
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+            .and_then(|p| p["reason"].as_str().map(str::to_owned)),
+    )
 }
 
 /// Queues one item for the owning Mono's inbox about the attempt.

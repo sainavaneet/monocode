@@ -493,3 +493,78 @@ fn the_retry_budget_holds_across_account_changes() {
     assert_eq!(launcher.count(), 1 + RETRY_BUDGET as usize);
     assert_eq!(kinds(&store, "recovery.exhausted").len(), 1);
 }
+
+fn unblock(store: &Store, now: u64) {
+    let tasks = store.tasks().unwrap();
+    let t = Subject::Task("t");
+    let active = State::Lifecycle(TaskLifecycle::Active);
+    let revision = tasks.revision(t).unwrap();
+    tasks
+        .transition(t, active, Requester::User, revision, now)
+        .unwrap();
+}
+
+#[test]
+fn allowing_another_account_then_unblocking_resumes_on_it() {
+    let repo = repo();
+    let store = open(&repo);
+    accounts(&store, &["account-b"]);
+    let launcher = Recorded::default();
+    let session = launched(&store, &repo, &launcher);
+    let outcome = fail(&store, session, "Not signed in", NOW + 5);
+    assert!(matches!(outcome, Outcome::Blocked(_)), "{outcome:?}");
+    stop_all(&store, NOW + 6);
+    // The user allows a second account (read live), then unblocks.
+    allow(&store, &repo, &[("default", None), ("account-b", None)]);
+    unblock(&store, NOW + 7);
+    coordinator().tick(&store, &launcher, NOW + 8).unwrap();
+    assert_eq!(launcher.count(), 2);
+    assert_eq!(launcher.last().1.account.id, "account-b");
+}
+
+#[test]
+fn a_paused_task_blocked_by_configuration_is_blocked_when_it_resumes() {
+    let repo = repo();
+    let store = open(&repo);
+    accounts(&store, &["account-b"]);
+    allow(&store, &repo, &[("default", None), ("account-b", None)]);
+    let launcher = Recorded::default();
+    let session = launched(&store, &repo, &launcher);
+    let tasks = store.tasks().unwrap();
+    let t = Subject::Task("t");
+    let paused = State::Lifecycle(TaskLifecycle::Paused);
+    tasks
+        .transition(
+            t,
+            paused,
+            Requester::User,
+            tasks.revision(t).unwrap(),
+            NOW + 1,
+        )
+        .unwrap();
+    let outcome = fail(&store, session, "model_not_found: gpt-9", NOW + 2);
+    assert!(matches!(outcome, Outcome::Blocked(_)), "{outcome:?}");
+    assert_eq!(task(&store).lifecycle, TaskLifecycle::Paused);
+    stop_all(&store, NOW + 3);
+    unblock(&store, NOW + 4);
+    coordinator().tick(&store, &launcher, NOW + 5).unwrap();
+    assert_eq!(launcher.count(), 1, "resuming does not relaunch");
+    let task = task(&store);
+    assert_eq!(task.lifecycle, TaskLifecycle::Blocked);
+    assert!(
+        task.blocked_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("configuration"),
+        "{:?}",
+        task.blocked_reason
+    );
+    assert_eq!(kinds(&store, "recovery.blocked").len(), 1);
+    // An explicit unblock retries on the same account, even when the live
+    // allowlist now prefers another one.
+    allow(&store, &repo, &[("account-b", None), ("default", None)]);
+    unblock(&store, NOW + 6);
+    coordinator().tick(&store, &launcher, NOW + 7).unwrap();
+    assert_eq!(launcher.count(), 2);
+    assert_eq!(launcher.last().1.account.id, "default");
+}

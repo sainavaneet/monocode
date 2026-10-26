@@ -42,9 +42,12 @@ impl Failure {
         Self::Unknown,
     ];
 
-    /// Classifies a provider's error text. Order matters: a configuration or
-    /// policy refusal never counts as a limit, a shared limit is checked
-    /// before the account's own, and only then are retryable errors matched.
+    /// Classifies a provider's error text. Order matters: a spent limit
+    /// (shared first, then the account's own) wins over everything, because
+    /// providers report it under other codes (Anthropic: a low credit balance
+    /// is an `invalid_request_error`); then configuration, an OS-level spawn
+    /// failure, policy, credentials, and only then retryable errors. Status
+    /// numbers count only at the start or after "status/http/code/error".
     pub fn classify(message: &str) -> Self {
         static CONFIGURATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         static POLICY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -53,27 +56,6 @@ impl Failure {
         static UNAVAILABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         static TEMPORARY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let text = message.trim();
-        if matches(
-            &CONFIGURATION,
-            r"(?i)model_not_found|\bmodel\b[^\n]{0,80}\b(?:does not exist|not found|is not (?:available|supported))|unknown model|invalid[_ ](?:request[_ ]error|parameter|argument)|unsupported[_ ](?:option|parameter|value|model)|unrecognized (?:option|argument)",
-            text,
-        ) {
-            return Self::Configuration;
-        }
-        if matches(
-            &POLICY,
-            r"(?i)content[_ ](?:policy|filter)|policy[_ ]violation|violates? (?:our |the )?(?:usage |content )?polic|permission[_ ]denied|not permitted|\bforbidden\b|\b403\b",
-            text,
-        ) {
-            return Self::Policy;
-        }
-        if matches(
-            &AUTH,
-            r"(?i)\b401\b|unauthori[sz]ed|invalid[_ ](?:api[_ ]key|token|credentials?|grant)|(?:token|credentials?|session|login) (?:has |have )?(?:expired|been revoked|revoked)|authentication[_ ](?:required|failed|error)|not (?:signed|logged) in|not authenticated|please (?:log ?in|sign in)|no longer signed in|re-?authenticate",
-            text,
-        ) {
-            return Self::Auth;
-        }
         if matches(
             &SHARED,
             r"(?i)\b(?:organi[sz]ation|org|workspace|team|enterprise)(?:'s)?\b[^.\n]{0,40}\b(?:limit|quota|credits?)\b[^.\n]{0,30}\b(?:reached|exceeded|exhausted|depleted)",
@@ -85,15 +67,36 @@ impl Failure {
             return Self::UsageExhausted;
         }
         if matches(
+            &CONFIGURATION,
+            r"(?i)model_not_found|\bmodel\b[^\n]{0,80}\b(?:does not exist|not found|is not (?:available|supported))|unknown model|invalid[_ ](?:request[_ ]error|parameter|argument)|unsupported[_ ](?:option|parameter|value|model)|unrecognized (?:option|argument)",
+            text,
+        ) {
+            return Self::Configuration;
+        }
+        if matches(
             &UNAVAILABLE,
-            r"(?i)not installed|command not found|no such file or directory|\benoent\b|failed to (?:spawn|start|launch)|could not (?:start|launch|find) (?:the )?(?:provider|codex|claude|cli)|(?:exited|crashed) (?:unexpectedly|with (?:code|status|signal))",
+            r"(?i)not installed|command not found|no such file or directory|\benoent\b|\(os error \d+\)|failed to (?:spawn|start|launch)|could not (?:start|launch|find) (?:the )?(?:provider|codex|claude|cli)|(?:exited|crashed) (?:unexpectedly|with (?:code|status|signal))",
             text,
         ) {
             return Self::ProviderUnavailable;
         }
         if matches(
+            &POLICY,
+            r"(?i)content[_ ](?:policy|filter)|policy[_ ]violation|violates? (?:our |the )?(?:usage |content )?polic|permission[_ ]denied|not permitted|\bforbidden\b|(?:^|\b(?:status|http|code|error)\b[^0-9\n]{0,12})403\b",
+            text,
+        ) {
+            return Self::Policy;
+        }
+        if matches(
+            &AUTH,
+            r"(?i)(?:^|\b(?:status|http|code|error)\b[^0-9\n]{0,12})401\b|unauthori[sz]ed|invalid[_ ](?:api[_ ]key|token|credentials?|grant)|(?:token|credentials?|session|login) (?:has |have )?(?:expired|been revoked|revoked)|authentication[_ ](?:required|failed|error)|not (?:signed|logged) in|not authenticated|please (?:log ?in|sign in)|no longer signed in|re-?authenticate",
+            text,
+        ) {
+            return Self::Auth;
+        }
+        if matches(
             &TEMPORARY,
-            r"(?i)\b(?:429|500|502|503|504|529)\b|rate[_ ]?limit|too many requests|overloaded|timed? ?out|timeout|temporar(?:y|ily)|try again|connection (?:reset|refused|closed|error)|network|econnreset|etimedout|service unavailable|bad gateway|internal server error|stream (?:error|disconnected)",
+            r"(?i)(?:^|\b(?:status|http|code|error)\b[^0-9\n]{0,12})(?:429|500|502|503|504|529)\b|rate[_ ]?limit|too many requests|overloaded|timed? ?out|timeout|temporar(?:y|ily)|try again|connection (?:reset|refused|closed|error)|network|econnreset|etimedout|service unavailable|bad gateway|internal server error|stream (?:error|disconnected)",
             text,
         ) {
             return Self::Temporary;
@@ -174,6 +177,19 @@ mod tests {
             ("content_policy_violation", Policy),
             ("permission denied by policy", Policy),
             ("Something odd happened", Unknown),
+            // Anthropic reports a spent balance as an invalid request.
+            (
+                "invalid_request_error: Your credit balance is too low to access the API",
+                UsageExhausted,
+            ),
+            // An OS spawn error is the provider, not a policy refusal.
+            ("Permission denied (os error 13)", ProviderUnavailable),
+            ("403 Forbidden", Policy),
+            ("HTTP status 403", Policy),
+            ("status code: 500", Temporary),
+            ("Wrote 500 lines", Unknown),
+            ("Read 403 files", Unknown),
+            ("The build took 503ms", Unknown),
             ("", Unknown),
         ] {
             assert_eq!(Failure::classify(message), expected, "{message:?}");

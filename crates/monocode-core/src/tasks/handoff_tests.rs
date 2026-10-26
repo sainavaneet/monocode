@@ -312,9 +312,13 @@ fn the_api_key_choice_is_snapshotted_when_the_task_is_created() {
     let snapshot = policy::of(&tasks, "t").unwrap().unwrap();
     assert!(snapshot.use_api_key);
     assert_eq!(snapshot.start_account, "default");
-    assert_eq!(
-        snapshot.accounts,
-        crate::accounts::eligibility::Allowlist::only("codex", "default")
+    // The allowlist is read live, not frozen into the snapshot.
+    let saved = store.tasks().unwrap().events_after(0, 1000).unwrap();
+    let policy = saved.iter().find(|e| e.kind == "task.policy").unwrap();
+    assert!(
+        policy.payload.get("accounts").is_none(),
+        "{}",
+        policy.payload
     );
 }
 
@@ -332,4 +336,102 @@ fn workers_launch_on_the_account_selected_for_the_project() {
     launched(&store, &repo, &launcher);
     assert_eq!(launcher.last().1.account.id, "account-b");
     assert_eq!(attempts(&store)[0].account_id.as_deref(), Some("account-b"));
+}
+
+struct OnClaude;
+impl crate::tasks::coordinator::Policy for OnClaude {
+    fn worker_provider(&self, _task: &crate::tasks::Task) -> String {
+        "claude".into()
+    }
+}
+
+#[test]
+fn a_replacement_resumes_the_failed_workers_thread_on_the_new_account() {
+    use crate::accounts::eligibility::{save_allowlist, AllowedAccount, Allowlist, Scope};
+    use crate::accounts::{Account, Book, Profile};
+    use crate::provider::Kind;
+    let repo = repo();
+    let store = open(&repo);
+    let project = repo.root.to_string_lossy().into_owned();
+    let mut book = Book {
+        accounts: ["account-a", "account-b"]
+            .iter()
+            .map(|id| Account {
+                id: (*id).into(),
+                provider: "claude".into(),
+                label: (*id).into(),
+            })
+            .collect(),
+        ..Book::default()
+    };
+    book.select(Kind::Claude, &project, "account-a").unwrap();
+    store.save_provider_accounts(&book).unwrap();
+    let mut allowed = Allowlist::only("claude", "account-a");
+    allowed.accounts.push(AllowedAccount {
+        priority: 1,
+        ..AllowedAccount::new("claude", "account-b")
+    });
+    save_allowlist(&store, Scope::Project(&project), &allowed).unwrap();
+    let new = crate::tasks::NewTask {
+        id: "t".into(),
+        mono_id: None,
+        project: project.clone(),
+        title: "Ship it".into(),
+        request: "Implement the feature".into(),
+        criteria: vec![],
+    };
+    policy::create_task(&store, &new, "claude", NOW).unwrap();
+    let tasks = store.tasks().unwrap();
+    let plan = crate::tasks::store::tests::plan(vec![crate::tasks::review::tests::scoped(&[])]);
+    tasks.save_plan("t", 1, &plan, NOW).unwrap();
+    let t = crate::tasks::Subject::Task("t");
+    for stage in [
+        crate::tasks::TaskStage::Ready,
+        crate::tasks::TaskStage::Implementing,
+    ] {
+        let revision = tasks.revision(t).unwrap();
+        tasks
+            .transition(
+                t,
+                crate::tasks::State::Stage(stage),
+                Requester::Mono,
+                revision,
+                NOW,
+            )
+            .unwrap();
+    }
+    let coordinator = crate::tasks::coordinator::Coordinator::new("gpui-1", OnClaude);
+    let launcher = Recorded::default();
+    coordinator.tick(&store, &launcher, NOW).unwrap();
+    let (old, settings) = launcher.last();
+    assert_eq!(settings.account.id, "account-a");
+    assert!(confirm_started(&store, old.id, NOW).unwrap());
+    // The failed worker had a provider thread in account-a's home (temp).
+    let thread = "thread-1";
+    store.provider_id(old.id, thread).unwrap();
+    let root = store.data_dir().unwrap().to_path_buf();
+    let from = Profile::new("account-a", &root).home(Kind::Claude).unwrap();
+    assert!(from.starts_with(&root), "hermetic: {from:?}");
+    let transcript = from
+        .join("projects/-project")
+        .join(format!("{thread}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "{\"history\":true}\n").unwrap();
+    let Outcome::Retry { at, account, .. } = fail(&store, old.id, "usage_limit_reached", NOW + 1)
+    else {
+        panic!("expected a retry");
+    };
+    assert_eq!(account, "account-b");
+    stop_all(&store, at);
+    coordinator.tick(&store, &launcher, at).unwrap();
+    let (replacement, settings) = launcher.last();
+    assert_eq!(settings.account.id, "account-b");
+    assert_eq!(replacement.provider_id.as_deref(), Some(thread));
+    let to = Profile::new("account-b", &root).home(Kind::Claude).unwrap();
+    assert!(to
+        .join("projects/-project")
+        .join(format!("{thread}.jsonl"))
+        .is_file());
+    let briefed = kinds(&store, "attempt.briefed");
+    assert_eq!(briefed.last().unwrap().payload["resumedThread"], true);
 }

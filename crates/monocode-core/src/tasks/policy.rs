@@ -1,6 +1,8 @@
-//! The account and billing policy snapshotted into a task when it is
-//! created: later changes to the live preference or allowlist do not change
-//! how an in-flight task runs or recovers.
+//! The billing choice and starting account snapshotted into a task when it
+//! is created: a later change to the live API key preference does not change
+//! how an in-flight task bills. The account allowlist is not snapshotted:
+//! recovery reads the live Mono or project allowlist each time it decides,
+//! so allowing another account and unblocking the task takes effect.
 //!
 //! Stored once as the event `policy:<task>` (write-once by its stable id), so
 //! it is as durable and replayable as the rest of the task's history. Account
@@ -23,8 +25,6 @@ pub struct TaskPolicy {
     pub provider: String,
     /// The account selected for the project when the task was created.
     pub start_account: String,
-    /// Where recovery may move work; by default only `start_account`.
-    pub accounts: Allowlist,
     /// Bill the saved API key instead of the CLI login (the app preference
     /// for `provider` at creation).
     pub use_api_key: bool,
@@ -71,13 +71,9 @@ pub fn capture(
         .ok_or_else(|| TaskError::Invalid(format!("Unknown worker provider {provider}")))?;
     let book = store.provider_accounts().map_err(TaskError::Storage)?;
     let start = book.selected(kind, &task.project);
-    let accounts = eligibility::allowlist_for(store, task.mono_id.as_deref(), &task.project)
-        .map_err(TaskError::Storage)?
-        .unwrap_or_else(|| Allowlist::only(kind.id(), &start));
     let policy = TaskPolicy {
         provider: kind.id().into(),
         start_account: start,
-        accounts,
         use_api_key: live_api_key(store, kind),
         captured_at: now,
     };
@@ -106,20 +102,56 @@ pub fn create_task(
     Ok(task)
 }
 
-impl TaskPolicy {
-    /// The entry for the account an attempt ran on.
-    pub fn entry(&self, provider: &str, account: Option<&str>) -> AllowedAccount {
-        self.accounts
-            .entry(provider, account.unwrap_or(&self.start_account))
-    }
+/// The live allowlist for the task: the Mono's, else the project's, else
+/// only the account the task started on.
+pub fn allowlist(store: &Store, task: &Task, policy: &TaskPolicy) -> Result<Allowlist, TaskError> {
+    Ok(
+        eligibility::allowlist_for(store, task.mono_id.as_deref(), &task.project)
+            .map_err(TaskError::Storage)?
+            .unwrap_or_else(|| Allowlist::only(&policy.provider, &policy.start_account)),
+    )
 }
 
-/// Whether the app still knows the account (it may have been removed).
-pub(super) fn known(store: &Store) -> Result<impl Fn(&AllowedAccount) -> bool, TaskError> {
-    let book = store.provider_accounts().map_err(TaskError::Storage)?;
-    Ok(move |account: &AllowedAccount| {
-        Kind::parse(&account.provider).is_some_and(|kind| book.exists(kind, &account.account_id))
-    })
+/// Everything recovery chooses accounts from, read once per decision.
+pub(super) struct Candidates {
+    pub allowlist: Allowlist,
+    pub health: eligibility::HealthBook,
+    exists: Box<dyn Fn(&AllowedAccount) -> bool>,
+    start_account: String,
+}
+
+impl Candidates {
+    pub fn read(store: &Store, task: &Task, policy: &TaskPolicy) -> Result<Self, TaskError> {
+        Ok(Self {
+            allowlist: allowlist(store, task, policy)?,
+            health: eligibility::health(store).map_err(TaskError::Storage)?,
+            exists: Box::new(eligibility::known_accounts(store).map_err(TaskError::Storage)?),
+            start_account: policy.start_account.clone(),
+        })
+    }
+
+    pub fn pool(&self) -> Pool<'_> {
+        Pool {
+            allowlist: &self.allowlist,
+            health: &self.health,
+            exists: &*self.exists,
+            exhausted_until: &|_| None,
+        }
+    }
+
+    /// The entry for the account an attempt ran on.
+    pub fn entry(&self, provider: &str, account: Option<&str>) -> AllowedAccount {
+        self.allowlist
+            .entry(provider, account.unwrap_or(&self.start_account))
+    }
+
+    pub fn eligible(&self, account: &AllowedAccount, now: u64) -> bool {
+        (self.exists)(account)
+            && self
+                .health
+                .get(&account.provider, &account.account_id)
+                .available(now)
+    }
 }
 
 /// Where a fresh launch runs.
@@ -134,21 +166,16 @@ pub(super) enum LaunchAccount {
 /// the policy's provider.
 pub(super) fn launch_choice(
     store: &Store,
+    task: &Task,
     policy: &TaskPolicy,
     now: u64,
 ) -> Result<LaunchAccount, TaskError> {
-    let health = eligibility::health(store).map_err(TaskError::Storage)?;
-    let exists = known(store)?;
-    let pool = Pool {
-        allowlist: &policy.accounts,
-        health: &health,
-        exists: &exists,
-        exhausted_until: &|_| None,
-    };
+    let candidates = Candidates::read(store, task, policy)?;
+    let pool = candidates.pool();
     if let Some(account) = eligibility::first_eligible(&pool, &policy.provider, None, now) {
         return Ok(LaunchAccount::Use(account));
     }
-    let start = policy.entry(&policy.provider, None);
+    let start = candidates.entry(&policy.provider, None);
     Ok(
         match eligibility::plan(Failure::UsageExhausted, &start, &pool, None, now) {
             AccountPlan::Wait { .. } => LaunchAccount::Wait,

@@ -4,16 +4,17 @@
 use super::coordinator::{Coordinator, Launcher, Policy, Tick};
 use super::handoff::{self, Inputs};
 use super::launch::fail_assignment;
+use super::policy::Candidates;
 use super::recovery::{
-    self, block, notify_mono, pool_parts, stop_delivery, Recovery, BLOCKED, EXHAUSTED, REPLACED,
-    RETRY_BUDGET, SCHEDULED,
+    self, block, block_reason, notify_mono, stop_delivery, Recovery, BLOCKED, BLOCK_PENDING,
+    EXHAUSTED, REPLACED, RETRY_BUDGET, SCHEDULED,
 };
 use super::store::{ms, Key};
 use super::{
     policy, Assignment, Attempt, DeliveryState, NewAttempt, Task, TaskError, TaskLifecycle,
     TaskStore,
 };
-use crate::accounts::eligibility::{self, AccountPlan, AllowedAccount, Pool};
+use crate::accounts::eligibility::{self, AccountPlan, AllowedAccount};
 use crate::store::Store;
 use crate::usage::Failure;
 use rusqlite::params;
@@ -41,7 +42,9 @@ enum Choice {
 }
 
 /// Picks the account a due retry runs on: the one chosen when it was
-/// scheduled if still eligible, else the best eligible one now.
+/// scheduled if still eligible, else the best eligible one of the live
+/// allowlist now. A configuration or policy failure never changes account:
+/// it retries (after an unblock) on the account that failed, or blocks.
 fn choose(store: &Store, row: &Recovery, now: u64) -> Result<Choice, TaskError> {
     let tasks = store.tasks()?;
     let task = tasks
@@ -58,29 +61,40 @@ fn choose(store: &Store, row: &Recovery, now: u64) -> Result<Choice, TaskError> 
         row.retries_used
     };
     let provider = row.next_provider.clone().unwrap_or(row.provider.clone());
-    let (health, exists) = pool_parts(store)?;
-    let pool = Pool {
-        allowlist: &policy.accounts,
-        health: &health,
-        exists: &exists,
-        exhausted_until: &|_| None,
+    let candidates = Candidates::read(store, &task, &policy)?;
+    let pool = candidates.pool();
+    let failed: AllowedAccount = candidates.entry(&row.provider, row.failed_account.as_deref());
+    let replace = |account: AllowedAccount| Choice::Replace {
+        provider: account.provider,
+        account: account.account_id,
+        retries,
     };
+    let keeps_account = matches!(
+        Failure::parse(&row.failure),
+        Some(Failure::Configuration | Failure::Policy)
+    );
+    if keeps_account {
+        return Ok(if candidates.eligible(&failed, now) {
+            replace(failed)
+        } else {
+            Choice::Block(format!(
+                "{}/{} is no longer available, and a configuration or policy failure never moves to another account.",
+                failed.provider, failed.account_id
+            ))
+        });
+    }
     let preferred = row
         .next_account
         .as_deref()
-        .map(|id| policy.accounts.entry(&provider, id))
-        .filter(|a| exists(a) && health.get(&a.provider, &a.account_id).available(now));
+        .map(|id| candidates.allowlist.entry(&provider, id))
+        .filter(|a| candidates.eligible(a, now));
     if let Some(account) =
         preferred.or_else(|| eligibility::first_eligible(&pool, &provider, None, now))
     {
-        return Ok(Choice::Replace {
-            provider: account.provider,
-            account: account.account_id,
-            retries,
-        });
+        return Ok(replace(account));
     }
     // Nothing eligible: wait for a known cooldown, else block with why.
-    let failed: AllowedAccount = policy.entry(&provider, row.failed_account.as_deref());
+    let failed = candidates.entry(&provider, row.failed_account.as_deref());
     Ok(
         match eligibility::plan(Failure::UsageExhausted, &failed, &pool, None, now) {
             AccountPlan::Wait { until } => Choice::Later(until),
@@ -114,6 +128,24 @@ impl<P: Policy> Coordinator<P> {
         let Some(row) = recovery::recovery(&tasks, &attempt.id)? else {
             return Ok(());
         };
+        if row.state == BLOCK_PENDING {
+            // Blocked while paused: now that it resumed, block it rather
+            // than relaunch.
+            let reason =
+                block_reason(tasks.conn, &attempt.id)?.unwrap_or_else(|| row.reason.clone());
+            let tx = tasks.begin()?;
+            let revision = key(&attempt.id).bump(
+                &tx,
+                row.revision,
+                "state=?",
+                params![BLOCKED].to_vec(),
+                now,
+            )?;
+            block(&tx, &task.id, &reason, now)?;
+            notify_mono(&tx, attempt, "recovery.blocked", &reason, revision, now)?;
+            tx.commit()?;
+            return Ok(());
+        }
         let due = row.state == BLOCKED || (row.state == SCHEDULED && now >= row.due_at);
         if !due {
             return Ok(());
