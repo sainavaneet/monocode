@@ -6,10 +6,14 @@ use crate::tasks::coordinator::FLAG;
 use crate::tasks::decisions::tests::{
     answer, ask, decision, independent, mono, mono_received, running, task_with, NOW,
 };
+use crate::tasks::AttemptState;
 use crate::tasks::{inbox, recovery, Requester};
 use crate::usage::Failure;
 use serde_json::json;
 use std::path::Path;
+
+/// When the tests read the view.
+const SEEN: u64 = NOW + 100;
 
 fn store_with_worker() -> (Store, i64) {
     let store = Store::open(Path::new(":memory:")).unwrap();
@@ -19,7 +23,7 @@ fn store_with_worker() -> (Store, i64) {
 }
 
 fn only(store: &Store) -> TaskMonitor {
-    let mut all = monitor(store, "mono-1").unwrap();
+    let mut all = monitor(store, "mono-1", SEEN).unwrap();
     assert_eq!(all.len(), 1);
     all.remove(0)
 }
@@ -41,6 +45,8 @@ fn all_text(view: &TaskMonitor) -> String {
     let mut text: Vec<String> = view.timeline.iter().map(|e| e.text.clone()).collect();
     text.extend(view.recovery.iter().cloned());
     text.extend(view.control.reason.iter().cloned());
+    text.push(view.control.title.clone());
+    text.extend(view.workers.iter().map(|w| w.title.clone()));
     text.join("\n")
 }
 
@@ -48,7 +54,7 @@ fn all_text(view: &TaskMonitor) -> String {
 fn nothing_is_shown_while_the_coordinator_is_off() {
     let (store, _) = store_with_worker();
     store.save_setting(FLAG, "disabled").unwrap();
-    assert!(monitor(&store, "mono-1").unwrap().is_empty());
+    assert!(monitor(&store, "mono-1", SEEN).unwrap().is_empty());
 }
 
 #[test]
@@ -146,6 +152,34 @@ fn a_secret_in_a_worker_error_never_reaches_the_timeline() {
     let (store, _) = store_with_worker();
     let secret = "sk-ant-api03-Zx81kQ2vB7nP0wLmT4yR";
     let token = "ghp_q8W2e4R6t8Y0u2I4o6P8a0S2d4F6g8H0j2K4";
+    let titled = "xoxb-1234567890-abcdefghij";
+    // Free text that is not an error: titles, and who answered.
+    let conn = store.connection();
+    conn.execute(
+        "UPDATE native_tasks SET title=?1 WHERE id='t'",
+        [format!("Ship it {titled}")],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE native_task_assignments SET title=?1 WHERE task_id='t' AND id='a'",
+        [format!("Assignment {titled}")],
+    )
+    .unwrap();
+    store
+        .tasks()
+        .unwrap()
+        .append_event(
+            &crate::tasks::NewEvent {
+                id: "answered-by-secret".into(),
+                task_id: "t".into(),
+                assignment_id: Some("a".into()),
+                attempt_id: None,
+                kind: "decision.answered".into(),
+                payload: json!({"by": format!("mono {secret}"), "requester": token}),
+            },
+            NOW + 2,
+        )
+        .unwrap();
     let error = format!("503 Service Unavailable: request with Bearer {secret} and {token} failed");
     let outcome = recovery::interrupt(&store, "x", Failure::Temporary, &error, None, NOW + 3);
     assert!(
@@ -162,6 +196,8 @@ fn a_secret_in_a_worker_error_never_reaches_the_timeline() {
     assert!(!text.contains(secret), "{text}");
     assert!(!text.contains("Zx81kQ2vB7nP0wLmT4yR"), "{text}");
     assert!(!text.contains(token), "{text}");
+    assert!(!text.contains(titled), "{text}");
+    assert!(text.contains("Answered by mono [redacted]"), "{text}");
     assert!(view.recovering);
     assert_eq!(view.badge(), Some(Badge::Recovering));
     assert_eq!(view.recovery.len(), 1);
@@ -208,4 +244,47 @@ fn worker_activity_status_sync_and_mono_review_are_separate_times() {
         .acquire_lease(&lease_resource("t"), "holder", LEASE_TTL_MS, at)
         .unwrap();
     assert_eq!(only(&store).last_status_sync, Some(at));
+    // Once the lease has expired it says nothing about a recent sync.
+    let later = monitor(&store, "mono-1", at + LEASE_TTL_MS + 1).unwrap();
+    assert_eq!(later[0].last_status_sync, None);
+}
+
+#[test]
+fn a_worker_held_after_a_takeover_is_not_counted_as_working() {
+    use crate::tasks::coordinator::{Coordinator, ExplicitStart};
+    use crate::tasks::recovery::tests::{attempts, launched_unconfirmed, Recorded};
+    use crate::tasks::review::tests::{open, repo, NOW};
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    launched_unconfirmed(&store, &repo, &launcher);
+    let session = launcher.last().0.id;
+    assert!(crate::tasks::confirm_started(&store, session, NOW).unwrap());
+    let running = monitor(&store, "mono-1", NOW + 1).unwrap().remove(0);
+    assert_eq!(running.working(), 1);
+    assert_eq!(running.workers[0].state(None), WorkerState::Working);
+    // Another app (which cannot be checked) held the lease; once it lapses
+    // this process takes the task over and holds that app's worker.
+    let later = NOW + LEASE_TTL_MS + 1_000;
+    store
+        .tasks()
+        .unwrap()
+        .acquire_lease(
+            &lease_resource("t"),
+            "monocode-desktop",
+            LEASE_TTL_MS,
+            later,
+        )
+        .unwrap();
+    let after = later + LEASE_TTL_MS + 2;
+    Coordinator::new("gpui-2", ExplicitStart)
+        .tick(&store, &launcher, after)
+        .unwrap();
+    assert_eq!(attempts(&store)[0].status, AttemptState::Interrupted);
+    let held = monitor(&store, "mono-1", after + 1).unwrap().remove(0);
+    assert_eq!(held.workers[0].status, AssignmentState::Running);
+    assert_eq!(held.workers[0].state(None), WorkerState::Stopped);
+    assert_eq!(held.working(), 0);
+    assert_ne!(held.badge(), Some(Badge::Working(1)));
+    assert_eq!(badge(&[held]), None);
 }

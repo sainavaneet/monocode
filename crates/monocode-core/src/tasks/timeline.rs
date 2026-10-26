@@ -11,6 +11,44 @@ use std::collections::HashMap;
 
 /// Entries kept per task, newest first.
 pub const TIMELINE_LIMIT: usize = 40;
+/// The event kinds [`entry`] may turn into an entry; the view reads only
+/// the newest of these, never a task's whole history.
+pub const KINDS: &[&str] = &[
+    "decision.requested",
+    "decision.provider_question",
+    "decision.escalated",
+    "decision.answered",
+    "attempt.started",
+    "attempt.handoff",
+    "attempt.failure",
+    "attempt.dispatch_failed",
+    "attempt.start_failed",
+    "launch.unconfirmed",
+    "assignment.failed",
+    "recovery.blocked",
+    "recovery.exhausted",
+    "recovery.ended_without_result",
+    "recovery.stop_stalled",
+    "recovery.workspace_missing",
+    "task.workspace_failed",
+    "task.account_unavailable",
+    "task.blocked",
+    "task.steered",
+    "assignment.requeued",
+    "assignment.queued",
+    "task.sent_back",
+    "assignment.mono_note",
+    "task.pause_requested",
+    "task.resume_requested",
+    "task.cancel_requested",
+    "assignment.reviewed",
+    "assignment.accepted",
+    "task.verifying",
+    "task.verified",
+    "task.verification_failed",
+    "verification.invalidated",
+    "task.completed",
+];
 /// The longest reason an entry shows.
 const REASON_LIMIT: usize = 160;
 
@@ -67,7 +105,7 @@ impl Names {
         event
             .assignment_id
             .as_deref()
-            .map(|id| self.titles.get(id).cloned().unwrap_or_else(|| id.into()))
+            .map(|id| self.titles.get(id).cloned().unwrap_or_else(|| safe(id)))
             .unwrap_or_else(|| "The task".into())
     }
 
@@ -76,8 +114,8 @@ impl Names {
             return String::new();
         };
         match &runner.account_id {
-            Some(account) => format!(" on {}/{account}", runner.provider),
-            None => format!(" on {}", runner.provider),
+            Some(account) => format!(" on {}/{}", safe(&runner.provider), safe(account)),
+            None => format!(" on {}", safe(&runner.provider)),
         }
     }
 }
@@ -106,8 +144,11 @@ fn with_reason(base: String, event: &Event) -> String {
     }
 }
 
-fn requester(event: &Event) -> &str {
-    event.payload["requester"].as_str().unwrap_or("the app")
+/// Who asked, from the payload: redacted, as all payload text.
+fn requester(event: &Event) -> String {
+    event.payload["requester"]
+        .as_str()
+        .map_or_else(|| "the app".into(), safe)
 }
 
 /// The timeline entry an event makes, if it is one the timeline shows.
@@ -120,7 +161,9 @@ pub fn entry(event: &Event, names: &Names) -> Option<TimelineEntry> {
         "decision.provider_question" => (Decision, format!("{who} asked a question")),
         "decision.escalated" => (Decision, "Mono asked you to decide".to_owned()),
         "decision.answered" => {
-            let by = event.payload["by"].as_str().unwrap_or("someone");
+            let by = event.payload["by"]
+                .as_str()
+                .map_or_else(|| "someone".into(), safe);
             (Decision, format!("Answered by {by}"))
         }
         "attempt.started" => (Launch, format!("Started {who}{}", names.runner(event))),

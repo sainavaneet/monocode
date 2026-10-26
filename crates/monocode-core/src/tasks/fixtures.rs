@@ -7,6 +7,17 @@ use super::{
 use crate::orchestration::{Plan, Task as Assignment};
 use crate::store::Store;
 
+/// Makes the monitoring view (`tasks::view::monitor`) fail, as a damaged
+/// verification table would, while the task inbox keeps working.
+pub fn break_monitor(store: &Store) -> Result<(), TaskError> {
+    let conn = store.connection();
+    conn.execute_batch(
+        "DROP TABLE native_task_verifications;
+         CREATE TABLE native_task_verifications(broken INTEGER);",
+    )?;
+    Ok(())
+}
+
 /// Task `t` owned by `mono` in `project`, Implementing, with assignment `a`
 /// ("Assignment a", files `src`) Running and attempt `x` Running and bound to
 /// a new worker session, whose handle is returned.

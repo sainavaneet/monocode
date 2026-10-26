@@ -175,10 +175,6 @@ pub fn next_batch(store: &Store, mono: &str, now: u64) -> Result<Option<Batch>, 
     Ok(batch_of(&payload))
 }
 
-/// Mono was not reminded of a question it has not answered since its last
-/// delivery reached it more than [`REMIND_AFTER_MS`] ago: queue it again (at
-/// most [`MAX_REMINDERS`] times). Covers a Mono turn that failed after the
-/// batch was acknowledged. Inside the caller's transaction.
 /// Each delivery of an open question to Mono (the first and every
 /// reminder): its state and when it last changed.
 fn sent(tasks: &TaskStore<'_>, decision: &str) -> Result<Vec<(String, u64)>, TaskError> {
@@ -203,6 +199,10 @@ pub(super) fn reminders_stopped(tasks: &TaskStore<'_>, decision: &str) -> Result
     Ok(sent.len() > MAX_REMINDERS && sent.iter().all(|(state, _)| state == "acknowledged"))
 }
 
+/// Mono was not reminded of a question it has not answered since its last
+/// delivery reached it more than [`REMIND_AFTER_MS`] ago: queue it again (at
+/// most [`MAX_REMINDERS`] times). Covers a Mono turn that failed after the
+/// batch was acknowledged. Inside the caller's transaction.
 fn remind(tasks: &TaskStore<'_>, mono: &str, now: u64) -> Result<(), TaskError> {
     for decision in tasks.mono_decisions(mono)? {
         if decision.state != DecisionState::Open || tasks.escalation(&decision.id)?.is_some() {

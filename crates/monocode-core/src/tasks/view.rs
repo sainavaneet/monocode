@@ -78,6 +78,65 @@ pub fn badge(tasks: &[TaskMonitor]) -> Option<Badge> {
         })
 }
 
+/// What a worker is doing, as the card, the overview and the badge count
+/// it. Defined once so its label and colour cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorkerState {
+    /// Its current attempt runs (or is starting and its session is busy).
+    Working,
+    NeedsInput,
+    /// Launched; the app has not confirmed the session runs yet.
+    Starting,
+    /// Running on paper, but its worker was stopped (paused, held after a
+    /// restart or takeover, failed): nothing works on it now.
+    Stopped,
+    NeedsReview,
+    Ready,
+    Queued,
+    Accepted,
+    Failed,
+    Cancelled,
+}
+
+impl WorkerState {
+    /// Display order for counts.
+    pub const ALL: [Self; 10] = [
+        Self::Working,
+        Self::NeedsInput,
+        Self::Starting,
+        Self::Stopped,
+        Self::NeedsReview,
+        Self::Ready,
+        Self::Queued,
+        Self::Accepted,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Working => "Working",
+            Self::NeedsInput => "Needs input",
+            Self::Starting => "Starting",
+            Self::Stopped => "Stopped",
+            Self::NeedsReview => "Needs review",
+            Self::Ready => "Ready",
+            Self::Queued => "Queued",
+            Self::Accepted => "Accepted",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+}
+
+/// What the app sees of a worker's session right now, when it has it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Live {
+    pub busy: bool,
+    /// Waiting on a permission or an answer in its chat.
+    pub needs_input: bool,
+}
+
 /// One assignment and the worker on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerView {
@@ -97,6 +156,40 @@ pub struct WorkerView {
     pub branch: Option<String>,
     /// Waiting on an answer (from Mono or the user).
     pub needs_input: bool,
+}
+
+impl WorkerView {
+    /// Its state from the store, refined by the live session when known.
+    /// Only a current attempt that runs (or is starting with a busy
+    /// session) counts as working; a held or stopped one never does.
+    pub fn state(&self, live: Option<Live>) -> WorkerState {
+        let needs_input = self.needs_input || live.is_some_and(|l| l.needs_input);
+        match self.status {
+            AssignmentState::WaitingForDecision => WorkerState::NeedsInput,
+            AssignmentState::Running if needs_input && self.session.is_some() => {
+                WorkerState::NeedsInput
+            }
+            AssignmentState::Running => match self.attempt {
+                Some(AttemptState::Running | AttemptState::Waiting) if self.session.is_some() => {
+                    WorkerState::Working
+                }
+                Some(AttemptState::Created | AttemptState::Starting) => {
+                    if live.is_some_and(|l| l.busy) {
+                        WorkerState::Working
+                    } else {
+                        WorkerState::Starting
+                    }
+                }
+                _ => WorkerState::Stopped,
+            },
+            AssignmentState::NeedsReview => WorkerState::NeedsReview,
+            AssignmentState::Ready => WorkerState::Ready,
+            AssignmentState::Queued => WorkerState::Queued,
+            AssignmentState::Accepted => WorkerState::Accepted,
+            AssignmentState::Failed => WorkerState::Failed,
+            AssignmentState::Cancelled => WorkerState::Cancelled,
+        }
+    }
 }
 
 /// An open decision of the task.
@@ -154,21 +247,17 @@ impl TaskMonitor {
         self.timeline.first()
     }
 
-    /// Workers running now.
+    /// Workers whose current attempt runs now, by the store.
     pub fn working(&self) -> usize {
         self.workers
             .iter()
-            .filter(|w| w.status == AssignmentState::Running && !w.needs_input)
+            .filter(|w| w.state(None) == WorkerState::Working)
             .count()
     }
 
     /// Open decisions that wait for the user.
     pub fn for_user(&self) -> usize {
         self.decisions.iter().filter(|d| d.escalated).count()
-    }
-
-    pub fn count(&self, status: AssignmentState) -> usize {
-        self.workers.iter().filter(|w| w.status == status).count()
     }
 
     /// This task's own badge (see [`Badge`] for the precedence).
@@ -188,8 +277,8 @@ impl TaskMonitor {
     }
 }
 
-/// The monitoring view of every unfinished task `mono` leads.
-pub fn monitor(store: &Store, mono: &str) -> Result<Vec<TaskMonitor>, TaskError> {
+/// The monitoring view of every unfinished task `mono` leads, at `now`.
+pub fn monitor(store: &Store, mono: &str, now: u64) -> Result<Vec<TaskMonitor>, TaskError> {
     let rows = lifecycle::controls(store, mono)?;
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -198,7 +287,7 @@ pub fn monitor(store: &Store, mono: &str) -> Result<Vec<TaskMonitor>, TaskError>
         return Ok(Vec::new());
     };
     rows.into_iter()
-        .map(|row| one(store, &tasks, row))
+        .map(|row| one(store, &tasks, row, now))
         .collect()
 }
 
@@ -206,10 +295,12 @@ fn one(
     store: &Store,
     tasks: &TaskStore<'_>,
     mut control: ControlRow,
+    now: u64,
 ) -> Result<TaskMonitor, TaskError> {
     let task = task_or_missing(tasks, &control.task_id)?;
     control.reason = control.reason.as_deref().map(safe);
-    let events = task_events(tasks, &task.id)?;
+    control.title = safe(&control.title);
+    let events = timeline_events(tasks, &task.id)?;
     let (workers, names) = workers(store, tasks, &task)?;
     let decisions = decisions(tasks, &task.id)?;
     let (recovery, recovering) = recovery(tasks, &task, &names)?;
@@ -223,11 +314,14 @@ fn one(
         activity,
         verification: verification(tasks, &task)?,
         timeline: timeline::entries(&events, &names),
-        last_worker_activity: latest(&events, from_worker),
+        last_worker_activity: latest(tasks, &task.id, FROM_WORKER)?,
+        // A lease is renewed at each sync for its time to live; an expired
+        // one says nothing about a recent sync.
         last_status_sync: tasks
             .lease(&lease_resource(&task.id))?
+            .filter(|lease| lease.expires_at > now)
             .map(|lease| lease.expires_at.saturating_sub(LEASE_TTL_MS)),
-        last_mono_review: latest(&events, from_mono),
+        last_mono_review: latest(tasks, &task.id, FROM_MONO)?,
         workers,
         decisions,
         recovery,
@@ -236,11 +330,20 @@ fn one(
     })
 }
 
-fn task_events(tasks: &TaskStore<'_>, task: &str) -> Result<Vec<Event>, TaskError> {
-    let mut statement = tasks.conn.prepare(
+/// The newest events the timeline can show (a bounded tail, oldest first).
+fn timeline_events(tasks: &TaskStore<'_>, task: &str) -> Result<Vec<Event>, TaskError> {
+    let kinds = timeline::KINDS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    // Some kinds make no entry (a superseded review), so read a margin.
+    let limit = timeline::TIMELINE_LIMIT * 2;
+    let mut statement = tasks.conn.prepare(&format!(
         "SELECT seq,id,assignment_id,attempt_id,kind,payload,created_at
-         FROM native_task_events WHERE task_id=?1 ORDER BY seq",
-    )?;
+         FROM native_task_events WHERE task_id=?1 AND kind IN ({kinds})
+         ORDER BY seq DESC LIMIT {limit}"
+    ))?;
     let rows = statement.query_map([task], |row| {
         let payload: String = row.get(5)?;
         Ok(Event {
@@ -254,43 +357,33 @@ fn task_events(tasks: &TaskStore<'_>, task: &str) -> Result<Vec<Event>, TaskErro
             created_at: read_ms(row, 6)?,
         })
     })?;
-    Ok(rows.collect::<Result<_, _>>()?)
-}
-
-fn latest(events: &[Event], pick: fn(&Event) -> bool) -> Option<u64> {
-    events
-        .iter()
-        .filter(|e| pick(e))
-        .map(|e| e.created_at)
-        .max()
+    let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+    events.reverse();
+    Ok(events)
 }
 
 /// Something a worker did: a report, a question, a claim, or its start.
-fn from_worker(event: &Event) -> bool {
-    event.payload["requester"] == "worker"
-        || matches!(
-            event.kind.as_str(),
-            "attempt.started"
-                | "attempt.claim"
-                | "worker.result"
-                | "attempt.blocked"
-                | "decision.requested"
-                | "decision.provider_question"
-        )
-}
+const FROM_WORKER: &str = "json_extract(payload,'$.requester')='worker'
+    OR kind IN ('attempt.started','attempt.claim','worker.result','attempt.blocked',
+                'decision.requested','decision.provider_question')";
 
 /// A judgement Mono made: an answer, an acceptance or send-back of an
 /// assignment, moving the task on from review, a note. Planning moves (a
 /// plan saved, the task made ready) are not reviews.
-fn from_mono(event: &Event) -> bool {
-    let by_mono = event.payload["requester"] == "mono";
-    let reviewed_task = matches!(
-        event.payload["from"].as_str(),
-        Some("reviewing" | "integrating" | "verifying")
-    );
-    (by_mono && (event.kind.starts_with("assignment.") || reviewed_task))
-        || event.payload["by"] == "mono"
-        || event.kind == "assignment.mono_note"
+const FROM_MONO: &str = "(json_extract(payload,'$.requester')='mono'
+      AND (kind LIKE 'assignment.%'
+           OR json_extract(payload,'$.from') IN ('reviewing','integrating','verifying')))
+    OR json_extract(payload,'$.by')='mono' OR kind='assignment.mono_note'";
+
+/// When the task's newest event matching `filter` happened (one indexed
+/// aggregate, not a scan in the app).
+fn latest(tasks: &TaskStore<'_>, task: &str, filter: &str) -> Result<Option<u64>, TaskError> {
+    let at: Option<i64> = tasks.conn.query_row(
+        &format!("SELECT MAX(created_at) FROM native_task_events WHERE task_id=?1 AND ({filter})"),
+        [task],
+        |row| row.get(0),
+    )?;
+    Ok(at.and_then(|at| u64::try_from(at).ok()))
 }
 
 fn workers(
@@ -334,14 +427,13 @@ fn workers(
             .iter()
             .rev()
             .find(|w| w.assignment_id.as_deref() == Some(assignment.id.as_str()));
-        names
-            .titles
-            .insert(assignment.id.clone(), assignment.title.clone());
+        let title = safe(&assignment.title);
+        names.titles.insert(assignment.id.clone(), title.clone());
         workers.push(WorkerView {
             needs_input: assignment.status == AssignmentState::WaitingForDecision
                 || current.is_some_and(|a| a.status == AttemptState::Waiting),
             assignment_id: assignment.id,
-            title: assignment.title,
+            title,
             status: assignment.status,
             attempt: latest.map(|a| a.status),
             session: current.and_then(|a| handle(&a.session_id)),
@@ -431,7 +523,7 @@ fn recovery_line(r: &Recovery, names: &Names) -> String {
         .titles
         .get(&r.assignment_id)
         .cloned()
-        .unwrap_or_else(|| r.assignment_id.clone());
+        .unwrap_or_else(|| safe(&r.assignment_id));
     let from = match &r.failed_account {
         Some(account) => format!("{}/{account}", r.provider),
         None => r.provider.clone(),
@@ -449,12 +541,13 @@ fn recovery_line(r: &Recovery, names: &Names) -> String {
             other => safe(other),
         },
     };
-    format!(
+    // Accounts are ids, but every stored text is redacted before it shows.
+    safe(&format!(
         "{who}: {} on {from}, {next} (retry {} of {})",
-        safe(&r.failure),
+        r.failure,
         r.retries_used,
         super::recovery::RETRY_BUDGET
-    )
+    ))
 }
 
 /// The kinds of the task's events waiting in Mono's inbox (review hand-offs
@@ -499,7 +592,10 @@ fn activity(
             .any(|w| w.status == AssignmentState::NeedsReview)
     {
         MonoActivity::Reviewing
-    } else if workers.iter().any(|w| w.status == AssignmentState::Running) {
+    } else if workers
+        .iter()
+        .any(|w| w.state(None) == WorkerState::Working)
+    {
         MonoActivity::Supervising
     } else {
         MonoActivity::Idle
