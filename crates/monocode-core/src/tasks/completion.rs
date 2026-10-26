@@ -14,8 +14,8 @@ use super::events::{append, NewEvent};
 use super::findings::task_ref;
 use super::states::apply;
 use super::{
-    AssignmentState, Requester, State, Subject, TaskError, TaskLifecycle, TaskStage, Verification,
-    Workspace,
+    AcceptanceCriterion, AssignmentState, Requester, State, Subject, TaskError, TaskLifecycle,
+    TaskStage, Verification, Workspace,
 };
 use crate::checkpoint;
 use crate::git::git;
@@ -261,6 +261,47 @@ fn invalidate(tasks: &super::TaskStore<'_>, v: &Verification, now: u64) -> Resul
     Ok(())
 }
 
+/// Whether `criterion` is satisfied by `live` (non-invalidated
+/// verifications, oldest first). A criterion without checks is Mono's
+/// judgement: its newest verification passed. One with checks needs every
+/// check's newest verification to have passed, all on one snapshot; a check
+/// that never ran (or could not run) leaves it unsatisfied.
+pub fn criterion_satisfied(criterion: &AcceptanceCriterion, live: &[Verification]) -> bool {
+    let newest = |check: Option<&str>| {
+        live.iter().rev().find(|v| {
+            v.criterion_id.as_deref() == Some(criterion.id.as_str())
+                && check.is_none_or(|check| v.check == check)
+        })
+    };
+    if criterion.checks.is_empty() {
+        return newest(None).is_some_and(|v| v.passed);
+    }
+    let mut checkpoint: Option<&str> = None;
+    criterion.checks.iter().all(|check| {
+        let Some(v) = newest(Some(check)).filter(|v| v.passed) else {
+            return false;
+        };
+        *checkpoint.get_or_insert(v.checkpoint_commit.as_str()) == v.checkpoint_commit
+    })
+}
+
+/// The completion precondition: at least one required criterion, and every
+/// required criterion satisfied ([`criterion_satisfied`]) by the task's
+/// recorded live verifications.
+pub(super) fn criteria_satisfied(conn: &Connection, task_id: &str) -> Result<bool, TaskError> {
+    let tasks = super::TaskStore { conn };
+    let Some(task) = tasks.task(task_id)? else {
+        return Ok(false);
+    };
+    let live: Vec<Verification> = tasks
+        .verifications(task_id)?
+        .into_iter()
+        .filter(|v| !v.invalidated)
+        .collect();
+    let required: Vec<&AcceptanceCriterion> = task.criteria.iter().filter(|c| c.required).collect();
+    Ok(!required.is_empty() && required.iter().all(|c| criterion_satisfied(c, &live)))
+}
+
 /// The task's verifications that still reflect their workspace, after
 /// [`refresh_verifications`].
 pub fn live_verifications(
@@ -413,7 +454,7 @@ pub fn final_report(store: &Store, task_id: &str, now: u64) -> Result<FinalRepor
             CriterionReport {
                 id: c.id.clone(),
                 required: c.required,
-                satisfied: latest.is_some_and(|v| v.passed),
+                satisfied: criterion_satisfied(c, &live),
                 verification: latest.map(|v| v.id.clone()),
                 checkpoint: latest.map(|v| v.checkpoint_commit.clone()),
             }
@@ -468,3 +509,7 @@ pub fn complete(
     tx.commit()?;
     Ok(report)
 }
+
+#[cfg(test)]
+#[path = "criteria_tests.rs"]
+mod criteria_tests;

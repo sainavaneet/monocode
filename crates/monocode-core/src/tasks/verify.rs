@@ -15,11 +15,16 @@
 //! responsible assignment back with a correction and the stage back to
 //! Implementing. A criterion without checks, or a check that cannot run,
 //! waits for Mono (`mono_review`), who may call `verify_criterion`; it is
-//! never satisfied by default. When every required criterion is satisfied
+//! never satisfied by default. A criterion with checks is satisfied only when
+//! every one of its checks passed on one snapshot (`criterion_satisfied`);
+//! a check that could not run is recorded as not passing. When every
+//! required criterion is satisfied
 //! the final report is persisted and the task completes. As with review,
 //! only collecting and recording use the store.
 use super::checks::{self, Batch};
-use super::completion::{complete, evidence, refresh_verifications, FinalReport};
+use super::completion::{
+    complete, criterion_satisfied, evidence, refresh_verifications, FinalReport,
+};
 use super::coordinator::{Coordinator, Policy};
 use super::events::{append, NewEvent};
 use super::findings::{task_ref, Finding, Review, ReviewOutcome};
@@ -334,11 +339,7 @@ impl<P: Policy> Coordinator<P> {
         let mut pending = Vec::new();
         let mut unchecked = Vec::new();
         for criterion in task.criteria.iter().filter(|c| c.required) {
-            let latest = live
-                .iter()
-                .rev()
-                .find(|v| v.criterion_id.as_deref() == Some(criterion.id.as_str()));
-            if latest.is_some_and(|v| v.passed) {
+            if criterion_satisfied(criterion, &live) {
                 continue;
             }
             if criterion.checks.is_empty() {
@@ -540,8 +541,9 @@ fn round_findings(job: &VerifyJob, inspection: &RoundInspection) -> Vec<Finding>
     findings
 }
 
-/// One verification per criterion check that ran on the round's snapshot;
-/// none when a check changed the workspace.
+/// One verification per criterion check of the round's snapshot, a check
+/// that could not run recorded as not passing; none when a check changed the
+/// workspace.
 fn record_criteria(
     tasks: &TaskStore<'_>,
     job: &VerifyJob,
@@ -555,34 +557,41 @@ fn record_criteria(
         return Ok(Vec::new());
     }
     let mut ids = Vec::new();
-    for (index, (criterion, result)) in inspection
-        .criteria
-        .iter()
-        .zip(&inspection.batch.results)
-        .enumerate()
-    {
-        let Ok(run) = result else {
-            continue;
-        };
+    let checks = inspection.criteria.iter().zip(&inspection.checks);
+    for (index, ((criterion, check), result)) in checks.zip(&inspection.batch.results).enumerate() {
         let id = format!(
             "criterion:{}:{criterion}:{}:{index}",
             job.task.id, job.round
         );
+        let (passed, evidence) = match result {
+            Ok(run) => (run.passed(), evidence(&job.workspace, run)),
+            Err(reason) => (false, unrunnable(&job.workspace, reason)),
+        };
         tasks.record_verification(&Verification {
             id: id.clone(),
             task_id: job.task.id.clone(),
             assignment_id: job.assignment.as_ref().map(|a| a.id.clone()),
             criterion_id: Some(criterion.clone()),
             checkpoint_commit: checkpoint.clone(),
-            check: run.check.clone(),
-            passed: run.passed(),
-            evidence: evidence(&job.workspace, run),
+            check: check.clone(),
+            passed,
+            evidence,
             invalidated: false,
             created_at: now,
         })?;
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// The evidence of a check that could not run: where, and why.
+fn unrunnable(workspace: &Workspace, reason: &str) -> String {
+    json!({
+        "workspace": workspace.id,
+        "path": workspace.path,
+        "unrunnable": reason,
+    })
+    .to_string()
 }
 
 /// The criteria failed: the responsible assignment goes back to Queued with

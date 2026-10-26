@@ -534,12 +534,9 @@ fn precondition_holds(
         Precondition::NoOpenDecision => "SELECT NOT EXISTS(SELECT 1 FROM native_task_decisions WHERE task_id=?1 AND assignment_id=?2 AND state='open')",
         Precondition::AssignmentsAccepted => "SELECT NOT EXISTS(SELECT 1 FROM native_task_assignments WHERE task_id=?1 AND status NOT IN ('accepted','cancelled'))
             AND EXISTS(SELECT 1 FROM native_task_assignments WHERE task_id=?1 AND status='accepted')",
-        Precondition::CriteriaSatisfied => "SELECT EXISTS(SELECT 1 FROM native_tasks t, json_each(t.criteria) c
-              WHERE t.id=?1 AND json_extract(c.value,'$.required'))
-            AND NOT EXISTS(SELECT 1 FROM native_tasks t, json_each(t.criteria) c
-            WHERE t.id=?1 AND json_extract(c.value,'$.required') AND COALESCE((SELECT v.passed FROM native_task_verifications v
-              WHERE v.task_id=t.id AND v.criterion_id=json_extract(c.value,'$.id') AND v.invalidated=0
-              ORDER BY v.rowid DESC LIMIT 1),0)=0)",
+        Precondition::CriteriaSatisfied => {
+            return super::completion::criteria_satisfied(conn, task);
+        }
         Precondition::NoBlockingDecision => "SELECT NOT EXISTS(SELECT 1 FROM native_task_decisions d WHERE d.task_id=?1 AND d.state<>'resolved'
             AND NOT EXISTS(SELECT 1 FROM native_task_assignments a WHERE a.task_id=d.task_id AND a.id=d.assignment_id AND a.status='cancelled'))",
         Precondition::FinalReportRecorded => "SELECT EXISTS(SELECT 1 FROM native_task_events WHERE id='final_report:'||?1)",

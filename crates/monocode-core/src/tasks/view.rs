@@ -15,7 +15,6 @@ use super::store::read_ms;
 use super::timeline::{self, safe, Names, Runner, TimelineEntry};
 use super::{AssignmentState, AttemptState, DecisionState, Task, TaskError, TaskStage, TaskStore};
 use crate::store::Store;
-use std::collections::HashMap;
 
 /// What Mono is doing for a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,24 +607,26 @@ fn verification(tasks: &TaskStore<'_>, task: &Task) -> Result<VerificationProgre
         .into_iter()
         .filter(|v| !v.invalidated)
         .collect();
-    let mut latest: HashMap<&str, bool> = HashMap::new();
-    for v in &live {
-        if let Some(criterion) = &v.criterion_id {
-            // Recorded oldest first, so the last one per criterion wins.
-            latest.insert(criterion.as_str(), v.passed);
-        }
-    }
     let required: Vec<_> = task.criteria.iter().filter(|c| c.required).collect();
-    let result = |passed| {
-        required
-            .iter()
-            .filter(|c| latest.get(c.id.as_str()) == Some(&passed))
-            .count()
-    };
+    // The same rule as completion; a criterion counts as failed when it is
+    // not satisfied and one of its live verifications failed.
+    let passed = required
+        .iter()
+        .filter(|c| super::completion::criterion_satisfied(c, &live))
+        .count();
+    let failed = required
+        .iter()
+        .filter(|c| {
+            !super::completion::criterion_satisfied(c, &live)
+                && live
+                    .iter()
+                    .any(|v| v.criterion_id.as_deref() == Some(c.id.as_str()) && !v.passed)
+        })
+        .count();
     Ok(VerificationProgress {
         required: required.len(),
-        passed: result(true),
-        failed: result(false),
+        passed,
+        failed,
     })
 }
 
