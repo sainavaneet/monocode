@@ -42,6 +42,28 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn nested_repositories_without_a_commit_do_not_block_the_turn_checkpoint() {
+    let f = Fixture::new();
+    // A stray `git clone <bundle> recovered` leaves a repository whose branch
+    // has no commit. `git add -A` refuses to record it as a gitlink.
+    let nested = f.repo.join("recovered");
+    std::fs::create_dir_all(&nested).unwrap();
+    run_git(&nested, &["init"]).unwrap();
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.write("new.txt", "agent change\n");
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let status = f.store.status("session", f.cwd()).unwrap();
+    assert_eq!(
+        status
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect::<Vec<_>>(),
+        ["new.txt"]
+    );
+}
+
+#[test]
 fn records_shell_changes_and_preserves_the_index_head_and_saved_result() {
     let f = Fixture::new();
     f.write("a.txt", "user change\n");

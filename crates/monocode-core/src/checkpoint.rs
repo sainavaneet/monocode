@@ -873,6 +873,35 @@ impl Drop for PrivateIndex {
     }
 }
 
+/// Whether a failed `git add --ignore-errors` reported nothing but nested
+/// repositories without a commit, as in:
+/// `error: 'recovered/' does not have a commit checked out`,
+/// `error: unable to index file 'recovered/'`, `fatal: adding files failed`.
+fn only_repositories_without_commits(error: &str) -> bool {
+    let mut stray: Vec<&str> = Vec::new();
+    for line in error.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with("warning:") || line.starts_with("hint:") {
+            continue;
+        }
+        if let Some(path) = line
+            .strip_prefix("error: '")
+            .and_then(|rest| rest.strip_suffix("' does not have a commit checked out"))
+        {
+            stray.push(path.trim_end_matches('/'));
+        } else if let Some(path) = line
+            .strip_prefix("error: unable to index file '")
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            if !stray.contains(&path.trim_end_matches('/')) {
+                return false;
+            }
+        } else if line != "fatal: adding files failed" {
+            return false;
+        }
+    }
+    !stray.is_empty()
+}
+
 fn capture_workspace(root: &Path, reference: &str) -> Result<String, String> {
     if run_git(root, &["config", "--bool", "core.sparseCheckout"])
         .ok()
@@ -903,7 +932,20 @@ fn capture_workspace(root: &Path, reference: &str) -> Result<String, String> {
         "-c",
         "core.fsyncMethod=fsync",
     ];
-    run(&[durable.as_slice(), &["add", "-A", "--", "."]].concat())?;
+    // A nested repository with no checked-out commit (a stray clone of an
+    // empty bundle, say) cannot be recorded as a gitlink. With --ignore-errors
+    // git still indexes everything else and reports the stray path, which is
+    // not the turn's work, so that outcome counts as a complete snapshot.
+    if let Err(error) = run(&[
+        durable.as_slice(),
+        &["add", "-A", "--ignore-errors", "--", "."],
+    ]
+    .concat())
+    {
+        if !only_repositories_without_commits(&error) {
+            return Err(error);
+        }
+    }
     let tree = String::from_utf8(run(&[durable.as_slice(), &["write-tree"]].concat())?)
         .map_err(|e| e.to_string())?;
     let commit = String::from_utf8(run(&[
