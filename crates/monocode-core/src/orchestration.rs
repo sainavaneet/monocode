@@ -1,5 +1,6 @@
 //! Reviewable orchestration plans. Workers share a checkout; overlapping scopes
 //! are serialized even when they have no explicit dependency.
+use crate::tasks::AssignmentState;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -45,7 +46,9 @@ impl SummaryTask {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One assignment of a plan. Durable task fields are optional in JSON, so plans
+/// written before they existed still parse and new plans look the same.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub title: String,
@@ -53,8 +56,49 @@ pub struct Task {
     pub files: Vec<String>,
     #[serde(default, alias = "dependsOn")]
     pub depends_on: Vec<String>,
+    /// Where the work happens; None leaves the choice to the coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMode>,
+    #[serde(default, skip_serializing_if = "is_queued")]
+    pub status: AssignmentState,
+    /// The durable record's revision; zero before it is persisted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revision: u64,
+    /// The checks the worker is expected to run and report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification: Vec<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+fn is_queued(status: &AssignmentState) -> bool {
+    *status == AssignmentState::Queued
+}
+fn is_zero(revision: &u64) -> bool {
+    *revision == 0
+}
+/// How an assignment's workspace is provided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    /// Read or edit the project's existing checkout.
+    Checkout,
+    /// A dedicated branch and worktree.
+    Worktree,
+}
+impl WorkspaceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Checkout => "checkout",
+            Self::Worktree => "worktree",
+        }
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "checkout" => Some(Self::Checkout),
+            "worktree" => Some(Self::Worktree),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     pub title: String,
     pub summary: String,
@@ -143,6 +187,17 @@ pub fn validate(plan: &Plan) -> Result<(), String> {
                 task.id
             ));
         }
+        if task.verification.len() > 16
+            || task
+                .verification
+                .iter()
+                .any(|step| step.trim().is_empty() || step.len() > 2_000)
+        {
+            return Err(format!(
+                "Assignment {} has an empty or oversized verification step.",
+                task.id
+            ));
+        }
         for file in &task.files {
             if file.trim().is_empty()
                 || file.len() > 512
@@ -200,6 +255,7 @@ mod tests {
             prompt: "Work".into(),
             files: vec![file.into()],
             depends_on: deps.iter().map(|s| (*s).into()).collect(),
+            ..Task::default()
         }
     }
     #[test]
@@ -216,6 +272,50 @@ mod tests {
         assert!(validate(&plan).is_err());
         assert!(overlaps(&["src".into()], &["src/main.rs".into()]));
         assert!(!overlaps(&["src".into()], &["src2/main.rs".into()]));
+    }
+    #[test]
+    fn old_format_plan_still_parses_with_assignment_defaults() {
+        let old = r#"{"title":"T","summary":"","tasks":[{"id":"a","title":"A","prompt":"p","files":["src"],"dependsOn":["b"]},{"id":"b","title":"B","prompt":"p","files":["tests"]}]}"#;
+        let plan: Plan = serde_json::from_str(old).unwrap();
+        let task = &plan.tasks[0];
+        assert_eq!(task.depends_on, vec!["b".to_owned()]);
+        assert_eq!(task.workspace, None);
+        assert_eq!(task.status, crate::tasks::AssignmentState::Queued);
+        assert_eq!(task.revision, 0);
+        assert!(task.verification.is_empty());
+        assert!(validate(&plan).is_ok());
+        // Defaults stay out of the JSON, so plans written today look as before.
+        let written = serde_json::to_value(&plan.tasks[1]).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({"id":"b","title":"B","prompt":"p","files":["tests"],"depends_on":[]})
+        );
+    }
+    #[test]
+    fn assignment_fields_round_trip_through_plan_json() {
+        let task = Task {
+            workspace: Some(WorkspaceMode::Worktree),
+            status: crate::tasks::AssignmentState::NeedsReview,
+            revision: 3,
+            verification: vec!["cargo test -p monocode-core".into()],
+            ..task("a", &[], "src")
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""workspace":"worktree""#));
+        assert!(json.contains(r#""status":"needs_review""#));
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, task);
+        let mut plan = Plan {
+            title: "Work".into(),
+            summary: String::new(),
+            tasks: vec![Task {
+                verification: vec![String::new()],
+                ..task.clone()
+            }],
+        };
+        assert!(validate(&plan).is_err(), "blank verification step");
+        plan.tasks[0].verification = vec!["x".repeat(2_001)];
+        assert!(validate(&plan).is_err(), "oversized verification step");
     }
     #[test]
     fn display_text_hides_plan_json_including_while_streaming() {

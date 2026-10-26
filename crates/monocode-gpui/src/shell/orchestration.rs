@@ -426,6 +426,7 @@ mod tests {
                         prompt: "Inspect and report".into(),
                         files: vec![file.into()],
                         depends_on: Vec::new(),
+                        ..Task::default()
                     })
                     .collect();
                 shell.start_orchestration(

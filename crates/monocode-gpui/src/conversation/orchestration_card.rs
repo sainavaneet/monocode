@@ -387,6 +387,7 @@ mod tests {
             prompt: "p".into(),
             files: vec!["src".into()],
             depends_on: vec![],
+            ..Task::default()
         };
         let plan = Plan {
             title: "T".into(),
@@ -406,6 +407,7 @@ mod tests {
             prompt: "p".into(),
             files: vec!["src".into(), "tests".into()],
             depends_on: vec!["a".into()],
+            ..Task::default()
         };
         assert_eq!(scope_line(&task), "src, tests · after a");
     }
