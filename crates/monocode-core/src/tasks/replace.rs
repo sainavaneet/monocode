@@ -51,17 +51,21 @@ fn choose(store: &Store, row: &Recovery, now: u64) -> Result<Choice, TaskError> 
         .task(&row.task_id)?
         .ok_or_else(|| TaskError::NotFound(format!("task:{}", row.task_id)))?;
     let policy = policy::capture(store, &task, &row.provider, now)?;
-    // A blocked lineage that was unblocked spends a retry now.
+    let candidates = Candidates::read(store, &task, &policy)?;
+    // A blocked lineage that was unblocked spends a retry now; a scheduled
+    // one already counted its retry, which a lowered limit may refuse.
     let retries = if row.state == BLOCKED {
-        if row.retries_used >= policy.autonomy.retry_limit {
+        if row.retries_used >= candidates.retry_limit {
             return Ok(Choice::Exhausted);
         }
         row.retries_used + 1
     } else {
+        if row.retries_used > candidates.retry_limit {
+            return Ok(Choice::Exhausted);
+        }
         row.retries_used
     };
     let provider = row.next_provider.clone().unwrap_or(row.provider.clone());
-    let candidates = Candidates::read(store, &task, &policy)?;
     let pool = candidates.pool();
     let failed: AllowedAccount = candidates.entry(&row.provider, row.failed_account.as_deref());
     let replace = |account: AllowedAccount| Choice::Replace {

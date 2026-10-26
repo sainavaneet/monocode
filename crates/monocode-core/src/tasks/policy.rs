@@ -167,9 +167,10 @@ pub fn allowlist(store: &Store, task: &Task, policy: &TaskPolicy) -> Result<Allo
 
 /// Everything recovery chooses accounts from, read once per decision.
 pub(super) struct Candidates {
-    /// The live allowlist, with provider fallback as the snapshot allows.
+    /// The live allowlist, with provider fallback as the task's effective
+    /// policy allows (the policy's switch supersedes the allowlist's flag).
     pub allowlist: Allowlist,
-    /// The snapshot's retries per lineage.
+    /// The effective retries per lineage.
     pub retry_limit: u32,
     pub health: eligibility::HealthBook,
     exists: Box<dyn Fn(&AllowedAccount) -> bool>,
@@ -177,12 +178,18 @@ pub(super) struct Candidates {
 }
 
 impl Candidates {
+    /// Reads the live allowlist and the task's effective policy: its
+    /// snapshot as the app's live policy (`autonomy::live`) still allows it,
+    /// so turning provider fallback off or lowering retries reaches tasks
+    /// already under way.
     pub fn read(store: &Store, task: &Task, policy: &TaskPolicy) -> Result<Self, TaskError> {
+        let live = autonomy::live(task.mono_id.as_deref(), &task.project);
+        let effective = autonomy::effective(Some(policy), &live);
         let mut allowlist = allowlist(store, task, policy)?;
-        allowlist.provider_fallback = policy.autonomy.provider_fallback;
+        allowlist.provider_fallback = effective.provider_fallback;
         Ok(Self {
             allowlist,
-            retry_limit: policy.autonomy.retry_limit,
+            retry_limit: effective.retry_limit,
             health: eligibility::health(store).map_err(TaskError::Storage)?,
             exists: Box::new(eligibility::known_accounts(store).map_err(TaskError::Storage)?),
             start_account: policy.start_account.clone(),

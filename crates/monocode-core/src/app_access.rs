@@ -23,7 +23,7 @@ mod mono_policy_tests;
 mod tests;
 #[cfg(test)]
 mod worker_tests;
-pub use mono_policy::{mono_policy_action, unblock, MONO_POLICY_ACTIONS};
+pub use mono_policy::{mono_policy_action, MONO_POLICY_ACTIONS};
 
 pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     if !matches!(

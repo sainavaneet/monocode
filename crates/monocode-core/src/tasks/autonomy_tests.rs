@@ -44,9 +44,13 @@ fn generous() -> Autonomy {
 }
 
 fn new(repo: &Repo, id: &str) -> NewTask {
+    owned_by(repo, id, "mono-1")
+}
+
+fn owned_by(repo: &Repo, id: &str, mono: &str) -> NewTask {
     NewTask {
         id: id.into(),
-        mono_id: Some("mono-1".into()),
+        mono_id: Some(mono.into()),
         project: repo.root.to_string_lossy().into_owned(),
         title: "Ship it".into(),
         request: "Implement the feature".into(),
@@ -79,7 +83,19 @@ fn planned(
     assignments: Vec<crate::tasks::Assignment>,
     stage: TaskStage,
 ) {
-    policy::create_task_with(store, &new(repo, id), "codex", live, NOW).unwrap();
+    planned_for(store, &new(repo, id), live, assignments, stage);
+}
+
+/// As [`planned`], for a task described by `new`.
+fn planned_for(
+    store: &Store,
+    new: &NewTask,
+    live: &Autonomy,
+    assignments: Vec<crate::tasks::Assignment>,
+    stage: TaskStage,
+) {
+    let id = new.id.as_str();
+    policy::create_task_with(store, new, "codex", live, NOW).unwrap();
     let tasks = store.tasks().unwrap();
     tasks.save_plan(id, 1, &plan(assignments), NOW).unwrap();
     let t = Subject::Task(id);
@@ -111,6 +127,7 @@ fn brief(store: &Store, launcher: &Recorded) -> String {
 
 #[test]
 fn the_default_policy_starts_nothing_on_its_own_and_grants_only_commits() {
+    let _published = tests_lock();
     let defaults = Autonomy::default();
     assert!(!defaults.automatic_execution);
     assert_eq!(defaults.workspace, WorkspacePreference::Automatic);
@@ -406,6 +423,7 @@ fn applying_the_policy_re_snapshots_one_active_task_with_a_revision_bump() {
 
 #[test]
 fn the_workspace_preference_picks_the_workspace_and_never_writes_into_the_checkout() {
+    let _published = tests_lock();
     // A dedicated worktree even for an investigation.
     let repo_a = repo();
     let store = open(&repo_a);
@@ -472,6 +490,7 @@ fn the_workspace_preference_picks_the_workspace_and_never_writes_into_the_checko
 
 #[test]
 fn recovery_takes_its_retry_limit_and_provider_fallback_from_the_snapshot() {
+    let _published = tests_lock();
     // One retry allowed: the second failure exhausts the lineage.
     let repo_a = repo();
     let store = open(&repo_a);
@@ -501,7 +520,9 @@ fn recovery_takes_its_retry_limit_and_provider_fallback_from_the_snapshot() {
     confirm_started(&store, session, at).unwrap();
     assert_eq!(fail(&store, session, "503", at + 1), Outcome::Exhausted);
 
-    // Provider fallback is the snapshot's, whatever the allowlist says.
+    // Provider fallback is the policy's (snapshot and live), whatever the
+    // allowlist's own flag says.
+    const MONO: &str = "mono-autonomy-fallback";
     for allowed in [false, true] {
         let repo = repo();
         let store = open(&repo);
@@ -521,10 +542,18 @@ fn recovery_takes_its_retry_limit_and_provider_fallback_from_the_snapshot() {
             provider_fallback: allowed,
             ..Autonomy::default()
         };
-        planned(
+        let mut live = std::collections::HashMap::new();
+        live.insert(
+            MONO.to_owned(),
+            MonoAutonomy {
+                policy: snapshot.clone(),
+                ..MonoAutonomy::default()
+            },
+        );
+        publish(live);
+        planned_for(
             &store,
-            &repo,
-            "t",
+            &owned_by(&repo, "t", MONO),
             &snapshot,
             vec![writes("a", &["src"])],
             TaskStage::Implementing,
@@ -543,6 +572,7 @@ fn recovery_takes_its_retry_limit_and_provider_fallback_from_the_snapshot() {
             assert!(matches!(outcome, Outcome::Blocked(_)), "{outcome:?}");
         }
     }
+    publish(std::collections::HashMap::new());
 }
 
 #[test]
@@ -566,4 +596,176 @@ fn a_mono_and_project_allowlist_overrides_the_monos_own_list() {
     assert_eq!(pick("/other"), mono);
     eligibility::clear_allowlist(&store, Scope::MonoProject("mono-1", "/repo")).unwrap();
     assert_eq!(pick("/repo"), mono);
+}
+
+#[test]
+fn a_commit_made_after_commit_authority_was_revoked_is_sent_back_at_review() {
+    use crate::tasks::review::tests::{feature, CHECK};
+    use crate::tasks::review::{Finding, ReviewOutcome};
+    for revoked in [false, true] {
+        let repo = repo();
+        let store = open(&repo);
+        let checked = crate::tasks::Assignment {
+            verification: vec![CHECK.into()],
+            ..assignment("a", &[])
+        };
+        planned(
+            &store,
+            &repo,
+            "t",
+            &Autonomy::default(),
+            vec![checked],
+            TaskStage::Implementing,
+        );
+        let coordinator = Coordinator::new("gpui-1", Live::new(Autonomy::default()));
+        let launcher = Recorded::default();
+        coordinator.tick(&store, &launcher, NOW).unwrap();
+        let session = launcher.last().0.id;
+        confirm_started(&store, session, NOW).unwrap();
+        // The user revokes commits while the worker runs; it commits anyway.
+        if revoked {
+            coordinator.policy().set(Autonomy {
+                commit: false,
+                ..Autonomy::default()
+            });
+        }
+        let tree =
+            std::path::PathBuf::from(&store.tasks().unwrap().workspaces("t").unwrap()[0].path);
+        feature(&tree);
+        git(&tree, &["add", "."]);
+        git(&tree, &["commit", "-q", "-m", "Add the feature"]);
+        let sha = git(&tree, &["rev-parse", "--short", "HEAD"]);
+        crate::app_access::worker_action(
+            &store,
+            session,
+            "r1",
+            "tasks.worker.result",
+            &serde_json::json!({"outcome": "succeeded", "summary": "Added the feature",
+                "validation": ["test -f src/feature.rs passed"]}),
+            NOW + 1,
+        )
+        .unwrap();
+        let tick = coordinator.tick(&store, &launcher, NOW + 2).unwrap();
+        assert_eq!(tick.reviews.len(), 1, "{tick:?}");
+        let reviews = coordinator.review(&store, NOW + 3).unwrap();
+        let review = &reviews[0];
+        if !revoked {
+            assert_eq!(review.outcome, ReviewOutcome::Accepted, "{review:?}");
+            continue;
+        }
+        assert_eq!(review.outcome, ReviewOutcome::Correction, "{review:?}");
+        let found = review
+            .findings
+            .iter()
+            .find_map(|f| match f {
+                Finding::UnauthorizedCommits { commits } => Some(commits.clone()),
+                _ => None,
+            })
+            .expect("the commit is a finding");
+        assert_eq!(found.len(), 1);
+        assert!(
+            sha.starts_with(&found[0]) || found[0].starts_with(&sha),
+            "{found:?} {sha}"
+        );
+        assert!(review.findings.iter().any(|f| f
+            .describe()
+            .contains("Commits made without commit authority")));
+        assert_eq!(status(&store, "t", "a"), AssignmentState::Queued);
+    }
+}
+
+#[test]
+fn turning_provider_fallback_off_or_lowering_retries_reaches_running_tasks() {
+    const MONO: &str = "mono-autonomy-live-recovery";
+    let _published = tests_lock();
+    let publish_live = |live: Autonomy| {
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            MONO.to_owned(),
+            MonoAutonomy {
+                policy: live,
+                ..MonoAutonomy::default()
+            },
+        );
+        publish(policies);
+    };
+    let coordinator = Coordinator::new("gpui-1", ExplicitStart);
+    let launch = |store: &Store, repo: &Repo, snapshot: &Autonomy, launcher: &Recorded| {
+        let new = owned_by(repo, "t", MONO);
+        planned_for(
+            store,
+            &new,
+            snapshot,
+            vec![writes("a", &["src"])],
+            TaskStage::Implementing,
+        );
+        coordinator.tick(store, launcher, NOW).unwrap();
+        let session = launcher.last().0.id;
+        confirm_started(store, session, NOW).unwrap();
+        session
+    };
+
+    // The task started with provider fallback; the user turns it off.
+    let repo_a = repo();
+    let store = open(&repo_a);
+    let project = repo_a.root.to_string_lossy().into_owned();
+    let list = Allowlist {
+        accounts: vec![
+            AllowedAccount::new("codex", "default"),
+            AllowedAccount {
+                priority: 1,
+                ..AllowedAccount::new("claude", "default")
+            },
+        ],
+        provider_fallback: true,
+    };
+    eligibility::save_allowlist(&store, Scope::Project(&project), &list).unwrap();
+    let fallback = Autonomy {
+        provider_fallback: true,
+        ..Autonomy::default()
+    };
+    publish_live(fallback.clone());
+    let launcher = Recorded::default();
+    let session = launch(&store, &repo_a, &fallback, &launcher);
+    publish_live(Autonomy::default());
+    let outcome = fail(&store, session, "codex is not installed", NOW + 1);
+    assert!(matches!(outcome, Outcome::Blocked(_)), "{outcome:?}");
+
+    // The task started with three retries; the user lowers it to one.
+    let repo_b = repo();
+    let store = open(&repo_b);
+    publish_live(Autonomy::default());
+    let launcher = Recorded::default();
+    let session = launch(&store, &repo_b, &Autonomy::default(), &launcher);
+    publish_live(Autonomy {
+        retry_limit: 1,
+        ..Autonomy::default()
+    });
+    let Outcome::Retry { at, .. } = fail(&store, session, "503", NOW + 1) else {
+        panic!("expected a retry");
+    };
+    stop_all(&store, at);
+    coordinator.tick(&store, &launcher, at).unwrap();
+    let session = launcher.last().0.id;
+    confirm_started(&store, session, at).unwrap();
+    assert_eq!(fail(&store, session, "503", at + 1), Outcome::Exhausted);
+
+    // A retry already scheduled is refused once the limit drops below it.
+    let repo_c = repo();
+    let store = open(&repo_c);
+    publish_live(Autonomy::default());
+    let launcher = Recorded::default();
+    let session = launch(&store, &repo_c, &Autonomy::default(), &launcher);
+    let Outcome::Retry { at, .. } = fail(&store, session, "503", NOW + 1) else {
+        panic!("expected a retry");
+    };
+    publish_live(Autonomy {
+        retry_limit: 0,
+        ..Autonomy::default()
+    });
+    stop_all(&store, at);
+    coordinator.tick(&store, &launcher, at).unwrap();
+    assert_eq!(launcher.count(), 1, "no replacement past the lowered limit");
+    assert_eq!(status(&store, "t", "a"), AssignmentState::Failed);
+    publish(std::collections::HashMap::new());
 }

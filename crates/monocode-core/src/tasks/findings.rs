@@ -72,6 +72,11 @@ pub enum Finding {
     CorrectionLimit {
         corrections: usize,
     },
+    /// The worktree has commits although the task's policy does not allow
+    /// it to commit (revoked while the worker ran).
+    UnauthorizedCommits {
+        commits: Vec<String>,
+    },
 }
 
 fn check_failure(check: &str, exit_code: Option<i32>, timed_out: bool, output: &str) -> String {
@@ -98,6 +103,7 @@ impl Finding {
                 | Self::FailedCheck { .. }
                 | Self::CriterionNotMet { .. }
                 | Self::ModifiedByCheck { .. }
+                | Self::UnauthorizedCommits { .. }
         )
     }
 
@@ -155,6 +161,10 @@ impl Finding {
             Self::CorrectionLimit { corrections } => {
                 format!("The work was already sent back {corrections} times.")
             }
+            Self::UnauthorizedCommits { commits } => format!(
+                "Commits made without commit authority: {}. The Mono's policy no longer allows this task to commit: undo them (keep the changes uncommitted, for example with git reset --soft to the base commit) and report again.",
+                commits.join(", ")
+            ),
         }
     }
 }

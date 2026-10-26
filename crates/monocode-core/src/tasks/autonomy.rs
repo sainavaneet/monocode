@@ -7,15 +7,18 @@
 //! A task captures the effective policy when it is created (or, for a task
 //! created without one, when it first launches) into its snapshot
 //! ([`super::policy::TaskPolicy`]). Later changes reach a task in two ways:
-//! - Reductions apply at once. Every decision point combines the snapshot
-//!   with the live policy and keeps the more restrictive of the two for
-//!   automatic execution, worker concurrency, commit/merge/push/deploy
-//!   authority and restart continuation ([`Autonomy::restricted_by`]).
-//!   Running workers are never stopped by this; new disallowed actions are.
-//! - Everything else (more authority, the workspace preference, the retry
-//!   limit, provider fallback, worktree retention, API key billing) reaches
-//!   an active task only through the explicit [`apply`] step, which
-//!   re-snapshots the live policy into the task with a revision bump.
+//! - Reductions apply at once. Every decision point (the coordinator,
+//!   review and recovery) combines the snapshot with the live policy and
+//!   keeps the more restrictive of the two for automatic execution, worker
+//!   concurrency, commit/merge/push/deploy authority, restart continuation,
+//!   provider fallback and the retry limit ([`Autonomy::restricted_by`]).
+//!   Running workers are never stopped by this; new disallowed actions are,
+//!   and a commit made after commit was revoked is sent back at review.
+//! - Everything else (more authority, the workspace preference, worktree
+//!   retention, API key billing) reaches an active task only through the
+//!   explicit [`apply`] step, which re-snapshots the live policy into the
+//!   task with a revision bump. Billing is never a reduction: which account
+//!   bills an in-flight task does not change under it.
 //!
 //! The account fallback list is not part of the policy: recovery reads the
 //! live allowlist (`accounts::eligibility`) each time it decides.
@@ -154,6 +157,8 @@ impl Autonomy {
             push: self.push && live.push,
             deploy: self.deploy && live.deploy,
             restart_continuation: self.restart_continuation && live.restart_continuation,
+            provider_fallback: self.provider_fallback && live.provider_fallback,
+            retry_limit: self.retry_limit.min(live.retry_limit),
             ..self.clone()
         }
     }
@@ -198,7 +203,10 @@ impl MonoAutonomy {
 /// The policies the app last published, by Mono id.
 static LIVE: RwLock<Option<HashMap<String, MonoAutonomy>>> = RwLock::new(None);
 
-/// Serializes tests that publish policies (the registry is process-wide).
+/// Serializes tests that publish or read published policies (the registry
+/// is process-wide). Publishing tests use Mono ids no other test owns, so a
+/// reader of another Mono (such as the fixtures' `mono-1`) always sees the
+/// default whatever is published.
 #[cfg(test)]
 pub(crate) fn tests_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

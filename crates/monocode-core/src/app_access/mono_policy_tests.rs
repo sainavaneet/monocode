@@ -121,21 +121,29 @@ fn mono_policy_commands_show_apply_and_unblock_only_the_owning_monos_tasks() {
     let task = tasks.task("t").unwrap().unwrap();
     assert_eq!(task.lifecycle, TaskLifecycle::Active);
     assert_eq!(task.blocked_reason, None);
-    // The user unblocks through the same path.
+    // The user unblocks through the store, and any path out of Blocked
+    // (here a plain transition to Paused) clears the reason with it.
     block(&store);
     let revision = tasks.revision(Subject::Task("t")).unwrap();
-    unblock(
-        &store,
-        "t",
-        revision,
-        crate::tasks::Requester::User,
-        NOW + 2,
-    )
-    .unwrap();
-    assert_eq!(
-        tasks.task("t").unwrap().unwrap().lifecycle,
-        TaskLifecycle::Active
-    );
+    tasks
+        .unblock("t", revision, crate::tasks::Requester::User, NOW + 2)
+        .unwrap();
+    let task = tasks.task("t").unwrap().unwrap();
+    assert_eq!(task.lifecycle, TaskLifecycle::Active);
+    assert_eq!(task.blocked_reason, None);
+    block(&store);
+    let revision = tasks.revision(Subject::Task("t")).unwrap();
+    let paused = crate::tasks::State::Lifecycle(TaskLifecycle::Paused);
+    tasks
+        .transition(
+            Subject::Task("t"),
+            paused,
+            crate::tasks::Requester::User,
+            revision,
+            NOW + 3,
+        )
+        .unwrap();
+    assert_eq!(tasks.task("t").unwrap().unwrap().blocked_reason, None);
     autonomy::publish(HashMap::new());
     // With the coordinator off, nothing is available.
     store
