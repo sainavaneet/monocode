@@ -23,6 +23,9 @@ pub const FLAG: &str = "native-task-coordinator";
 pub const LEASE_TTL_MS: u64 = 30_000;
 /// How often a running app ticks; well inside the lease's lifetime.
 pub const TICK_INTERVAL_MS: u64 = 5_000;
+/// How long a reserved worker session may wait for the app to confirm it
+/// started before the attempt fails with a `launch.unconfirmed` event.
+pub const LAUNCH_CONFIRM_TIMEOUT_MS: u64 = 60_000;
 /// The destination of review requests for succeeded claims.
 pub const REVIEW: &str = "review";
 
@@ -121,8 +124,11 @@ impl<P: Policy> Coordinator<P> {
                 Err(TaskError::LeaseHeld { .. }) => tick.leased_elsewhere.push(id),
                 Err(error) => tick.errors.push(format!("{id}: {error}")),
                 Ok(()) => {
-                    if let Err(error) = self.step(store, &id, launcher, now, &mut tick) {
-                        tick.errors.push(format!("{id}: {error}"));
+                    match self.step(store, &id, launcher, now, &mut tick) {
+                        Ok(()) => {}
+                        // Lost to another holder at the dispatch fence.
+                        Err(TaskError::LeaseHeld { .. }) => tick.leased_elsewhere.push(id),
+                        Err(error) => tick.errors.push(format!("{id}: {error}")),
                     }
                 }
             }
@@ -169,6 +175,10 @@ impl<P: Policy> Coordinator<P> {
         for assignment in tasks.assignments(id)? {
             self.reconcile(store, &task, &assignment, launcher, now, tick)?;
         }
+        // Reconciling may have blocked the task.
+        let Some(task) = tasks.task(id)? else {
+            return Ok(());
+        };
         if task.lifecycle == TaskLifecycle::Active {
             self.schedule(store, &task, launcher, now, tick)?;
         }

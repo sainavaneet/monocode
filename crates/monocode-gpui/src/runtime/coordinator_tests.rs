@@ -136,6 +136,10 @@ fn a_launched_worker_runs_its_brief_in_its_worktree_and_reports_durably() {
         .unwrap();
     assert_eq!(tick.launched.len(), 1, "{tick:?}");
     let (session, settings) = launcher.0.borrow()[0].clone();
+    // The app installed and submitted it.
+    assert!(
+        monocode_core::tasks::confirm_started(&locked(&store).unwrap(), session.id, 11).unwrap()
+    );
     let worktree = settings.worktree_cwd.clone().unwrap();
     let brief = locked(&store)
         .unwrap()

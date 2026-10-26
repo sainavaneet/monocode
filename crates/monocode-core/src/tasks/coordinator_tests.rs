@@ -5,7 +5,10 @@ use crate::agent::Settings;
 use crate::orchestration::WorkspaceMode;
 use crate::store::{Session, Store};
 use crate::tasks::store::tests::{assignment, plan};
-use crate::tasks::{AcceptanceCriterion, AssignmentState, AttemptState, NewTask, Subject};
+use crate::tasks::{
+    confirm_started, start_failed, AcceptanceCriterion, AssignmentState, AttemptState, NewTask,
+    Subject,
+};
 use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -111,12 +114,16 @@ fn scoped(id: &str, files: &[&str], deps: &[&str]) -> crate::tasks::Assignment {
 struct FakeLauncher {
     started: RefCell<Vec<(Session, Settings)>>,
     crash: Cell<bool>,
+    refuse: Cell<bool>,
 }
 
 impl Launcher for FakeLauncher {
     fn start(&self, session: &Session, settings: &Settings) -> Result<(), String> {
         if self.crash.get() {
-            panic!("the app quit before the receipt was recorded");
+            panic!("the app quit before installing the session");
+        }
+        if self.refuse.get() {
+            return Err("The app is closing".into());
         }
         self.started
             .borrow_mut()
@@ -200,11 +207,12 @@ fn one_assignment_launches_into_its_worktree_and_reports_durably() {
     assert_ne!(Path::new(&workspace.path), repo.root);
     assert!(git(&repo.root, &["worktree", "list"]).contains(&branch));
 
-    // One attempt, bound to the one session the launcher started, Running.
+    // One attempt, bound to the one session handed to the app. Reserved is
+    // not started: it stays Starting until the app confirms.
     let all = attempts(&store, "a");
     assert_eq!(all.len(), 1);
     let attempt = &all[0];
-    assert_eq!(attempt.status, AttemptState::Running);
+    assert_eq!(attempt.status, AttemptState::Starting);
     assert_eq!(status(&store, "a"), AssignmentState::Running);
     assert_eq!(tick.launched, vec![attempt.id.clone()]);
     let started = launcher.started.borrow();
@@ -239,8 +247,10 @@ fn one_assignment_launches_into_its_worktree_and_reports_durably() {
     assert_eq!(payload["attemptId"], attempt.id);
     assert_eq!(payload["assignmentId"], "a");
     assert_eq!(payload["workspace"]["path"], workspace.path);
-    assert_eq!(events(&store, "attempt.receipt").len(), 1);
+    assert_eq!(events(&store, "attempt.reserved").len(), 1);
     drop(started);
+    assert!(confirm_started(&store, session_id(&launcher), NOW + 1).unwrap());
+    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Running);
 
     // The worker reports; a duplicated result is one claim and one review.
     let claim = report(&store, session_id(&launcher), "r1", "succeeded");
@@ -318,7 +328,8 @@ fn a_crash_between_intent_and_dispatch_does_not_duplicate_the_launch() {
     let all = attempts(&store, "a");
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, attempt.id);
-    assert_eq!(all[0].status, AttemptState::Running);
+    assert_eq!(all[0].status, AttemptState::Starting);
+    assert!(all[0].session_id.is_some());
     assert_eq!(store.sessions().unwrap().len(), 1);
     assert_eq!(store.tasks().unwrap().workspaces("t").unwrap().len(), 1);
     let lease = store
@@ -337,17 +348,21 @@ fn a_retried_launch_after_dispatch_resolves_to_the_existing_session() {
     let repo = repo();
     let store = open(&repo);
     started(&store, &repo, vec![scoped("a", &["src"], &[])]);
-    // The session is reserved and handed to the GUI, then the app dies
-    // before the receipt is recorded.
-    let crashing = FakeLauncher::default();
-    crashing.crash.set(true);
+    // The first process reserves the session, then dies before recording
+    // the reservation on the attempt.
     let first = coordinator("gpui-1");
-    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        first.tick(&store, &crashing, NOW)
-    }));
-    assert!(crashed.is_err());
+    let tasks = store.tasks().unwrap();
+    let subject = Subject::Assignment { task: "t", id: "a" };
+    let ready = State::Assignment(AssignmentState::Ready);
+    tasks
+        .transition(subject, ready, Requester::Coordinator, 1, NOW)
+        .unwrap();
+    let task = tasks.task("t").unwrap().unwrap();
+    let a = tasks.assignment("t", "a").unwrap().unwrap();
+    let attempt = first.begin_launch(&store, &task, &a, NOW).unwrap().unwrap();
+    let (session, _, fresh) = crate::tasks::launch::reserve(&store, &task, &attempt).unwrap();
+    assert!(fresh);
     assert_eq!(attempts(&store, "a")[0].session_id, None);
-    assert_eq!(store.sessions().unwrap().len(), 1);
 
     let launcher = FakeLauncher::default();
     let later = NOW + LEASE_TTL_MS + 1;
@@ -355,16 +370,122 @@ fn a_retried_launch_after_dispatch_resolves_to_the_existing_session() {
         .tick(&store, &launcher, later)
         .unwrap();
     assert!(tick.errors.is_empty(), "{tick:?}");
-    assert!(launcher.started.borrow().is_empty(), "never started twice");
-    let attempt = &attempts(&store, "a")[0];
-    assert_eq!(attempt.status, AttemptState::Running);
-    let session = store.sessions().unwrap()[0].id;
-    assert_eq!(
-        attempt.session_id.as_deref(),
-        Some(store.persisted_session_id(session).unwrap().as_str())
-    );
     assert_eq!(tick.bound, vec![attempt.id.clone()]);
+    assert!(launcher.started.borrow().is_empty(), "never started twice");
+    // Bound to the reserved session, but not started: still Starting.
+    let bound = &attempts(&store, "a")[0];
+    assert_eq!(bound.status, AttemptState::Starting);
+    assert_eq!(
+        bound.session_id.as_deref(),
+        Some(store.persisted_session_id(session.id).unwrap().as_str())
+    );
+    assert!(events(&store, "attempt.started").is_empty());
     assert_eq!(store.sessions().unwrap().len(), 1);
+}
+
+#[test]
+fn a_confirmed_start_moves_the_attempt_to_running_exactly_once() {
+    let repo = repo();
+    let store = open(&repo);
+    started(&store, &repo, vec![scoped("a", &["src"], &[])]);
+    let launcher = FakeLauncher::default();
+    coordinator("gpui-1").tick(&store, &launcher, NOW).unwrap();
+    let session = session_id(&launcher);
+    // A worker cannot report before its start is confirmed.
+    assert!(crate::app_access::worker_action(
+        &store,
+        session,
+        "early",
+        "tasks.worker.result",
+        &json!({"outcome": "succeeded", "summary": "s"}),
+        NOW,
+    )
+    .is_err());
+    assert!(confirm_started(&store, session, NOW + 1).unwrap());
+    assert!(!confirm_started(&store, session, NOW + 2).unwrap());
+    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Running);
+    assert_eq!(events(&store, "attempt.started").len(), 1);
+    assert_eq!(events(&store, "attempt.running").len(), 1);
+    // A later failure report from the app cannot undo a confirmed start.
+    start_failed(&store, session, "late", NOW + 3).unwrap();
+    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Running);
+    // Sessions that are not task workers are ignored.
+    let other = store.create("codex", "/elsewhere").unwrap().id;
+    assert!(!confirm_started(&store, other, NOW + 4).unwrap());
+}
+
+#[test]
+fn a_launch_the_app_cannot_start_fails_the_attempt_with_an_event() {
+    let repo = repo();
+    let store = open(&repo);
+    started(&store, &repo, vec![scoped("a", &["src"], &[])]);
+    let launcher = FakeLauncher::default();
+    let ours = coordinator("gpui-1");
+    ours.tick(&store, &launcher, NOW).unwrap();
+    // No window to start it in.
+    start_failed(&store, session_id(&launcher), "No window", NOW + 1).unwrap();
+    let attempt = &attempts(&store, "a")[0];
+    assert_eq!(attempt.status, AttemptState::Failed);
+    assert_eq!(status(&store, "a"), AssignmentState::Failed);
+    let failed = events(&store, "attempt.start_failed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].payload["reason"], "No window");
+    assert_eq!(
+        events(&store, "attempt.failed")[0].payload["requester"],
+        "coordinator"
+    );
+    ours.tick(&store, &launcher, NOW + 10).unwrap();
+    assert_eq!(attempts(&store, "a").len(), 1);
+
+    // Handing the session over can fail too (the app is closing).
+    let repo = self::repo();
+    let store = open(&repo);
+    started(&store, &repo, vec![scoped("a", &["src"], &[])]);
+    let refusing = FakeLauncher::default();
+    refusing.refuse.set(true);
+    let tick = ours.tick(&store, &refusing, NOW).unwrap();
+    assert_eq!(tick.failed.len(), 1, "{tick:?}");
+    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Failed);
+    assert_eq!(events(&store, "attempt.dispatch_failed").len(), 1);
+}
+
+#[test]
+fn an_unconfirmed_reservation_is_failed_after_the_timeout() {
+    let repo = repo();
+    let store = open(&repo);
+    started(&store, &repo, vec![scoped("a", &["src"], &[])]);
+    // The session is reserved and handed over, then the app dies before
+    // installing it.
+    let crashing = FakeLauncher::default();
+    crashing.crash.set(true);
+    let first = coordinator("gpui-1");
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        first.tick(&store, &crashing, NOW)
+    }));
+    assert!(crashed.is_err());
+    let reserved = &attempts(&store, "a")[0];
+    assert_eq!(reserved.status, AttemptState::Starting);
+    assert!(reserved.session_id.is_some());
+
+    let launcher = FakeLauncher::default();
+    let second = coordinator("gpui-2");
+    let later = NOW + LEASE_TTL_MS + 1;
+    let tick = second.tick(&store, &launcher, later).unwrap();
+    assert!(
+        tick.failed.is_empty() && tick.launched.is_empty(),
+        "{tick:?}"
+    );
+    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Starting);
+    let expired = NOW + LAUNCH_CONFIRM_TIMEOUT_MS;
+    let tick = second.tick(&store, &launcher, expired).unwrap();
+    assert_eq!(tick.failed, vec![reserved.id.clone()]);
+    assert_eq!(attempts(&store, "a")[0].status, AttemptState::Failed);
+    assert_eq!(status(&store, "a"), AssignmentState::Failed);
+    assert_eq!(events(&store, "launch.unconfirmed").len(), 1);
+    assert!(launcher.started.borrow().is_empty());
+    second.tick(&store, &launcher, expired + 1).unwrap();
+    assert_eq!(events(&store, "launch.unconfirmed").len(), 1);
+    assert_eq!(attempts(&store, "a").len(), 1);
 }
 
 #[test]
@@ -466,7 +587,9 @@ fn investigation_reads_the_existing_checkout() {
         .draft
         .unwrap()
         .text;
-    assert!(brief.contains("the project checkout"), "{brief}");
+    assert!(brief.contains("the user's project checkout"), "{brief}");
+    assert!(brief.contains("make no edits"), "{brief}");
+    assert!(!brief.contains("Files you may change"), "{brief}");
     assert!(!brief.contains("worktree"), "{brief}");
 }
 
@@ -478,6 +601,7 @@ fn a_failed_claim_is_classified_by_the_coordinator_without_a_retry() {
     let launcher = FakeLauncher::default();
     let ours = coordinator("gpui-1");
     ours.tick(&store, &launcher, NOW).unwrap();
+    confirm_started(&store, session_id(&launcher), NOW + 1).unwrap();
     report(&store, session_id(&launcher), "r1", "failed");
     // The claim alone does not fail the attempt; the coordinator does.
     assert_eq!(attempts(&store, "a")[0].status, AttemptState::Running);
@@ -601,4 +725,76 @@ fn paused_tasks_launch_nothing_and_unpreparable_workspaces_block_the_task() {
     assert!(reason[0].payload["reason"].as_str().unwrap().len() > 3);
     assert!(attempts(&store, "a").is_empty());
     assert!(launcher.started.borrow().is_empty());
+}
+
+#[test]
+fn a_block_while_reconciling_launches_nothing_else_that_tick() {
+    let repo = repo();
+    let store = open(&repo);
+    started(
+        &store,
+        &repo,
+        vec![scoped("a", &["src"], &[]), scoped("b", &["docs"], &[])],
+    );
+    // An earlier run left a's launch intent unfinished, and the project has
+    // since stopped being a repository.
+    let tasks = store.tasks().unwrap();
+    let subject = Subject::Assignment { task: "t", id: "a" };
+    let ready = State::Assignment(AssignmentState::Ready);
+    tasks
+        .transition(subject, ready, Requester::Coordinator, 1, NOW)
+        .unwrap();
+    tasks
+        .create_attempt(&crate::tasks::store::tests::new_attempt("x", "t", "a"), NOW)
+        .unwrap();
+    let outside = repo.root.parent().unwrap().join("plain");
+    std::fs::create_dir_all(&outside).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE native_tasks SET project=?1 WHERE id='t'",
+            [outside.to_string_lossy()],
+        )
+        .unwrap();
+    let launcher = FakeLauncher::default();
+    let tick = Coordinator::new("gpui-1", Automatic(4))
+        .tick(&store, &launcher, NOW)
+        .unwrap();
+    assert!(tick.errors.is_empty(), "{tick:?}");
+    assert_eq!(
+        tasks.task("t").unwrap().unwrap().lifecycle,
+        TaskLifecycle::Blocked
+    );
+    assert_eq!(events(&store, "task.workspace_failed").len(), 1);
+    assert!(attempts(&store, "b").is_empty());
+    assert_eq!(status(&store, "b"), AssignmentState::Queued);
+    assert!(tasks.workspaces("t").unwrap().is_empty());
+    assert!(launcher.started.borrow().is_empty());
+}
+
+#[test]
+fn a_leftover_branch_is_adopted_with_its_commits() {
+    let repo = repo();
+    let main = git(&repo.root, &["rev-parse", "HEAD"]);
+    // An earlier run's branch survives without its worktree.
+    let branch = crate::tasks::workspaces::branch_for("t", "a");
+    git(&repo.root, &["checkout", "-q", "-b", &branch]);
+    std::fs::write(repo.root.join("src/earlier.rs"), "// kept\n").unwrap();
+    git(&repo.root, &["add", "."]);
+    git(&repo.root, &["commit", "-q", "-m", "earlier work"]);
+    git(&repo.root, &["checkout", "-q", "main"]);
+    let store = open(&repo);
+    started(&store, &repo, vec![scoped("a", &["src"], &[])]);
+    let launcher = FakeLauncher::default();
+    let tick = coordinator("gpui-1").tick(&store, &launcher, NOW).unwrap();
+    assert_eq!(tick.launched.len(), 1, "{tick:?}");
+    let tasks = store.tasks().unwrap();
+    assert_eq!(
+        tasks.task("t").unwrap().unwrap().lifecycle,
+        TaskLifecycle::Active
+    );
+    let workspace = &tasks.workspaces("t").unwrap()[0];
+    assert_eq!(workspace.branch.as_deref(), Some(branch.as_str()));
+    assert!(Path::new(&workspace.path).join("src/earlier.rs").is_file());
+    assert_eq!(workspace.base_commit.as_deref(), Some(main.as_str()));
 }

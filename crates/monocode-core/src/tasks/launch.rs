@@ -7,11 +7,15 @@
 //! retry resolves to the same session), started, and its receipt bound. A
 //! crash anywhere leaves a state the next tick finishes without a second
 //! attempt or a second session.
-use super::coordinator::{in_flight, latest_attempt, Coordinator, Launcher, Policy, Tick, REVIEW};
+use super::coordinator::{
+    in_flight, latest_attempt, Coordinator, Launcher, Policy, Tick, LAUNCH_CONFIRM_TIMEOUT_MS,
+    REVIEW,
+};
 use super::events::append;
 use super::states::{apply, is_latest_attempt};
+use super::store::read_ms;
 use super::worker::{claim_event, event, settle};
-use super::workspaces::{self, Prepared};
+use super::workspaces::{self, PrepareError, Prepared};
 use super::{
     Assignment, AssignmentState, Attempt, AttemptState, ClaimOutcome, NewAttempt, NewEvent,
     Requester, State, Subject, Task, TaskError, TaskLifecycle, TaskStore, Workspace,
@@ -21,13 +25,18 @@ use crate::app_access;
 use crate::orchestration::WorkspaceMode;
 use crate::provider::Kind;
 use crate::store::{Session, Store};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 
 /// The app caller under which coordinator launches reserve their sessions;
 /// the request id is the attempt's operation id.
 pub const LAUNCH_CALLER: i64 = 0;
 const TITLE_CHARS: usize = 160;
+/// Failure event kinds.
+const DISPATCH_FAILED: &str = "attempt.dispatch_failed";
+const START_FAILED: &str = "attempt.start_failed";
+/// A recovery condition: reserved, never confirmed started.
+const UNCONFIRMED: &str = "launch.unconfirmed";
 
 fn storage(error: String) -> TaskError {
     TaskError::Storage(error)
@@ -48,10 +57,11 @@ impl<P: Policy> Coordinator<P> {
         let tasks = store.tasks()?;
         let prepared = match workspaces::prepare(&tasks, task, assignment, now) {
             Ok(prepared) => prepared,
-            Err(reason) => {
+            Err(PrepareError::Workspace(reason)) => {
                 block(&tasks, task, assignment, &reason, now)?;
                 return Ok(None);
             }
+            Err(PrepareError::Storage(error)) => return Err(error),
         };
         let attempt = match latest_attempt(&tasks, &task.id, &assignment.id)? {
             Some(attempt) if in_flight(&attempt) => attempt,
@@ -106,7 +116,7 @@ impl<P: Policy> Coordinator<P> {
             .app_session_for_request(LAUNCH_CALLER, &attempt.operation_id)
             .map_err(storage)?;
         if let Some(session) = existing {
-            bind(store, attempt, Some(session), now)?;
+            bind(store, attempt, session, now)?;
             tick.bound.push(attempt.id.clone());
             return Ok(());
         }
@@ -115,23 +125,25 @@ impl<P: Policy> Coordinator<P> {
         }
         // Fence: a coordinator that lost the lease must not start a worker.
         self.lease(&tasks, &task.id, now)?;
-        let reserved = reserve(store, task, attempt);
-        let started = reserved.and_then(|(session, settings, fresh)| {
-            if fresh {
-                launcher.start(&session, &settings)?;
-            }
-            Ok(session)
-        });
-        match started {
-            Ok(session) => {
-                bind(store, attempt, Some(session.id), now)?;
-                tick.launched.push(attempt.id.clone());
-            }
+        let (session, settings, fresh) = match reserve(store, task, attempt) {
+            Ok(reserved) => reserved,
             Err(reason) => {
-                fail(&tasks, attempt, Some(&reason), now)?;
+                fail(&tasks, attempt, Some((DISPATCH_FAILED, &reason)), now)?;
                 tick.failed.push(attempt.id.clone());
+                return Ok(());
+            }
+        };
+        // Durable before the GUI sees it, so its confirmation finds the
+        // attempt; the attempt stays Starting until then.
+        bind(store, attempt, session.id, now)?;
+        if fresh {
+            if let Err(reason) = launcher.start(&session, &settings) {
+                fail(&tasks, attempt, Some((DISPATCH_FAILED, &reason)), now)?;
+                tick.failed.push(attempt.id.clone());
+                return Ok(());
             }
         }
+        tick.launched.push(attempt.id.clone());
         Ok(())
     }
 
@@ -171,8 +183,11 @@ impl<P: Policy> Coordinator<P> {
                 }
                 if attempt.session_id.is_none() {
                     self.dispatch(store, task, &attempt, launcher, now, tick)?;
-                } else {
-                    bind(store, &attempt, None, now)?;
+                } else if unconfirmed(&tasks, &attempt, now)? {
+                    let reason =
+                        "The worker session was reserved but the app never confirmed it started.";
+                    fail(&tasks, &attempt, Some((UNCONFIRMED, reason)), now)?;
+                    tick.failed.push(attempt.id);
                 }
             }
             AttemptState::Running | AttemptState::Waiting => {
@@ -218,7 +233,7 @@ fn intent(attempt: &Attempt, prepared: &Prepared) -> NewEvent {
 /// `sessions.start`'s durable steps, keyed by the operation id: reserve the
 /// session, select the workspace, configure it and prepare the worker brief
 /// as its first prompt. Returns whether this call reserved it.
-fn reserve(
+pub(super) fn reserve(
     store: &Store,
     task: &Task,
     attempt: &Attempt,
@@ -230,7 +245,7 @@ fn reserve(
         .ok_or("The assignment no longer exists")?;
     let workspace = workspace_of(&tasks, &task.id, &assignment.id)?;
     let kind = Kind::parse(&attempt.provider).ok_or("Unknown worker provider")?;
-    let prompt = worker_brief(task, &assignment, &workspace);
+    let prompt = super::brief::worker_brief(task, &assignment, &workspace);
     let title: String = format!("{}: {}", task.title, assignment.title)
         .chars()
         .take(TITLE_CHARS)
@@ -273,15 +288,12 @@ fn workspace_of(tasks: &TaskStore<'_>, task: &str, assignment: &str) -> Result<W
         .ok_or_else(|| format!("No workspace is recorded for assignment {assignment}"))
 }
 
-/// Records the session the launch resolved to (None: already recorded) and
-/// moves the attempt to Running, so the worker's calls are accepted.
-fn bind(store: &Store, attempt: &Attempt, session: Option<i64>, now: u64) -> Result<(), TaskError> {
+/// Records the session a launch reserved. The attempt stays Starting: a
+/// reserved session is not a running worker until the app confirms it
+/// ([`confirm_started`]).
+fn bind(store: &Store, attempt: &Attempt, session: i64, now: u64) -> Result<(), TaskError> {
     let tasks = store.tasks()?;
-    let bound = match (&attempt.session_id, session) {
-        (Some(id), _) => id.clone(),
-        (None, Some(handle)) => store.persisted_session_id(handle).map_err(storage)?,
-        (None, None) => return Err(TaskError::Invalid("No session to bind.".into())),
-    };
+    let bound = store.persisted_session_id(session).map_err(storage)?;
     let tx = tasks.begin()?;
     let current = tasks
         .attempt(&attempt.id)?
@@ -292,43 +304,91 @@ fn bind(store: &Store, attempt: &Attempt, session: Option<i64>, now: u64) -> Res
     let payload = json!({"sessionId": bound, "operationId": attempt.operation_id});
     let receipt = event(
         attempt,
-        format!("receipt:{}", attempt.id),
-        "attempt.receipt",
+        reserved_event(&attempt.id),
+        "attempt.reserved",
         payload,
     );
     append(&tx, &receipt, now)?;
-    if current.status == AttemptState::Starting {
-        let running = State::Attempt(AttemptState::Running);
-        settle(
-            &tx,
-            Subject::Attempt(&attempt.id),
-            running,
-            Requester::Coordinator,
-            now,
-        )?;
-    }
     tx.commit()?;
     Ok(())
+}
+
+fn reserved_event(attempt: &str) -> String {
+    format!("reserved:{attempt}")
+}
+
+/// Whether the attempt's session was reserved longer than
+/// [`LAUNCH_CONFIRM_TIMEOUT_MS`] ago without the app confirming it started.
+fn unconfirmed(tasks: &TaskStore<'_>, attempt: &Attempt, now: u64) -> Result<bool, TaskError> {
+    let reserved: Option<u64> = tasks
+        .conn
+        .query_row(
+            "SELECT created_at FROM native_task_events WHERE id=?1",
+            [reserved_event(&attempt.id)],
+            |row| read_ms(row, 0),
+        )
+        .optional()?;
+    let since = reserved.unwrap_or(attempt.updated_at);
+    Ok(now >= since.saturating_add(LAUNCH_CONFIRM_TIMEOUT_MS))
+}
+
+/// The coordinator attempt bound to the app session `session`, if any.
+fn launched_attempt(store: &Store, session: i64) -> Result<Option<Attempt>, TaskError> {
+    let bound = store.persisted_session_id(session).map_err(storage)?;
+    store.tasks()?.attempt_for_session(&bound)
+}
+
+/// The app installed and submitted the session it was handed: its Starting
+/// attempt becomes Running, so the worker's calls are accepted. Returns
+/// false when there was nothing to move (a duplicate confirmation, or not a
+/// task worker).
+pub fn confirm_started(store: &Store, session: i64, now: u64) -> Result<bool, TaskError> {
+    let Some(attempt) = launched_attempt(store, session)? else {
+        return Ok(false);
+    };
+    if attempt.status != AttemptState::Starting {
+        return Ok(false);
+    }
+    let tasks = store.tasks()?;
+    let tx = tasks.begin()?;
+    let payload = json!({"sessionId": attempt.session_id});
+    let id = format!("started:{}", attempt.id);
+    append(&tx, &event(&attempt, id, "attempt.started", payload), now)?;
+    let running = State::Attempt(AttemptState::Running);
+    let subject = Subject::Attempt(&attempt.id);
+    settle(&tx, subject, running, Requester::Coordinator, now)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The app could not start the session it was handed (no window, closing):
+/// the attempt fails with the reason, under the coordinator's authority.
+pub fn start_failed(store: &Store, session: i64, reason: &str, now: u64) -> Result<(), TaskError> {
+    let Some(attempt) = launched_attempt(store, session)? else {
+        return Ok(());
+    };
+    if attempt.status != AttemptState::Starting {
+        return Ok(());
+    }
+    fail(&store.tasks()?, &attempt, Some((START_FAILED, reason)), now)
 }
 
 /// The coordinator's own classification: the attempt Failed, and its
 /// assignment Failed too when it is the current run. No retry here; the
 /// assignment stays Failed until recovery or Mono queues it again.
+/// `why` is the failure event's kind and reason, when the attempt did not
+/// fail by its own claim.
 fn fail(
     tasks: &TaskStore<'_>,
     attempt: &Attempt,
-    reason: Option<&str>,
+    why: Option<(&str, &str)>,
     now: u64,
 ) -> Result<(), TaskError> {
     let tx = tasks.begin()?;
-    if let Some(reason) = reason {
-        let id = format!("dispatch_failed:{}", attempt.id);
+    if let Some((kind, reason)) = why {
+        let id = format!("{kind}:{}", attempt.id);
         let payload = json!({"reason": reason});
-        append(
-            &tx,
-            &event(attempt, id, "attempt.dispatch_failed", payload),
-            now,
-        )?;
+        append(&tx, &event(attempt, id, kind, payload), now)?;
     }
     let subject = Subject::Attempt(&attempt.id);
     settle(
@@ -409,52 +469,4 @@ fn block(
     append(&tx, &failed, now)?;
     tx.commit()?;
     Ok(())
-}
-
-/// Everything a worker needs, since it does not inherit Mono's conversation.
-pub fn worker_brief(task: &Task, assignment: &Assignment, workspace: &Workspace) -> String {
-    let list = |items: &[String], none: &str| {
-        if items.is_empty() {
-            none.to_owned()
-        } else {
-            items.join(", ")
-        }
-    };
-    let place = match workspace.mode {
-        WorkspaceMode::Worktree => format!(
-            "your own worktree {} on branch {} from commit {}. Commit your work there; never touch the main checkout.",
-            workspace.path,
-            workspace.branch.as_deref().unwrap_or("?"),
-            workspace.base_commit.as_deref().unwrap_or("?"),
-        ),
-        WorkspaceMode::Checkout => format!("the project checkout {}.", workspace.path),
-    };
-    let files = if assignment.files.is_empty() {
-        "None. This is an investigation: read and report. Do not edit files.".to_owned()
-    } else {
-        format!(
-            "{}. If you need a change outside them, report it as blocked.",
-            assignment.files.join(", ")
-        )
-    };
-    format!(
-        "You are a worker Mono launched for task \"{task_title}\", assignment {id}: {title}.\n\
-         You do not have Mono's conversation; everything you need is here.\n\n\
-         Objective:\n{prompt}\n\n\
-         Workspace: {place}\n\
-         Files you may change: {files}\n\
-         Depends on (already accepted): {deps}\n\
-         Expected verification: {checks}\n\n\
-         Report through the app commands (`monocode-gpui app ACTION --json '{{...}}'`); the task and attempt come from this session:\n\
-         - tasks.worker.status {{}} shows your assignment and answered decisions.\n\
-         - tasks.worker.ask {{question, context?, scope?}} when you need a decision; then wait for the answer.\n\
-         - tasks.worker.blocked {{reason}} if you cannot continue.\n\
-         - tasks.worker.result {{outcome: \"succeeded\"|\"failed\", summary, workspace, commits, validation, evidence, remainingWork, limitations}} once, when done. It is a claim Mono reviews against the acceptance criteria; it does not complete the task.",
-        task_title = task.title,
-        id = assignment.id,
-        title = assignment.title,
-        prompt = assignment.prompt,
-        deps = list(&assignment.depends_on, "none"),
-        checks = list(&assignment.verification, "run focused checks and report them"),
-    )
 }

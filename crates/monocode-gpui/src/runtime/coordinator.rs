@@ -1,12 +1,14 @@
 //! The process's one task coordinator (`monocode_core::tasks::coordinator`).
 //! It ticks off the main thread and does nothing unless the
 //! `native-task-coordinator` setting is `enabled`. Sessions it reserves are
-//! handed to the Shell, which installs and submits them like `sessions.start`.
+//! handed to the Shell, which installs and submits them like `sessions.start`,
+//! and the result is reported back: confirmed (attempt Running) or failed.
 use super::{Database, locked};
 use crate::shell::Shell;
 use gpui::{App, Global, WeakEntity};
 use monocode_core::agent::Settings;
 use monocode_core::store::Session;
+use monocode_core::tasks;
 use monocode_core::tasks::coordinator::{Coordinator, ExplicitStart, Launcher, TICK_INTERVAL_MS};
 use std::time::Duration;
 
@@ -45,17 +47,40 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
     }
     cx.set_global(Service { shell });
     let (launches, receive) = async_channel::unbounded::<(Session, Settings)>();
+    let confirmations = store.clone();
     cx.spawn(async move |cx| {
         while let Ok((session, settings)) = receive.recv().await {
-            cx.update(|cx| {
+            let id = session.id;
+            let installed = cx.update(|cx| {
                 let shell = cx.try_global::<Service>().and_then(|s| s.shell.upgrade());
                 match shell {
-                    Some(shell) => shell.update(cx, |shell, cx| {
-                        shell.install_task_launch(session, settings, cx)
-                    }),
-                    None => eprintln!("Task worker {} has no window to start in", session.id),
+                    Some(shell) => {
+                        shell.update(cx, |shell, cx| {
+                            shell.install_task_launch(session, settings, cx)
+                        });
+                        Ok(())
+                    }
+                    None => Err("No Monocode window was open to start the worker in."),
                 }
             });
+            // The attempt runs only once the app confirms it; a failure is
+            // recorded on the attempt rather than left Starting.
+            let store = confirmations.clone();
+            let recorded = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = locked(&store)?;
+                    let now = monocode_core::time::now_ms();
+                    match installed {
+                        Ok(()) => tasks::confirm_started(&store, id, now).map(|_| ()),
+                        Err(reason) => tasks::start_failed(&store, id, reason, now),
+                    }
+                    .map_err(|e| e.to_string())
+                })
+                .await;
+            if let Err(error) = recorded {
+                eprintln!("Task coordinator: could not record worker {id}'s start: {error}");
+            }
         }
     })
     .detach();

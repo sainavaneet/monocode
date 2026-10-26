@@ -6,7 +6,7 @@
 //! never copied: a worktree starts from the committed `HEAD`, the dirty files
 //! stay where they are, and the caller is told so it can say so. Nothing here
 //! deletes a worktree.
-use super::{Assignment, Task, TaskStore, Workspace};
+use super::{Assignment, Task, TaskError, TaskStore, Workspace};
 use crate::git::{self, git};
 use crate::orchestration::WorkspaceMode;
 use std::path::Path;
@@ -67,25 +67,40 @@ fn dirty(project: &Path) -> bool {
     git(project, &["status", "--porcelain"]).is_ok_and(|s| !s.trim().is_empty())
 }
 
+/// Why no workspace was prepared.
+#[derive(Debug)]
+pub enum PrepareError {
+    /// Git or the project refused: the task cannot proceed as planned.
+    Workspace(String),
+    /// The task store failed; a later tick retries.
+    Storage(TaskError),
+}
+
+impl From<TaskError> for PrepareError {
+    fn from(error: TaskError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 /// Returns the assignment's recorded workspace, or creates and records one.
-/// Errors explain why no workspace could be prepared; nothing is recorded then.
+/// `dirty_base` is only reported when the workspace is created. Nothing is
+/// recorded when preparation fails.
 pub fn prepare(
     tasks: &TaskStore<'_>,
     task: &Task,
     assignment: &Assignment,
     now: u64,
-) -> Result<Prepared, String> {
+) -> Result<Prepared, PrepareError> {
+    let id = workspace_id(&task.id, &assignment.id);
+    if let Some(workspace) = tasks.workspaces(&task.id)?.into_iter().find(|w| w.id == id) {
+        return Ok(Prepared {
+            workspace,
+            dirty_base: false,
+        });
+    }
     let project = Path::new(&task.project);
     let mode = mode_for(assignment);
     let dirty_base = mode == WorkspaceMode::Worktree && dirty(project);
-    let id = workspace_id(&task.id, &assignment.id);
-    let recorded = tasks.workspaces(&task.id).map_err(|e| e.to_string())?;
-    if let Some(workspace) = recorded.into_iter().find(|w| w.id == id) {
-        return Ok(Prepared {
-            workspace,
-            dirty_base,
-        });
-    }
     let repository = git(project, &["rev-parse", "--show-toplevel"])
         .map(|root| root.trim().to_owned())
         .ok();
@@ -100,49 +115,62 @@ pub fn prepare(
         ),
         WorkspaceMode::Worktree => {
             let repository = repository.ok_or_else(|| {
-                format!(
+                PrepareError::Workspace(format!(
                     "{} is not a Git repository, so assignment {} cannot have its own worktree.",
                     task.project, assignment.id
+                ))
+            })?;
+            let base = head(project).ok_or_else(|| {
+                PrepareError::Workspace(
+                    "The repository has no commit to base a worktree on.".into(),
                 )
             })?;
-            let base = head(project)
-                .ok_or("The repository has no commit to base a worktree on.".to_owned())?;
             let branch = branch_for(&task.id, &assignment.id);
-            let tree = worktree(project, &branch, &base)?;
-            (repository, tree.path, Some(branch), Some(tree.head))
+            let (path, base) =
+                worktree(project, &branch, &base).map_err(PrepareError::Workspace)?;
+            (repository, path, Some(branch), Some(base))
         }
     };
-    let workspace = tasks
-        .save_workspace(&Workspace {
-            id,
-            task_id: task.id.clone(),
-            assignment_id: Some(assignment.id.clone()),
-            mode,
-            repository,
-            path,
-            branch,
-            base_commit,
-            owner: owner_of(&task.id),
-            revision: 0,
-            created_at: now,
-        })
-        .map_err(|e| e.to_string())?;
+    let workspace = tasks.save_workspace(&Workspace {
+        id,
+        task_id: task.id.clone(),
+        assignment_id: Some(assignment.id.clone()),
+        mode,
+        repository,
+        path,
+        branch,
+        base_commit,
+        owner: owner_of(&task.id),
+        revision: 0,
+        created_at: now,
+    })?;
     Ok(Prepared {
         workspace,
         dirty_base,
     })
 }
 
-/// Creates the assignment's worktree from `base`, or adopts the one a crash
-/// left behind before it was recorded (the branch name is ours alone).
-fn worktree(project: &Path, branch: &str, base: &str) -> Result<git::Worktree, String> {
+/// The assignment's worktree path and the commit its work starts from.
+/// Creates it from `base`, or adopts what an earlier run left behind (the
+/// branch name is ours alone): a worktree on the branch, or the branch alone,
+/// which is then checked out in a new worktree with its commits kept.
+fn worktree(project: &Path, branch: &str, base: &str) -> Result<(String, String), String> {
+    let forked = |tip: &str| {
+        git(project, &["merge-base", tip, base])
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_else(|_| base.to_owned())
+    };
     let existing = git::worktrees(project)?
         .into_iter()
         .find(|tree| tree.branch.as_deref() == Some(branch) && !tree.missing);
     if let Some(tree) = existing {
-        return Ok(tree);
+        return Ok((tree.path, forked(&tree.head)));
     }
-    let mut tree = git::create_project_worktree(project, branch, Some(base), false)?;
-    tree.head = base.to_owned();
-    Ok(tree)
+    let reference = format!("refs/heads/{branch}");
+    if git(project, &["rev-parse", "--verify", "--quiet", &reference]).is_ok() {
+        let tree = git::create_project_worktree(project, branch, None, true)?;
+        return Ok((tree.path, forked(&reference)));
+    }
+    let tree = git::create_project_worktree(project, branch, Some(base), false)?;
+    Ok((tree.path, base.to_owned()))
 }
