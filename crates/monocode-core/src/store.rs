@@ -116,7 +116,6 @@ impl Store {
             PRIMARY KEY(session_id,row_ix));
           CREATE TABLE IF NOT EXISTS native_reminders(session_id INTEGER PRIMARY KEY REFERENCES native_sessions(id),
             due_at INTEGER NOT NULL, fired_at INTEGER);").map_err(|e| e.to_string())?;
-        crate::tasks::store::create_tables(&conn).map_err(|e| e.to_string())?;
         let columns = conn
             .prepare("PRAGMA table_info(native_sessions)")
             .map_err(|e| e.to_string())?
@@ -179,6 +178,10 @@ impl Store {
             path: path.into(),
             shared: None,
         })
+    }
+    /// False for a read-only desktop store.
+    pub(crate) fn is_writable(&self) -> bool {
+        self.shared.is_none() || self.shared_writable().is_ok()
     }
     /// The connection for sibling stores that keep their own tables, such as
     /// `tasks`.

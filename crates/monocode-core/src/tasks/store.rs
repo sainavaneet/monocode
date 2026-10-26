@@ -83,10 +83,15 @@ pub struct TaskStore<'a> {
 }
 
 impl Store {
-    pub fn tasks(&self) -> TaskStore<'_> {
-        TaskStore {
-            conn: self.connection(),
+    /// The task records. A writable store creates the `native_task*` tables
+    /// on first use, as notes do, so opening a desktop database never changes
+    /// it; a read-only store creates nothing.
+    pub fn tasks(&self) -> Result<TaskStore<'_>, TaskError> {
+        let conn = self.connection();
+        if self.is_writable() {
+            create_tables(conn)?;
         }
+        Ok(TaskStore { conn })
     }
 }
 
@@ -309,11 +314,6 @@ pub(super) fn event_for(
 }
 
 impl TaskStore<'_> {
-    /// Creates the tables if missing. Idempotent; never alters other tables.
-    pub fn ensure_schema(&self) -> Result<(), TaskError> {
-        Ok(create_tables(self.conn)?)
-    }
-
     pub(super) fn begin(&self) -> Result<Transaction<'_>, TaskError> {
         Ok(Transaction::new_unchecked(
             self.conn,
@@ -408,16 +408,24 @@ impl TaskStore<'_> {
         ) {
             return Err(TaskError::Precondition(Precondition::NotStarted));
         }
+        // Revisions never repeat for an assignment id, even one dropped by an
+        // earlier plan, so stale writers fail and event ids stay unique.
+        let first: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(revision),0)+1 FROM native_task_assignments WHERE task_id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
         tx.execute("DELETE FROM native_task_assignments WHERE task_id=?1", [id])?;
         for (position, assignment) in plan.tasks.iter().enumerate() {
             tx.execute(
                 "INSERT INTO native_task_assignments(task_id,id,position,title,prompt,files,depends_on,workspace,verification,status,revision,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',1,?10)",
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?11,?10)",
                 params![id, assignment.id, position as i64, assignment.title, assignment.prompt,
                     serde_json::to_string(&assignment.files)?,
                     serde_json::to_string(&assignment.depends_on)?,
                     assignment.workspace.map(WorkspaceMode::as_str),
-                    serde_json::to_string(&assignment.verification)?, ms(now)],
+                    serde_json::to_string(&assignment.verification)?, ms(now),
+                    first],
             )?;
         }
         let revision = key.bump(
@@ -508,7 +516,8 @@ impl TaskStore<'_> {
     /// Records a launch intent as a Created attempt. A retry with the same
     /// operation id returns the attempt already recorded.
     pub fn create_attempt(&self, new: &NewAttempt, now: u64) -> Result<Attempt, TaskError> {
-        let inserted = self.conn.execute(
+        let tx = self.begin()?;
+        let inserted = tx.execute(
             "INSERT INTO native_task_attempts(id,task_id,assignment_id,operation_id,provider,account_id,status,revision,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,'created',1,?7,?7) ON CONFLICT(operation_id) DO NOTHING",
             params![new.id, new.task_id, new.assignment_id, new.operation_id, new.provider, new.account_id, ms(now)],
@@ -525,8 +534,9 @@ impl TaskStore<'_> {
             let mut event = event_for(&attempt.task_id, &label, 1, "attempt.created", json!({}));
             event.assignment_id = Some(attempt.assignment_id.clone());
             event.attempt_id = Some(attempt.id.clone());
-            append(self.conn, &event, now)?;
+            append(&tx, &event, now)?;
         }
+        tx.commit()?;
         Ok(attempt)
     }
 

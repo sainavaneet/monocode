@@ -251,6 +251,9 @@ impl TaskStore<'_> {
         ttl_ms: u64,
         now: u64,
     ) -> Result<Lease, TaskError> {
+        if holder.is_empty() {
+            return Err(TaskError::Invalid("A lease holder needs a name.".into()));
+        }
         let taken = self.conn.execute(
             "INSERT INTO native_task_leases(resource,holder,expires_at,generation) VALUES(?1,?2,?3,1)
              ON CONFLICT(resource) DO UPDATE SET holder=excluded.holder, expires_at=excluded.expires_at,
@@ -271,10 +274,11 @@ impl TaskStore<'_> {
         Ok(current)
     }
 
-    /// Releases `resource` if `holder` holds it; returns whether it did.
+    /// Releases `resource` if `holder` holds it; returns whether it did. The
+    /// row stays, without a holder, so the next holder gets a new generation.
     pub fn release_lease(&self, resource: &str, holder: &str) -> Result<bool, TaskError> {
         Ok(self.conn.execute(
-            "DELETE FROM native_task_leases WHERE resource=?1 AND holder=?2",
+            "UPDATE native_task_leases SET holder='',expires_at=0 WHERE resource=?1 AND holder=?2",
             [resource, holder],
         )? == 1)
     }
@@ -283,7 +287,7 @@ impl TaskStore<'_> {
         Ok(self
             .conn
             .query_row(
-                "SELECT resource,holder,expires_at,generation FROM native_task_leases WHERE resource=?1",
+                "SELECT resource,holder,expires_at,generation FROM native_task_leases WHERE resource=?1 AND holder<>''",
                 [resource],
                 lease,
             )

@@ -185,14 +185,14 @@ impl State {
 /// What must already hold; the store checks it inside the transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precondition {
-    None,
     /// The task's lifecycle is Active.
     TaskActive,
     /// The task is still Planning or Ready, so its plan may be replaced.
     NotStarted,
     /// Every assignment this one depends on is Accepted.
     DependenciesAccepted,
-    /// The assignment has a Succeeded attempt: its result is a claim to review.
+    /// The assignment's latest attempt Succeeded: its result is a claim to
+    /// review. An older attempt's success never counts for a newer run.
     AttemptSucceeded,
     /// The assignment has no Open decision request.
     NoOpenDecision,
@@ -233,7 +233,8 @@ pub struct Transition {
     pub from: &'static [State],
     pub to: State,
     pub requesters: &'static [Requester],
-    pub precondition: Precondition,
+    /// Checked in order; the first that fails is reported.
+    pub preconditions: &'static [Precondition],
     /// The columns the store writes, besides `revision` and `updated_at`.
     pub persists: &'static str,
     /// The kind of the event appended in the same transaction.
@@ -243,7 +244,6 @@ pub struct Transition {
 }
 
 use Eligibility::{Eligible, Ineligible, Unchanged};
-use Precondition as P;
 use Recovery::{Interrupt, Never, Reconcile, Resume, Wait};
 use Requester::{Coordinator as C, Mono as M, User as U, Worker as W};
 // Each machine's states by its `State` variant name, for the table below.
@@ -253,13 +253,13 @@ type Assignment = AssignmentState;
 type Attempt = AttemptState;
 
 macro_rules! rule {
-    ($machine:ident [$($from:ident),+] -> $to:ident, [$($who:ident),+], $pre:expr,
+    ($machine:ident [$($from:ident),+] -> $to:ident, [$($who:ident),+], [$($pre:ident),*],
      $persists:literal, $event:literal, $eligibility:expr, $recovery:expr) => {
         Transition {
             from: &[$(State::$machine($machine::$from)),+],
             to: State::$machine($machine::$to),
             requesters: &[$($who),+],
-            precondition: $pre,
+            preconditions: &[$(Precondition::$pre),*],
             persists: $persists,
             event: $event,
             eligibility: $eligibility,
@@ -271,40 +271,40 @@ macro_rules! rule {
 #[rustfmt::skip]
 pub static TRANSITIONS: &[Transition] = &[
     // Task stage.
-    rule!(Stage [Planning] -> Ready, [M, U], P::None, "stage", "task.ready", Eligible, Resume),
-    rule!(Stage [Ready] -> Planning, [U, M], P::None, "stage", "task.replanning", Ineligible, Resume),
-    rule!(Stage [Ready] -> Implementing, [C, M], P::TaskActive, "stage", "task.implementing", Eligible, Resume),
-    rule!(Stage [Implementing] -> Reviewing, [C, M], P::None, "stage", "task.reviewing", Unchanged, Resume),
-    rule!(Stage [Reviewing, Integrating, Verifying] -> Implementing, [C, M], P::None, "stage", "task.sent_back", Eligible, Resume),
-    rule!(Stage [Reviewing] -> Integrating, [C, M], P::AssignmentsAccepted, "stage", "task.integrating", Unchanged, Resume),
-    rule!(Stage [Integrating] -> Verifying, [C, M], P::None, "stage", "task.verifying", Unchanged, Resume),
-    rule!(Stage [Verifying] -> Completed, [C, M], P::CriteriaSatisfied, "stage", "task.verified", Ineligible, Never),
+    rule!(Stage [Planning] -> Ready, [M, U], [], "stage", "task.ready", Eligible, Resume),
+    rule!(Stage [Ready] -> Planning, [U, M], [], "stage", "task.replanning", Ineligible, Resume),
+    rule!(Stage [Ready] -> Implementing, [C, M], [TaskActive], "stage", "task.implementing", Eligible, Resume),
+    rule!(Stage [Implementing] -> Reviewing, [C, M], [TaskActive], "stage", "task.reviewing", Unchanged, Resume),
+    rule!(Stage [Reviewing, Integrating, Verifying] -> Implementing, [C, M], [], "stage", "task.sent_back", Eligible, Resume),
+    rule!(Stage [Reviewing] -> Integrating, [C, M], [TaskActive, AssignmentsAccepted], "stage", "task.integrating", Unchanged, Resume),
+    rule!(Stage [Integrating] -> Verifying, [C, M], [TaskActive], "stage", "task.verifying", Unchanged, Resume),
+    rule!(Stage [Verifying] -> Completed, [C, M], [TaskActive, CriteriaSatisfied], "stage", "task.verified", Ineligible, Never),
     // Task lifecycle.
-    rule!(Lifecycle [Active] -> Waiting, [C, M], P::None, "lifecycle", "task.waiting", Ineligible, Wait),
-    rule!(Lifecycle [Waiting, Blocked] -> Active, [U, M, C], P::None, "lifecycle, blocked_reason", "task.active", Eligible, Resume),
-    rule!(Lifecycle [Active, Waiting, Blocked] -> Paused, [U, M], P::None, "lifecycle", "task.paused", Ineligible, Wait),
-    rule!(Lifecycle [Paused] -> Active, [U, M], P::None, "lifecycle", "task.resumed", Eligible, Resume),
-    rule!(Lifecycle [Active, Waiting] -> Blocked, [C, M], P::None, "lifecycle, blocked_reason", "task.blocked", Ineligible, Wait),
-    rule!(Lifecycle [Active, Waiting, Paused, Blocked] -> Cancelled, [U, M], P::None, "lifecycle", "task.cancelled", Ineligible, Never),
-    rule!(Lifecycle [Active] -> Completed, [C, M], P::StageCompleted, "lifecycle", "task.completed", Ineligible, Never),
+    rule!(Lifecycle [Active] -> Waiting, [C, M], [], "lifecycle", "task.waiting", Ineligible, Wait),
+    rule!(Lifecycle [Waiting, Blocked] -> Active, [U, M, C], [], "lifecycle, blocked_reason", "task.active", Eligible, Resume),
+    rule!(Lifecycle [Active, Waiting, Blocked] -> Paused, [U, M], [], "lifecycle", "task.paused", Ineligible, Wait),
+    rule!(Lifecycle [Paused] -> Active, [U, M], [], "lifecycle", "task.resumed", Eligible, Resume),
+    rule!(Lifecycle [Active, Waiting] -> Blocked, [C, M], [], "lifecycle, blocked_reason", "task.blocked", Ineligible, Wait),
+    rule!(Lifecycle [Active, Waiting, Paused, Blocked] -> Cancelled, [U, M], [], "lifecycle", "task.cancelled", Ineligible, Never),
+    rule!(Lifecycle [Active] -> Completed, [C, M], [StageCompleted], "lifecycle", "task.completed", Ineligible, Never),
     // Assignment.
-    rule!(Assignment [Queued] -> Ready, [C], P::DependenciesAccepted, "status", "assignment.ready", Eligible, Resume),
-    rule!(Assignment [Ready, NeedsReview, Failed] -> Queued, [C, M], P::None, "status", "assignment.queued", Unchanged, Resume),
-    rule!(Assignment [Ready] -> Running, [C], P::TaskActive, "status", "assignment.running", Ineligible, Interrupt),
-    rule!(Assignment [Running] -> WaitingForDecision, [W, C, M], P::None, "status", "assignment.waiting_for_decision", Ineligible, Wait),
-    rule!(Assignment [WaitingForDecision] -> Running, [M, U, C], P::NoOpenDecision, "status", "assignment.resumed", Ineligible, Interrupt),
-    rule!(Assignment [Running, WaitingForDecision] -> NeedsReview, [C, W], P::AttemptSucceeded, "status", "assignment.needs_review", Ineligible, Reconcile),
-    rule!(Assignment [NeedsReview] -> Accepted, [C, M], P::None, "status", "assignment.accepted", Eligible, Never),
-    rule!(Assignment [Running, WaitingForDecision] -> Failed, [C, M], P::None, "status", "assignment.failed", Ineligible, Wait),
-    rule!(Assignment [Queued, Ready, Running, WaitingForDecision, NeedsReview, Failed] -> Cancelled, [U, M, C], P::None, "status", "assignment.cancelled", Ineligible, Never),
+    rule!(Assignment [Queued] -> Ready, [C], [DependenciesAccepted], "status", "assignment.ready", Eligible, Resume),
+    rule!(Assignment [Ready, NeedsReview, Failed, Accepted] -> Queued, [C, M], [], "status", "assignment.queued", Unchanged, Resume),
+    rule!(Assignment [Ready] -> Running, [C], [TaskActive], "status", "assignment.running", Ineligible, Interrupt),
+    rule!(Assignment [Running] -> WaitingForDecision, [W, C, M], [], "status", "assignment.waiting_for_decision", Ineligible, Wait),
+    rule!(Assignment [WaitingForDecision] -> Running, [M, U, C], [NoOpenDecision], "status", "assignment.resumed", Ineligible, Interrupt),
+    rule!(Assignment [Running, WaitingForDecision] -> NeedsReview, [C, W], [AttemptSucceeded], "status", "assignment.needs_review", Ineligible, Reconcile),
+    rule!(Assignment [NeedsReview] -> Accepted, [C, M], [], "status", "assignment.accepted", Eligible, Resume),
+    rule!(Assignment [Running, WaitingForDecision] -> Failed, [C, M], [], "status", "assignment.failed", Ineligible, Wait),
+    rule!(Assignment [Queued, Ready, Running, WaitingForDecision, NeedsReview, Failed] -> Cancelled, [U, M, C], [], "status", "assignment.cancelled", Ineligible, Never),
     // Attempt.
-    rule!(Attempt [Created] -> Starting, [C], P::None, "status", "attempt.starting", Unchanged, Reconcile),
-    rule!(Attempt [Starting, Waiting] -> Running, [C], P::None, "status", "attempt.running", Unchanged, Interrupt),
-    rule!(Attempt [Running] -> Waiting, [W, C], P::None, "status", "attempt.waiting", Unchanged, Interrupt),
-    rule!(Attempt [Running, Waiting] -> Succeeded, [W, C], P::None, "status; its assignment to NeedsReview", "attempt.succeeded", Unchanged, Never),
-    rule!(Attempt [Starting, Running, Waiting] -> Failed, [C], P::None, "status", "attempt.failed", Unchanged, Never),
-    rule!(Attempt [Starting, Running, Waiting] -> Interrupted, [C], P::None, "status", "attempt.interrupted", Unchanged, Never),
-    rule!(Attempt [Created, Starting, Running, Waiting] -> Cancelled, [U, M, C], P::None, "status", "attempt.cancelled", Unchanged, Never),
+    rule!(Attempt [Created] -> Starting, [C], [TaskActive], "status", "attempt.starting", Unchanged, Reconcile),
+    rule!(Attempt [Starting, Waiting] -> Running, [C], [], "status", "attempt.running", Unchanged, Interrupt),
+    rule!(Attempt [Running] -> Waiting, [W, C], [], "status", "attempt.waiting", Unchanged, Interrupt),
+    rule!(Attempt [Running, Waiting] -> Succeeded, [W, C], [], "status; its assignment to NeedsReview", "attempt.succeeded", Unchanged, Never),
+    rule!(Attempt [Starting, Running, Waiting] -> Failed, [C], [], "status", "attempt.failed", Unchanged, Never),
+    rule!(Attempt [Starting, Running, Waiting] -> Interrupted, [C], [], "status", "attempt.interrupted", Unchanged, Never),
+    rule!(Attempt [Created, Starting, Running, Waiting] -> Cancelled, [U, M, C], [], "status", "attempt.cancelled", Unchanged, Never),
 ];
 
 /// The rule for `from -> to` when `requester` may ask for it.
@@ -447,8 +447,10 @@ fn apply(
         .ok_or_else(|| TaskError::Storage(format!("{} has unknown state {text}", key.label)))?;
     let rule = authorize(from, to, requester)?;
     let (task, assignment, attempt) = owners(conn, subject)?;
-    if !precondition_holds(conn, &task, assignment.as_deref(), rule.precondition)? {
-        return Err(TaskError::Precondition(rule.precondition));
+    for precondition in rule.preconditions {
+        if !precondition_holds(conn, &task, assignment.as_deref(), *precondition)? {
+            return Err(TaskError::Precondition(*precondition));
+        }
     }
     let set = format!("{}=?", to.column());
     let revision = key.bump(conn, expected, &set, vec![&to.as_str()], now)?;
@@ -457,7 +459,7 @@ fn apply(
     event.assignment_id.clone_from(&assignment);
     event.attempt_id = attempt;
     append(conn, &event, now)?;
-    if to == State::Attempt(AttemptState::Succeeded) {
+    if to == State::Attempt(AttemptState::Succeeded) && is_latest_attempt(conn, subject)? {
         let id = assignment.unwrap_or_default();
         let parent = Subject::Assignment {
             task: &task,
@@ -474,6 +476,22 @@ fn apply(
     Ok(revision)
 }
 
+/// Whether `subject` is its assignment's newest attempt. A replaced attempt
+/// that finishes late must not start a review of the current run.
+fn is_latest_attempt(conn: &Connection, subject: Subject<'_>) -> Result<bool, TaskError> {
+    let Subject::Attempt(id) = subject else {
+        return Ok(false);
+    };
+    let latest: String = conn.query_row(
+        "SELECT l.id FROM native_task_attempts a JOIN native_task_attempts l
+           ON l.task_id=a.task_id AND l.assignment_id=a.assignment_id
+         WHERE a.id=?1 ORDER BY l.created_at DESC, l.rowid DESC LIMIT 1",
+        [id],
+        |row| row.get(0),
+    )?;
+    Ok(latest == id)
+}
+
 fn precondition_holds(
     conn: &Connection,
     task: &str,
@@ -481,13 +499,13 @@ fn precondition_holds(
     precondition: Precondition,
 ) -> Result<bool, TaskError> {
     let sql = match precondition {
-        Precondition::None => return Ok(true),
         Precondition::TaskActive => "SELECT lifecycle='active' FROM native_tasks WHERE id=?1",
         Precondition::NotStarted => "SELECT stage IN ('planning','ready') FROM native_tasks WHERE id=?1",
         Precondition::StageCompleted => "SELECT stage='completed' FROM native_tasks WHERE id=?1",
         Precondition::DependenciesAccepted => "SELECT NOT EXISTS(SELECT 1 FROM json_each((SELECT depends_on FROM native_task_assignments WHERE task_id=?1 AND id=?2)) d
             WHERE NOT EXISTS(SELECT 1 FROM native_task_assignments a WHERE a.task_id=?1 AND a.id=d.value AND a.status='accepted'))",
-        Precondition::AttemptSucceeded => "SELECT EXISTS(SELECT 1 FROM native_task_attempts WHERE task_id=?1 AND assignment_id=?2 AND status='succeeded')",
+        Precondition::AttemptSucceeded => "SELECT status='succeeded' FROM native_task_attempts WHERE task_id=?1 AND assignment_id=?2
+            ORDER BY created_at DESC, rowid DESC LIMIT 1",
         Precondition::NoOpenDecision => "SELECT NOT EXISTS(SELECT 1 FROM native_task_decisions WHERE task_id=?1 AND assignment_id=?2 AND state='open')",
         Precondition::AssignmentsAccepted => "SELECT NOT EXISTS(SELECT 1 FROM native_task_assignments WHERE task_id=?1 AND status NOT IN ('accepted','cancelled'))
             AND EXISTS(SELECT 1 FROM native_task_assignments WHERE task_id=?1 AND status='accepted')",
@@ -509,3 +527,7 @@ fn precondition_holds(
 #[cfg(test)]
 #[path = "states_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transitions_tests.rs"]
+mod transitions_tests;

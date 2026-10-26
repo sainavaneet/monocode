@@ -81,7 +81,7 @@ pub(in crate::tasks) fn force(store: &Store, subject: Subject<'_>, state: State)
 }
 
 pub(in crate::tasks) fn revision(store: &Store, subject: Subject<'_>) -> u64 {
-    store.tasks().revision(subject).unwrap()
+    store.tasks().unwrap().revision(subject).unwrap()
 }
 
 #[test]
@@ -90,8 +90,8 @@ fn schema_is_additive_and_idempotent_on_the_shared_desktop_database() {
     let path = dir.path().join("monocode.db");
     let store = Store::open_monocode(&path).unwrap();
     let before: Vec<String> = sql_column(&store, "SELECT type || ' ' || name || ' ' || COALESCE(sql,'') FROM sqlite_master WHERE tbl_name NOT LIKE 'native_task%' ORDER BY name");
-    store.tasks().ensure_schema().unwrap();
-    store.tasks().ensure_schema().unwrap();
+    store.tasks().unwrap();
+    store.tasks().unwrap();
     let after: Vec<String> = sql_column(&store, "SELECT type || ' ' || name || ' ' || COALESCE(sql,'') FROM sqlite_master WHERE tbl_name NOT LIKE 'native_task%' ORDER BY name");
     assert_eq!(before, after, "desktop schema untouched");
     let tables = sql_column(&store, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_task%' ORDER BY name");
@@ -109,8 +109,12 @@ fn schema_is_additive_and_idempotent_on_the_shared_desktop_database() {
             "native_tasks",
         ]
     );
-    store.tasks().create_task(&new_task("t"), 1).unwrap();
-    assert!(store.tasks().task("t").unwrap().is_some());
+    store
+        .tasks()
+        .unwrap()
+        .create_task(&new_task("t"), 1)
+        .unwrap();
+    assert!(store.tasks().unwrap().task("t").unwrap().is_some());
 }
 
 fn sql_column(store: &Store, query: &str) -> Vec<String> {
@@ -124,7 +128,7 @@ fn sql_column(store: &Store, query: &str) -> Vec<String> {
 #[test]
 fn task_and_plan_round_trip() {
     let store = memory();
-    let tasks = store.tasks();
+    let tasks = store.tasks().unwrap();
     let created = tasks.create_task(&new_task("t"), 10).unwrap();
     assert_eq!(created.stage, TaskStage::Planning);
     assert_eq!(created.lifecycle, TaskLifecycle::Active);
@@ -169,7 +173,7 @@ fn task_and_plan_round_trip() {
 #[test]
 fn attempt_workspace_decision_and_verification_round_trip() {
     let store = memory();
-    let tasks = store.tasks();
+    let tasks = store.tasks().unwrap();
     tasks.create_task(&new_task("t"), 1).unwrap();
     tasks
         .save_plan("t", 1, &plan(vec![assignment("a", &[])]), 2)
@@ -257,7 +261,7 @@ fn attempt_workspace_decision_and_verification_round_trip() {
 #[test]
 fn stale_revisions_are_rejected_without_changes() {
     let store = memory();
-    let tasks = store.tasks();
+    let tasks = store.tasks().unwrap();
     tasks.create_task(&new_task("t"), 1).unwrap();
     tasks
         .save_plan("t", 1, &plan(vec![assignment("a", &[])]), 2)
@@ -377,7 +381,7 @@ fn stale_revisions_are_rejected_without_changes() {
 #[test]
 fn events_replay_idempotently_in_sequence() {
     let store = memory();
-    let tasks = store.tasks();
+    let tasks = store.tasks().unwrap();
     tasks.create_task(&new_task("t"), 1).unwrap();
     let event = NewEvent {
         id: "op-1".into(),
@@ -416,7 +420,7 @@ fn events_replay_idempotently_in_sequence() {
 #[test]
 fn deliveries_record_destination_payload_state_and_retries() {
     let store = memory();
-    let tasks = store.tasks();
+    let tasks = store.tasks().unwrap();
     tasks.create_task(&new_task("t"), 1).unwrap();
     let event = tasks.events_after(0, 1).unwrap().remove(0);
     let delivery = tasks
@@ -468,7 +472,7 @@ fn deliveries_record_destination_payload_state_and_retries() {
 #[test]
 fn leases_expire_and_can_be_taken_over() {
     let store = memory();
-    let tasks = store.tasks();
+    let tasks = store.tasks().unwrap();
     let lease = tasks.acquire_lease("task:t", "gui", 1_000, 100).unwrap();
     assert_eq!(lease.holder, "gui");
     assert_eq!(lease.expires_at, 1_100);
@@ -495,6 +499,114 @@ fn leases_expire_and_can_be_taken_over() {
     assert!(!tasks.release_lease("task:t", "gui").unwrap());
     assert!(tasks.release_lease("task:t", "tauri").unwrap());
     assert_eq!(tasks.lease("task:t").unwrap(), None);
+    // The fencing generation keeps growing across a release.
     let again = tasks.acquire_lease("task:t", "gui", 10, 2_000).unwrap();
-    assert_eq!(again.generation, 1);
+    assert_eq!(again.generation, 3);
+    assert!(matches!(
+        tasks.acquire_lease("task:t", "", 10, 2_000),
+        Err(TaskError::Invalid(_))
+    ));
+}
+
+#[test]
+fn replanning_never_reuses_assignment_revisions_or_event_ids() {
+    let store = memory();
+    let tasks = store.tasks().unwrap();
+    tasks.create_task(&new_task("t"), 1).unwrap();
+    tasks
+        .save_plan(
+            "t",
+            1,
+            &plan(vec![assignment("a", &[]), assignment("b", &[])]),
+            2,
+        )
+        .unwrap();
+    let a = Subject::Assignment { task: "t", id: "a" };
+    let ready = State::Assignment(AssignmentState::Ready);
+    tasks
+        .transition(a, ready, Requester::Coordinator, 1, 3)
+        .unwrap();
+    // A writer read plan v1's assignment at revision 1.
+    let stale = tasks.assignment("t", "b").unwrap().unwrap();
+    // Re-plan; b is dropped then comes back in v3.
+    tasks
+        .save_plan("t", 2, &plan(vec![assignment("a", &[])]), 4)
+        .unwrap();
+    tasks
+        .save_plan(
+            "t",
+            3,
+            &plan(vec![assignment("a", &[]), assignment("b", &[])]),
+            5,
+        )
+        .unwrap();
+    let replanned = tasks.assignments("t").unwrap();
+    assert!(replanned.iter().all(|x| x.revision > 2), "{replanned:?}");
+    assert!(matches!(
+        tasks.update_assignment(
+            "t",
+            &Assignment {
+                prompt: "Stale".into(),
+                ..stale
+            },
+            6
+        ),
+        Err(TaskError::Stale { .. })
+    ));
+    // The same transition after a re-plan is a new event.
+    tasks
+        .transition(a, ready, Requester::Coordinator, revision(&store, a), 7)
+        .unwrap();
+    let readied = tasks
+        .events_after(0, 1_000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "assignment.ready")
+        .count();
+    assert_eq!(readied, 2);
+}
+
+#[test]
+fn writable_desktop_stores_create_task_tables_on_first_use_and_readers_never_do() {
+    let task_tables = |store: &Store| {
+        sql_column(
+            store,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_task%'",
+        )
+        .len()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    // An existing desktop database from before task tables existed.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(include_str!("../store/shared_schema.sql"))
+        .unwrap();
+    drop(conn);
+    let original = std::fs::read(&path).unwrap();
+    let reader = Store::read_monocode(&path).unwrap();
+    assert!(reader.tasks().unwrap().task("t").is_err());
+    assert_eq!(task_tables(&reader), 0, "a reader creates nothing");
+    drop(reader);
+    let store = Store::open_monocode(&path).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "opening changes nothing"
+    );
+    store
+        .tasks()
+        .unwrap()
+        .create_task(&new_task("t"), 1)
+        .unwrap();
+    assert_eq!(task_tables(&store), 9);
+    drop(store);
+    let reader = Store::read_monocode(&path).unwrap();
+    assert!(reader.tasks().unwrap().task("t").unwrap().is_some());
+    let memory = Store::open_monocode(Path::new(":memory:")).unwrap();
+    memory
+        .tasks()
+        .unwrap()
+        .create_task(&new_task("t"), 1)
+        .unwrap();
+    assert_eq!(task_tables(&memory), 9);
 }
