@@ -390,11 +390,12 @@ fn context(
         .task(task_id)?
         .ok_or_else(|| TaskError::NotFound(format!("task:{task_id}")))?;
     let mut text = format!(
-        "Task {} \"{}\" ({}, {}). Request: {}",
+        "Task {} \"{}\" ({}, {}, revision {}). Request: {}",
         task.id,
         task.title,
         task.stage.as_str(),
         task.lifecycle.as_str(),
+        task.revision,
         task.request
     );
     if let Some(found) = assignment.and_then(|id| tasks.assignment(task_id, id).transpose()) {
@@ -443,6 +444,19 @@ fn question(tasks: &TaskStore<'_>, decision: &DecisionRequest) -> Result<String,
 }
 
 fn review(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskError> {
+    let notice =
+        super::lifecycle::describe(&event.kind, &event.task_id, event.assignment_id.as_deref());
+    if let Some(notice) = notice {
+        let mut text = format!(
+            "{notice} ({}).\n{}",
+            event.id,
+            context(tasks, &event.task_id, event.assignment_id.as_deref())?
+        );
+        if let Some(reason) = event.payload["reason"].as_str() {
+            text.push_str(&format!("\nDetails: {reason}"));
+        }
+        return Ok(text);
+    }
     let findings: Vec<String> = event.payload["findings"]
         .as_array()
         .into_iter()

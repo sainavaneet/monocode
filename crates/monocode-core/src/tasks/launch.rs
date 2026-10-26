@@ -305,6 +305,12 @@ pub(super) fn reserve(
         Some(reason) => format!("{prompt}\n\nMono sent the previous attempt back: {reason}"),
         None => prompt,
     };
+    // Requirements revised by steering since the plan was made.
+    let steered = super::steer::brief_note(&tasks, &task.id).map_err(|e| e.to_string())?;
+    let prompt = match steered {
+        Some(note) => format!("{prompt}\n\n{note}"),
+        None => prompt,
+    };
     // A replacement continues from its durable hand-off.
     let handoff = super::handoff::of(&tasks, &attempt.id).map_err(|e| e.to_string())?;
     let prompt = match &handoff {

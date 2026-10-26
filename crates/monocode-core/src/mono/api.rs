@@ -10,6 +10,9 @@ pub const WORKER_LISTS: [&str; 5] = [
 ];
 pub const WORKER_LIST_ITEMS: usize = 50;
 pub const WORKER_LIST_ITEM_BYTES: usize = 4_000;
+/// The assignments a resume or steer names.
+pub const MAX_ASSIGNMENT_IDS: usize = 100;
+const MAX_ASSIGNMENT_ID_BYTES: usize = 512;
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let fields=match action{
@@ -38,6 +41,9 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "tasks.review.accept"=>"taskId assignmentId revision",
         "tasks.review.sendBack"=>"taskId assignmentId revision reason",
         "tasks.criteria.verify"=>"taskId criterionId check assignmentId",
+        "tasks.pause"|"tasks.cancel"=>"taskId revision",
+        "tasks.resume"=>"taskId revision assignmentIds",
+        "tasks.steer"=>"taskId revision requirements assignmentIds plan",
         _=>return Err("Unknown app action. Run app help".into()),
     };
     for (key, value) in input.as_object().ok_or("Input must be an object")? {
@@ -76,6 +82,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "number",
             "revision",
             "alternatives",
+            "assignmentIds",
+            "plan",
             "id",
             "sessionId",
             "besideSessionId",
@@ -125,6 +133,22 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             crate::app_access::MAX_ALTERNATIVES,
             crate::app_access::MAX_ALTERNATIVE_BYTES
         ));
+    }
+    if input.get("assignmentIds").is_some_and(|v| {
+        v.as_array().is_none_or(|a| {
+            a.len() > MAX_ASSIGNMENT_IDS
+                || a.iter().any(|v| {
+                    v.as_str()
+                        .is_none_or(|s| s.trim().is_empty() || s.len() > MAX_ASSIGNMENT_ID_BYTES)
+                })
+        })
+    }) {
+        return Err(format!(
+            "assignmentIds must be an array of up to {MAX_ASSIGNMENT_IDS} assignment ids"
+        ));
+    }
+    if input.get("plan").is_some_and(|v| !v.is_object()) {
+        return Err("plan must be the revised plan object ({title,summary,tasks})".into());
     }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
@@ -211,6 +235,25 @@ mod tests {
             &json!({"taskId":"t","criterionId":"c","check":"true","assignmentId":"a"})
         )
         .is_ok());
+    }
+    #[test]
+    fn task_lifecycle_commands_validate_their_fields() {
+        assert!(validate("tasks.pause", &json!({"taskId":"t","revision":3})).is_ok());
+        assert!(validate("tasks.cancel", &json!({"taskId":"t","revision":"3"})).is_err());
+        assert!(validate("tasks.pause", &json!({"taskId":"t","reason":"x"})).is_err());
+        assert!(validate(
+            "tasks.resume",
+            &json!({"taskId":"t","revision":3,"assignmentIds":["a"]})
+        )
+        .is_ok());
+        assert!(validate("tasks.resume", &json!({"assignmentIds":"a"})).is_err());
+        assert!(validate("tasks.resume", &json!({"assignmentIds":[" "]})).is_err());
+        let steer = json!({"taskId":"t","revision":3,"requirements":"r","assignmentIds":["a"],
+            "plan":{"title":"P","summary":"","tasks":[]}});
+        assert!(validate("tasks.steer", &steer).is_ok());
+        assert!(validate("tasks.steer", &json!({"plan":"text"})).is_err());
+        let many = vec!["a"; MAX_ASSIGNMENT_IDS + 1];
+        assert!(validate("tasks.steer", &json!({"assignmentIds": many})).is_err());
     }
     #[test]
     fn worker_commands_validate_their_fields_and_never_take_ids() {

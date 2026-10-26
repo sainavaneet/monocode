@@ -48,6 +48,8 @@ pub const STOP_STALL_MS: u64 = 2 * 60 * 1000;
 pub const WORKER_STOP: &str = "worker_stop";
 /// The category of a session that ended with no result and no error.
 pub const ENDED_WITHOUT_RESULT: &str = "ended_without_result";
+/// The category of a worker the user stopped by hand while its task ran.
+pub const STOPPED_BY_USER: &str = "stopped_by_user";
 
 pub(super) const SCHEDULED: &str = "scheduled";
 pub(super) const BLOCKED: &str = "blocked";
@@ -55,6 +57,11 @@ pub(super) const BLOCKED: &str = "blocked";
 pub(super) const BLOCK_PENDING: &str = "block_pending";
 pub(super) const EXHAUSTED: &str = "exhausted";
 pub(super) const REPLACED: &str = "replaced";
+/// Kept until the user or Mono resumes it (a worker the user stopped, or a
+/// restart the task's policy does not continue).
+pub(super) const HELD: &str = "held";
+/// Never carried out: the task was cancelled or its assignment re-queued.
+pub(super) const SUPERSEDED: &str = "superseded";
 const MONO: &str = "mono";
 const ABANDONED: &str = "abandoned";
 
@@ -98,6 +105,8 @@ pub enum Outcome {
     Exhausted,
     /// The session ended without a result; Mono reconciles it.
     HandedToMono,
+    /// The user stopped the worker; it waits, held, for Mono or the user.
+    Held,
     /// The task was cancelled.
     Abandoned,
 }
@@ -126,7 +135,7 @@ pub struct Recovery {
     pub revision: u64,
 }
 
-const COLUMNS: &str = "attempt_id,task_id,assignment_id,root_attempt,retries_used,category,reason,provider,failed_account,next_provider,next_account,state,due_at,replacement,revision";
+pub(super) const COLUMNS: &str = "attempt_id,task_id,assignment_id,root_attempt,retries_used,category,reason,provider,failed_account,next_provider,next_account,state,due_at,replacement,revision";
 
 fn row(row: &Row<'_>) -> rusqlite::Result<Recovery> {
     Ok(Recovery {
@@ -161,7 +170,7 @@ pub fn recovery(tasks: &TaskStore<'_>, attempt: &str) -> Result<Option<Recovery>
 }
 
 /// The lineage `attempt` belongs to and the retries it has used.
-fn lineage(tasks: &TaskStore<'_>, attempt: &str) -> Result<(String, u32), TaskError> {
+pub(super) fn lineage(tasks: &TaskStore<'_>, attempt: &str) -> Result<(String, u32), TaskError> {
     let parent = tasks
         .conn
         .query_row(
@@ -205,6 +214,7 @@ enum Next {
     Block(String),
     Exhausted,
     Mono,
+    Hold,
     Abandon,
 }
 
@@ -227,6 +237,7 @@ impl Next {
             Next::Block(reason) => Outcome::Blocked(reason.clone()),
             Next::Exhausted => Outcome::Exhausted,
             Next::Mono => Outcome::HandedToMono,
+            Next::Hold => Outcome::Held,
             Next::Abandon => Outcome::Abandoned,
         }
     }
@@ -322,6 +333,16 @@ pub fn turn_ended(
         ),
         // Waiting on a decision or blocked: the turn ends by design.
         None if attempt.status != AttemptState::Running => Ok(Outcome::Ignored),
+        // The user stopped it by hand (pause and cancel move the attempt
+        // first, so they never get here): held, never failed, and Mono told.
+        None if end.stopped => settle_failure(
+            store,
+            &attempt.id,
+            STOPPED_BY_USER,
+            "The user stopped this worker before it reported a result.",
+            now,
+            |_| Ok(Next::Hold),
+        ),
         None => {
             let why = if end.stopped {
                 "The worker was stopped before it reported a result."
@@ -464,6 +485,7 @@ fn settle_failure(
         Next::Block(_) => (BLOCK_PENDING, now, None, None, 0),
         Next::Exhausted => (EXHAUSTED, now, None, None, 0),
         Next::Mono => (MONO, now, None, None, 0),
+        Next::Hold => (HELD, now, None, None, 0),
         Next::Abandon => (ABANDONED, now, None, None, 0),
     };
     let (root, used) = lineage(&inside, &attempt.id)?;
@@ -513,6 +535,9 @@ fn settle_failure(
                 1,
                 now,
             )?;
+        }
+        Next::Hold => {
+            notify_mono(&tx, &attempt, "recovery.stopped_by_user", &reason, 1, now)?;
         }
         Next::Block(_) | Next::Schedule { .. } | Next::Abandon => {}
     }

@@ -38,6 +38,8 @@ const EXPECTED: &[&str] = &[
     "assignment:needs_review>accepted",
     "assignment:needs_review>queued",
     "assignment:accepted>queued",
+    "assignment:running>queued",
+    "assignment:waiting_for_decision>queued",
     "assignment:running>failed",
     "assignment:waiting_for_decision>failed",
     "assignment:failed>queued",

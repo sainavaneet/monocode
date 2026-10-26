@@ -275,6 +275,21 @@ impl TaskStore<'_> {
             attempt.status,
             AttemptState::Running | AttemptState::Waiting
         ) {
+            // A stopped, cancelled or failed worker's late result is kept in
+            // the history; it changes nothing.
+            if matches!(
+                attempt.status,
+                AttemptState::Interrupted | AttemptState::Cancelled | AttemptState::Failed
+            ) {
+                let payload = serde_json::to_value(claim)?;
+                let id = format!("late-claim:{attempt_id}");
+                append(
+                    &tx,
+                    &event(&attempt, id, "attempt.late_claim", payload),
+                    now,
+                )?;
+                tx.commit()?;
+            }
             return Err(TaskError::InvalidState {
                 subject: format!("attempt:{attempt_id}"),
                 state: attempt.status.as_str().into(),

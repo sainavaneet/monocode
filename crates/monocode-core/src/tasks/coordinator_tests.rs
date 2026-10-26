@@ -461,8 +461,10 @@ fn an_unconfirmed_reservation_is_recovered_after_the_timeout() {
     assert_eq!(reserved.status, AttemptState::Starting);
     assert!(reserved.session_id.is_some());
 
+    // The same process ticks on (only its hand-over was lost); a new
+    // process would treat the attempt as interrupted by the restart.
     let launcher = FakeLauncher::default();
-    let second = coordinator("gpui-2");
+    let second = &first;
     let later = NOW + LEASE_TTL_MS + 1;
     let tick = second.tick(&store, &launcher, later).unwrap();
     assert!(
@@ -509,11 +511,13 @@ fn two_coordinators_cannot_both_hold_a_task_lease() {
         .tick(&theirs, &their_launcher, NOW + LEASE_TTL_MS + 1)
         .unwrap();
     assert_eq!(tick.leased_elsewhere, vec!["t".to_owned()]);
-    // Once we stop, they take over with a new generation and launch nothing new.
+    // Once we stop, they take over with a new generation. Our worker is
+    // treated as gone with us: interrupted, and continued by them alone.
     let tick = b
         .tick(&theirs, &their_launcher, NOW + 3 * LEASE_TTL_MS)
         .unwrap();
     assert!(tick.leased_elsewhere.is_empty());
+    assert_eq!(their_launcher.started.borrow().len(), 1);
     let lease = theirs
         .tasks()
         .unwrap()
@@ -525,8 +529,8 @@ fn two_coordinators_cannot_both_hold_a_task_lease() {
         .tick(&ours, &our_launcher, NOW + 3 * LEASE_TTL_MS + 1)
         .unwrap();
     assert_eq!(tick.leased_elsewhere, vec!["t".to_owned()]);
-    assert!(their_launcher.started.borrow().is_empty());
-    assert_eq!(attempts(&ours, "a").len(), 1);
+    assert_eq!(our_launcher.started.borrow().len(), 1);
+    assert_eq!(attempts(&ours, "a").len(), 2);
 }
 
 #[test]

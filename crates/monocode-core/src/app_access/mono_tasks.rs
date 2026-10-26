@@ -7,19 +7,25 @@ use crate::orchestration::WorkspaceMode;
 use crate::store::Store;
 use crate::tasks::completion::CriterionRun;
 use crate::tasks::decisions::Escalation;
+use crate::tasks::lifecycle;
+use crate::tasks::steer::{self, Steer, MAX_REQUIREMENTS};
 use crate::tasks::{
     AssignmentState, DecisionRequest, NewEvent, Requester, State, Subject, Task, TaskError,
     TaskStore, Verification,
 };
 use serde_json::{json, Value};
 
-pub const MONO_TASK_ACTIONS: [&str; 6] = [
+pub const MONO_TASK_ACTIONS: [&str; 10] = [
     "tasks.decisions.list",
     "tasks.decisions.answer",
     "tasks.decisions.escalate",
     "tasks.review.accept",
     "tasks.review.sendBack",
     "tasks.criteria.verify",
+    "tasks.pause",
+    "tasks.resume",
+    "tasks.cancel",
+    "tasks.steer",
 ];
 /// Escalation alternatives: at most this many, each up to the byte limit.
 pub const MAX_ALTERNATIVES: usize = 6;
@@ -113,11 +119,68 @@ pub fn mono_task_action(
             )
         }
         "tasks.review.accept" | "tasks.review.sendBack" => review(&tasks, mono, action, input, now),
+        "tasks.pause" | "tasks.resume" | "tasks.cancel" | "tasks.steer" => {
+            let task = owned_task(&tasks, mono, &text(input, "taskId", 512)?)?;
+            control(store, &task.id, action, input, Requester::Mono, now)
+        }
         _ => {
             let run = prepare_mono_verify(store, mono, input)?;
             finish_mono_verify(store, &run, run.run(now))
         }
     }
+}
+
+/// The assignment ids an action names, if any.
+fn assignment_ids(input: &Value) -> Vec<String> {
+    input["assignmentIds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|id| id.trim().to_owned())
+        .collect()
+}
+
+/// Pauses, resumes, cancels or steers `task` for `requester` (the owning
+/// Mono through its command; the user through the app's controls). The
+/// caller has checked the action's fields and the requester's authority.
+pub fn control(
+    store: &Store,
+    task: &str,
+    action: &str,
+    input: &Value,
+    requester: Requester,
+    now: u64,
+) -> Result<Value, String> {
+    let revision = revision(input)?;
+    let done = match action {
+        "tasks.pause" => lifecycle::pause(store, task, revision, requester, now),
+        "tasks.cancel" => lifecycle::cancel(store, task, revision, requester, now),
+        "tasks.resume" => {
+            let ids = assignment_ids(input);
+            lifecycle::resume(store, task, revision, requester, &ids, now)
+        }
+        "tasks.steer" => {
+            let plan = match input.get("plan") {
+                Some(plan) => Some(
+                    serde_json::from_value::<crate::orchestration::Plan>(plan.clone())
+                        .map_err(|e| format!("plan is not a valid plan: {e}"))?,
+                ),
+                None => None,
+            };
+            let steer = Steer {
+                requirements: text(input, "requirements", MAX_REQUIREMENTS)?,
+                assignments: assignment_ids(input),
+                plan,
+            };
+            return steer::steer(store, task, revision, requester, &steer, now)
+                .map_err(failed)
+                .and_then(|steered| serde_json::to_value(steered).map_err(|e| e.to_string()));
+        }
+        _ => return Err("Unknown task action. Run app help".into()),
+    };
+    done.map_err(failed)
+        .and_then(|controlled| serde_json::to_value(controlled).map_err(|e| e.to_string()))
 }
 
 fn list(tasks: &TaskStore<'_>, mono: &str) -> Result<Value, String> {

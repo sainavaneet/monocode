@@ -59,6 +59,13 @@ pub trait Policy {
     fn worker_provider(&self, _task: &Task) -> String {
         "codex".into()
     }
+    /// Whether work interrupted by an app restart continues on its own once
+    /// the app is back (task-9's policy fills this in). A task reaches a
+    /// worker only once Mono or the user started it explicitly, so the
+    /// default continues; otherwise the task waits for a resume.
+    fn restart_continuation(&self, _task: &Task) -> bool {
+        true
+    }
 }
 
 /// The default policy: nothing automatic.
@@ -124,10 +131,17 @@ impl<P: Policy> Coordinator<P> {
         tick.enabled = true;
         let tasks = store.tasks()?;
         for id in candidates(&tasks)? {
-            match self.lease(&tasks, &id, now) {
+            match self.take(&tasks, &id, now) {
                 Err(TaskError::LeaseHeld { .. }) => tick.leased_elsewhere.push(id),
                 Err(error) => tick.errors.push(format!("{id}: {error}")),
                 Ok(()) => {
+                    // A task taken over from a holder that is gone is
+                    // reconciled first (its workers died with it).
+                    let mut restart = super::restart::Startup::default();
+                    if let Err(error) = self.reconcile_restart(store, &id, now, &mut restart) {
+                        tick.errors.push(format!("{id}: {error}"));
+                        continue;
+                    }
                     match self.step(store, &id, launcher, now, &mut tick) {
                         Ok(()) => {}
                         // Lost to another holder at the dispatch fence.
@@ -157,6 +171,9 @@ impl<P: Policy> Coordinator<P> {
         tick: &mut Tick,
     ) -> Result<(), TaskError> {
         let tasks = store.tasks()?;
+        // A task-wide open question makes the task wait, and its answer
+        // makes it active again.
+        super::lifecycle::sync_waiting(&tasks, id, now)?;
         let Some(mut task) = tasks.task(id)? else {
             return Ok(());
         };

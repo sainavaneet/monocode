@@ -13,8 +13,8 @@ use std::collections::HashMap;
 mod mono_task_tests;
 mod mono_tasks;
 pub use mono_tasks::{
-    finish_mono_verify, mono_task_action, prepare_mono_verify, MAX_ALTERNATIVES,
-    MAX_ALTERNATIVE_BYTES, MONO_TASK_ACTIONS,
+    control as task_control, finish_mono_verify, mono_task_action, prepare_mono_verify,
+    MAX_ALTERNATIVES, MAX_ALTERNATIVE_BYTES, MONO_TASK_ACTIONS,
 };
 #[cfg(test)]
 mod tests;

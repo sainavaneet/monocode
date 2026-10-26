@@ -297,6 +297,8 @@ pub static TRANSITIONS: &[Transition] = &[
     rule!(Assignment [Queued] -> Ready, [C], [DependenciesAccepted], "status", "assignment.ready", Eligible, Resume),
     rule!(Assignment [Ready, NeedsReview, Failed] -> Queued, [C, M], [], "status", "assignment.queued", Unchanged, Resume),
     rule!(Assignment [Accepted] -> Queued, [C, M], [TaskActive], "status", "assignment.queued", Unchanged, Resume),
+    // Steering re-queues an affected assignment whose worker it stopped.
+    rule!(Assignment [Running, WaitingForDecision] -> Queued, [C, M], [], "status", "assignment.requeued", Unchanged, Resume),
     rule!(Assignment [Ready] -> Running, [C], [TaskActive], "status", "assignment.running", Ineligible, Interrupt),
     rule!(Assignment [Running] -> WaitingForDecision, [W, C, M], [], "status", "assignment.waiting_for_decision", Ineligible, Wait),
     rule!(Assignment [WaitingForDecision] -> Running, [M, U, C], [NoOpenDecision], "status", "assignment.resumed", Ineligible, Interrupt),

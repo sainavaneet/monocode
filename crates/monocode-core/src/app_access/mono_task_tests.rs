@@ -104,3 +104,45 @@ fn mono_task_actions_belong_to_the_owning_mono_only() {
     let off = call("mono-1", "tasks.decisions.list", json!({})).unwrap_err();
     assert!(off.contains("off"), "{off}");
 }
+
+#[test]
+fn mono_pauses_resumes_steers_and_cancels_only_its_own_tasks() {
+    let (store, _) = fixture();
+    let revision = || store.tasks().unwrap().task("t").unwrap().unwrap().revision;
+    let call = |mono: &str, action: &str, input: Value| {
+        mono_task_action(&store, mono, action, &input, NOW + 1)
+    };
+    let pause = json!({"taskId": "t", "revision": revision()});
+    let refused = call("mono-2", "tasks.pause", pause.clone()).unwrap_err();
+    assert!(refused.contains("not found"), "{refused}");
+    let paused = call("mono-1", "tasks.pause", pause.clone()).unwrap();
+    assert_eq!(paused["display"], "pausing");
+    // A stale revision changes nothing.
+    assert!(call("mono-1", "tasks.resume", pause).is_err());
+    let resumed = call(
+        "mono-1",
+        "tasks.resume",
+        json!({"taskId": "t", "revision": revision()}),
+    )
+    .unwrap();
+    assert_eq!(resumed["display"], "active");
+    let steer = json!({"taskId": "t", "revision": revision(), "requirements": "Also log errors",
+        "assignmentIds": ["a"]});
+    assert!(call("mono-2", "tasks.steer", steer.clone()).is_err());
+    let steered = call("mono-1", "tasks.steer", steer).unwrap();
+    assert_eq!(steered["affected"], json!(["a"]));
+    let cancel = json!({"taskId": "t", "revision": revision()});
+    assert!(call("mono-2", "tasks.cancel", cancel.clone()).is_err());
+    let cancelled = call("mono-1", "tasks.cancel", cancel).unwrap();
+    assert!(matches!(
+        cancelled["display"].as_str(),
+        Some("cancelled" | "cancelling")
+    ));
+    // Unknown fields are refused before anything changes.
+    assert!(call(
+        "mono-1",
+        "tasks.pause",
+        json!({"taskId": "t", "revision": 1, "x": 1})
+    )
+    .is_err());
+}
