@@ -743,7 +743,7 @@ impl TaskStore<'_> {
 
     pub fn verifications(&self, task_id: &str) -> Result<Vec<Verification>, TaskError> {
         self.all(
-            &format!("SELECT {VERIFICATION} FROM native_task_verifications WHERE task_id=? ORDER BY created_at,rowid"),
+            &format!("SELECT {VERIFICATION} FROM native_task_verifications WHERE task_id=? ORDER BY rowid"),
             &[task_id],
             verification,
         )

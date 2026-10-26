@@ -967,6 +967,40 @@ fn capture_workspace(root: &Path, reference: &str) -> Result<String, String> {
     Ok(commit.trim().to_string())
 }
 
+/// Snapshots everything in the workspace at `cwd` that Git would track
+/// (committed, modified and untracked, ignored files excluded) as a commit
+/// kept alive at `reference`. HEAD, the index and the files are untouched.
+pub fn snapshot_workspace(cwd: &str, reference: &str) -> Result<String, String> {
+    capture_workspace(&project_root(cwd)?, reference)
+}
+
+/// Whether two snapshots record the same files. Snapshot commits differ by
+/// their time even when nothing changed, so their trees are compared.
+pub fn same_snapshot(cwd: &str, a: &str, b: &str) -> Result<bool, String> {
+    let root = project_root(cwd)?;
+    let tree = |commit: &str| {
+        run_git(
+            &root,
+            &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+        )
+        .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+    };
+    Ok(tree(a)? == tree(b)?)
+}
+
+/// The project-relative paths that differ between two commits.
+pub fn changed_paths(cwd: &str, from: &str, to: &str) -> Result<Vec<String>, String> {
+    let root = project_root(cwd)?;
+    let mut paths: Vec<String> = git_paths(
+        &root,
+        &["diff", "--name-only", "-z", "--no-renames", from, to, "--"],
+    )?
+    .into_iter()
+    .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 fn changes(root: &Path, turn: &RecordedTurn) -> Result<Vec<Change>, String> {
     let before = turn.before.as_deref().ok_or("Missing turn baseline")?;
     let after = turn.after.as_deref().ok_or("Missing turn result")?;

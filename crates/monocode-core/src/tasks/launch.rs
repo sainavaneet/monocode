@@ -81,7 +81,7 @@ impl<P: Policy> Coordinator<P> {
             }
         };
         let tx = tasks.begin()?;
-        append(&tx, &intent(&attempt, &prepared), now)?;
+        append(&tx, &intent(&attempt, assignment, &prepared), now)?;
         let starting = State::Attempt(AttemptState::Starting);
         settle(
             &tx,
@@ -211,7 +211,7 @@ impl<P: Policy> Coordinator<P> {
 }
 
 /// The persisted launch intent: everything needed to reconcile it later.
-fn intent(attempt: &Attempt, prepared: &Prepared) -> NewEvent {
+fn intent(attempt: &Attempt, assignment: &Assignment, prepared: &Prepared) -> NewEvent {
     let w = &prepared.workspace;
     let payload = json!({
         "operationId": attempt.operation_id,
@@ -225,6 +225,9 @@ fn intent(attempt: &Attempt, prepared: &Prepared) -> NewEvent {
         },
         // Uncommitted changes in the checkout are not in the worktree.
         "dirtyBase": prepared.dirty_base,
+        // What the worker was asked to do; review compares it to the current
+        // requirements.
+        "requirements": super::review::requirements(assignment),
     });
     let id = format!("launch:{}", attempt.id);
     event(attempt, id, "attempt.launch_intent", payload)
@@ -245,7 +248,10 @@ pub(super) fn reserve(
         .ok_or("The assignment no longer exists")?;
     let workspace = workspace_of(&tasks, &task.id, &assignment.id)?;
     let kind = Kind::parse(&attempt.provider).ok_or("Unknown worker provider")?;
-    let prompt = super::brief::worker_brief(task, &assignment, &workspace);
+    let correction = tasks
+        .latest_correction(&task.id, &assignment.id)
+        .map_err(|e| e.to_string())?;
+    let prompt = super::brief::worker_brief(task, &assignment, &workspace, correction.as_ref());
     let title: String = format!("{}: {}", task.title, assignment.title)
         .chars()
         .take(TITLE_CHARS)

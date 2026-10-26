@@ -7,6 +7,19 @@ use crate::tasks::store::tests::{
     assignment, force, memory, new_attempt, new_task, plan, revision,
 };
 
+/// Persists a final report for `task`, which completion requires.
+fn report(store: &Store, task: &str) {
+    let event = crate::tasks::NewEvent {
+        id: format!("final_report:{task}"),
+        task_id: task.into(),
+        assignment_id: None,
+        attempt_id: None,
+        kind: "task.final_report".into(),
+        payload: serde_json::json!({}),
+    };
+    store.tasks().unwrap().append_event(&event, 1).unwrap();
+}
+
 /// Fixtures where every precondition holds, one task per machine so sweeping
 /// one subject never invalidates another's precondition.
 fn sweep_fixture(store: &Store) {
@@ -52,6 +65,7 @@ fn sweep_fixture(store: &Store) {
         Subject::Task("lifecycle"),
         State::Stage(TaskStage::Completed),
     );
+    report(store, "stage");
     tasks
         .create_attempt(&new_attempt("swept", "attempt", "a"), 1)
         .unwrap();
@@ -85,6 +99,9 @@ fn every_legal_transition_persists_and_every_illegal_one_changes_nothing() {
         for from in machine {
             for to in machine {
                 force(&store, subject, *from);
+                // Send-backs invalidate verifications; each pair starts fresh.
+                let fresh = "UPDATE native_task_verifications SET invalidated=0";
+                store.connection().execute(fresh, []).unwrap();
                 let rule = TRANSITIONS
                     .iter()
                     .find(|rule| rule.to == *to && rule.from.contains(from));
@@ -235,7 +252,13 @@ fn transitions_enforce_requester_subject_and_preconditions() {
     tasks
         .transition(a, to(AssignmentState::Running), Requester::Mono, 4, 12)
         .unwrap();
-    // Completion needs every required criterion verified at a checkpoint.
+    // Completion needs accepted work, no unresolved decision, every required
+    // criterion verified at a checkpoint and a persisted report.
+    tasks.resolve_decision("d", 2, 12).unwrap();
+    for id in ["a", "b"] {
+        let accepted = State::Assignment(AssignmentState::Accepted);
+        force(&store, Subject::Assignment { task: "t", id }, accepted);
+    }
     tasks
         .transition(
             Subject::Task("t"),
@@ -290,15 +313,14 @@ fn transitions_enforce_requester_subject_and_preconditions() {
     tasks
         .record_verification(&check("again", true, 18))
         .unwrap();
-    tasks
-        .transition(
-            Subject::Task("t"),
-            State::Stage(TaskStage::Completed),
-            Requester::Mono,
-            5,
-            19,
-        )
-        .unwrap();
+    let complete = || {
+        let completed = State::Stage(TaskStage::Completed);
+        tasks.transition(Subject::Task("t"), completed, Requester::Mono, 5, 19)
+    };
+    let unreported = Err(TaskError::Precondition(Precondition::FinalReportRecorded));
+    assert_eq!(complete(), unreported);
+    report(&store, "t");
+    complete().unwrap();
 }
 
 #[test]
@@ -610,6 +632,7 @@ fn verification_send_back_reopens_accepted_work_and_completes_again() {
             created_at: 4,
         })
         .unwrap();
+    report(&store, "t");
     stage(TaskStage::Completed);
     assert_eq!(
         tasks.task("t").unwrap().unwrap().stage,

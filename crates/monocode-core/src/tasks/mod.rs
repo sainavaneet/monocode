@@ -4,21 +4,26 @@
 //! mutation names the revision it read and fails on a stale one, so a stale
 //! writer cannot overwrite newer requirements or resolve a superseded decision.
 pub mod brief;
+pub mod checks;
+pub mod completion;
 pub mod coordinator;
 pub mod events;
 mod launch;
 pub mod model;
+pub mod review;
 pub mod states;
 pub mod store;
 pub mod worker;
 pub mod workspaces;
 
+pub use completion::{complete, final_report, live_verifications, FinalReport};
 pub use events::{DeliveryOutcome, DeliveryState, Event, Lease, NewEvent, PendingDelivery};
 pub use launch::{confirm_started, start_failed};
 pub use model::{
     AcceptanceCriterion, Assignment, Attempt, DecisionRequest, DecisionScope, DecisionState,
     NewAttempt, NewDecision, NewTask, Task, Verification, Workspace,
 };
+pub use review::{Finding, Review, ReviewOutcome};
 pub use states::{
     authorize, AssignmentState, AttemptState, Eligibility, Precondition, Recovery, Requester,
     State, Subject, TaskLifecycle, TaskStage, Transition, TRANSITIONS,

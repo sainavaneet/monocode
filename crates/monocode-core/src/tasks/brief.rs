@@ -1,6 +1,7 @@
 //! The first prompt of a task worker. Workers do not inherit Mono's
 //! conversation, so it carries everything: objective, workspace, scope,
 //! dependencies, expected checks and how to report.
+use super::review::Review;
 use super::{Assignment, Task, Workspace};
 use crate::orchestration::WorkspaceMode;
 
@@ -18,10 +19,33 @@ fn list(items: &[String], none: &str) -> String {
     }
 }
 
+/// What review found in the previous attempt, for the one that redoes it.
+fn correction_text(correction: Option<&Review>) -> String {
+    let Some(review) = correction else {
+        return String::new();
+    };
+    let findings: Vec<String> = review
+        .findings
+        .iter()
+        .map(|finding| format!("- {}", finding.describe()))
+        .collect();
+    format!(
+        "Review sent back the previous attempt ({}). Address these findings first:\n{}\n\n",
+        review.attempt_id,
+        findings.join("\n")
+    )
+}
+
 /// The brief for `assignment` in `workspace`. A checkout workspace is the
 /// user's own working copy, so its worker only reads: the brief lists no
-/// writable files and forbids edits.
-pub fn worker_brief(task: &Task, assignment: &Assignment, workspace: &Workspace) -> String {
+/// writable files and forbids edits. `correction` is the review that sent
+/// the previous attempt back, if one did.
+pub fn worker_brief(
+    task: &Task,
+    assignment: &Assignment,
+    workspace: &Workspace,
+    correction: Option<&Review>,
+) -> String {
     let (place, rules) = match workspace.mode {
         WorkspaceMode::Worktree => (
             format!(
@@ -50,6 +74,7 @@ pub fn worker_brief(task: &Task, assignment: &Assignment, workspace: &Workspace)
         "You are a worker Mono launched for task \"{task_title}\", assignment {id}: {title}.\n\
          You do not have Mono's conversation; everything you need is here.\n\n\
          Objective:\n{prompt}\n\n\
+         {corrections}\
          Workspace: {place}\n\
          {rules}\n\
          Depends on (already accepted): {deps}\n\
@@ -59,6 +84,7 @@ pub fn worker_brief(task: &Task, assignment: &Assignment, workspace: &Workspace)
         id = assignment.id,
         title = assignment.title,
         prompt = assignment.prompt,
+        corrections = correction_text(correction),
         deps = list(&assignment.depends_on, "none"),
         checks = list(
             &assignment.verification,

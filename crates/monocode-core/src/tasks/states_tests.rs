@@ -164,7 +164,13 @@ fn completion_and_launch_carry_their_preconditions() {
             State::Stage(TaskStage::Completed)
         )
         .preconditions,
-        [Precondition::TaskActive, Precondition::CriteriaSatisfied]
+        [
+            Precondition::TaskActive,
+            Precondition::AssignmentsAccepted,
+            Precondition::CriteriaSatisfied,
+            Precondition::NoBlockingDecision,
+            Precondition::FinalReportRecorded
+        ]
     );
     assert_eq!(
         rule(
