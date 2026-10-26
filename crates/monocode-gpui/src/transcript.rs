@@ -4124,14 +4124,31 @@ impl TranscriptView {
         })
         .detach();
     }
+    /// `row` is the transcript row the fence belongs to, when it has one:
+    /// task text renders fences too, and those carry no search or selection.
+    /// `ix` only seeds element ids.
     fn code(
         &mut self,
         fence: Arc<Fence>,
         lines: std::ops::Range<usize>,
+        row: Option<usize>,
         ix: usize,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         self.highlight(&fence, cx);
+        let current = row.is_some_and(|row| {
+            self.search_match
+                .as_ref()
+                .is_some_and(|(start, _)| *start == self.rows[row].key.0)
+        });
+        let selection = row.and_then(|row| {
+            self.text_selection(
+                self.rows[row].key,
+                self.messages[self.rows[row].message].start,
+                self.messages[self.rows[row].message].role == "assistant",
+                cx,
+            )
+        });
         let first = lines.start == 0;
         let last = lines.end == fence.lines.len();
         let key = fence.key;
@@ -4271,15 +4288,8 @@ impl TranscriptView {
                         lines,
                         self.highlights.get(&key).and_then(|v| v.as_deref()),
                         self.search_match.as_ref().map_or("", |(_, q)| q.as_str()),
-                        self.search_match
-                            .as_ref()
-                            .is_some_and(|(start, _)| *start == self.rows[ix].key.0),
-                        self.text_selection(
-                            self.rows[ix].key,
-                            self.messages[self.rows[ix].message].start,
-                            self.messages[self.rows[ix].message].role == "assistant",
-                            cx,
-                        ),
+                        current,
+                        selection,
                     )),
             )
             .into_any_element()
@@ -4807,7 +4817,7 @@ impl TranscriptView {
                 let prepared = self.markdown_cache.get(row.key, md);
                 let md = &prepared.row;
                 let body = if let Part::Code { fence, lines } = &md.part {
-                    self.code(fence.clone(), lines.clone(), ix, cx)
+                    self.code(fence.clone(), lines.clone(), Some(ix), ix, cx)
                 } else {
                     markdown::body_selected(
                         md,

@@ -950,7 +950,7 @@ fn markdown_text(
             markdown::resolve_file_links(&mut row, base);
         }
         let rendered = if let markdown::Part::Code { fence, lines } = &row.part {
-            view.code(fence.clone(), lines.clone(), fence.key as usize, cx)
+            view.code(fence.clone(), lines.clone(), None, fence.key as usize, cx)
         } else {
             markdown::body(
                 &row,
@@ -1000,5 +1000,32 @@ impl gpui::Render for AgentBrief {
             .line_height(px(18.))
             .text_color(content(0.85))
             .child(self.0.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn task_text_with_a_code_block_renders_without_a_transcript_row(cx: &mut gpui::TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| TranscriptView::new())
+            })
+            .unwrap()
+        });
+        // A subagent's reply quoted code. The fence key is not a row index.
+        window
+            .update(cx, |view, _, cx| {
+                let _ = markdown_text(
+                    view,
+                    "Done.\n\n```rust\nlet x = 1;\n```\n",
+                    "agent-1",
+                    markdown::Tone::Work,
+                    cx,
+                );
+            })
+            .unwrap();
     }
 }
