@@ -29,6 +29,18 @@ pub(crate) fn turn_end(
 }
 
 impl Conversation {
+    /// The running turn's final update arrived.
+    #[cfg(test)]
+    pub(crate) fn end_turn_for_test(&mut self) {
+        self.busy = false;
+        self.stopping = false;
+    }
+
+    /// Whether a turn still runs here: busy, or stopped but not yet ended.
+    pub(crate) fn turn_running(&self) -> bool {
+        self.busy || self.stopping
+    }
+
     /// Whether queued follow-ups wait (a stopped session pauses them).
     #[cfg(test)]
     pub(crate) fn follow_ups_paused(&self) -> bool {

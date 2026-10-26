@@ -5,17 +5,24 @@
 //! and the result is reported back: confirmed (attempt Running) or failed.
 use super::{Database, locked};
 use crate::shell::Shell;
-use gpui::{App, AsyncApp, Global, WeakEntity};
+use gpui::{App, AsyncApp, Entity, Global, WeakEntity};
 use monocode_core::agent::Settings;
 use monocode_core::store::Session;
 use monocode_core::tasks;
 use monocode_core::tasks::coordinator::{Coordinator, ExplicitStart, Launcher, TICK_INTERVAL_MS};
 use std::time::Duration;
 
-/// Where coordinator launches are installed; the latest Shell to start its
-/// app bridge.
+/// Where coordinator launches are installed (the latest Shell to start its
+/// app bridge), and every Shell that may hold a worker session.
 struct Service {
     shell: WeakEntity<Shell>,
+    shells: Vec<WeakEntity<Shell>>,
+}
+
+impl Service {
+    fn live_shells(&self) -> Vec<Entity<Shell>> {
+        self.shells.iter().filter_map(WeakEntity::upgrade).collect()
+    }
 }
 impl Global for Service {}
 
@@ -92,9 +99,39 @@ fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> R
     Ok(())
 }
 
+/// Stops each requested session in every window that has it and returns the
+/// requests that are done: the session's turn has ended everywhere it is
+/// open, or it is open in none of the (at least one) live windows. A session
+/// whose id cannot be resolved, or with no window to look in, stays pending,
+/// and so does its replacement. Called again on every tick until done.
+pub(crate) fn stop_sessions(
+    shells: &[Entity<Shell>],
+    requests: &[(String, Option<i64>)],
+    cx: &mut App,
+) -> Vec<String> {
+    if shells.is_empty() {
+        return Vec::new();
+    }
+    let mut done = Vec::new();
+    for (delivery, handle) in requests {
+        let Some(handle) = handle else {
+            continue;
+        };
+        let running: Vec<bool> = shells
+            .iter()
+            .filter_map(|shell| shell.update(cx, |shell, cx| shell.stop_task_worker(*handle, cx)))
+            .collect();
+        if !running.iter().any(|still| *still) {
+            done.push(delivery.clone());
+        }
+    }
+    done
+}
+
 /// Carries out recovery's stop requests: each failed worker's session is
-/// stopped through the Shell's `sessions.stop` path, then the request is
-/// recorded as done so its replacement may launch.
+/// stopped through the Shell's `sessions.stop` path in every window, and the
+/// request is recorded as done only once its turn has ended, so its
+/// replacement never shares the worktree with it.
 async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
     let lookup = store.clone();
     let requests = cx
@@ -106,7 +143,13 @@ async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
                 stops
                     .into_iter()
                     .map(|stop| {
-                        let handle = store.resolve_session_id(&stop.session_id).ok();
+                        let handle = match store.resolve_session_id(&stop.session_id) {
+                            Ok(handle) => Some(handle),
+                            Err(error) => {
+                                eprintln!("Task recovery: session {}: {error}", stop.session_id);
+                                None
+                            }
+                        };
                         (stop.delivery, handle)
                     })
                     .collect::<Vec<_>>(),
@@ -121,20 +164,23 @@ async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
             return;
         }
     };
-    let sessions: Vec<i64> = requests.iter().filter_map(|(_, h)| *h).collect();
-    cx.update(|cx| {
-        let shell = cx.try_global::<Service>().and_then(|s| s.shell.upgrade());
-        if let Some(shell) = shell {
-            shell.update(cx, |shell, cx| shell.stop_task_workers(&sessions, cx));
-        }
+    let done = cx.update(|cx| {
+        let shells = cx
+            .try_global::<Service>()
+            .map(Service::live_shells)
+            .unwrap_or_default();
+        stop_sessions(&shells, &requests, cx)
     });
+    if done.is_empty() {
+        return;
+    }
     let store = store.clone();
     let recorded = cx
         .background_executor()
         .spawn(async move {
             let store = locked(&store)?;
             let now = monocode_core::time::now_ms();
-            for (delivery, _) in requests {
+            for delivery in done {
                 tasks::recovery::stopped(&store, &delivery, now).map_err(|e| e.to_string())?;
             }
             Ok::<_, String>(())
@@ -157,11 +203,21 @@ fn holder() -> String {
 /// Registers the coordinator once per process; later calls only retarget the
 /// Shell that installs launched workers.
 pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
-    if cx.has_global::<Service>() {
-        cx.set_global(Service { shell });
+    if let Some(service) = cx.try_global::<Service>() {
+        let mut shells: Vec<_> = service
+            .shells
+            .iter()
+            .filter(|s| s.upgrade().is_some() && *s != &shell)
+            .cloned()
+            .collect();
+        shells.push(shell.clone());
+        cx.set_global(Service { shell, shells });
         return;
     }
-    cx.set_global(Service { shell });
+    cx.set_global(Service {
+        shell: shell.clone(),
+        shells: vec![shell],
+    });
     let (launches, receive) = async_channel::unbounded::<(Session, Settings)>();
     // Wakes the stop pump: after each tick and after each confirmation.
     let (pumps, pumped) = async_channel::unbounded::<()>();
@@ -184,13 +240,21 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
             let allowed = cx
                 .background_executor()
                 .spawn(async move {
-                    locked(&check)
-                        .and_then(|store| {
-                            tasks::recovery::launch_allowed(&store, id).map_err(|e| e.to_string())
-                        })
-                        .unwrap_or(true)
+                    locked(&check).and_then(|store| {
+                        tasks::recovery::launch_allowed(&store, id).map_err(|e| e.to_string())
+                    })
                 })
                 .await;
+            // Fail closed: when it cannot be checked it is not installed;
+            // the attempt stays Starting and the confirmation timeout
+            // recovers it.
+            let allowed = match allowed {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    eprintln!("Task coordinator: worker {id} was not started: {error}");
+                    continue;
+                }
+            };
             let installed = cx.update(|cx| {
                 if !allowed {
                     return Err("The worker's launch was given up before the app started it.");

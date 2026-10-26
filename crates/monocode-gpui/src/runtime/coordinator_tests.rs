@@ -273,22 +273,33 @@ fn a_worker_that_hits_its_usage_limit_continues_on_the_next_allowed_account() {
 
     let store = Store::open(&base.join("monocode.db")).unwrap();
     store.save_setting(FLAG, "enabled").unwrap();
-    store
-        .save_provider_accounts(&monocode_core::accounts::Book {
-            accounts: vec![monocode_core::accounts::Account {
-                id: "account-b".into(),
+    // Hermetic: both accounts are profiles under the temp data dir, never
+    // the real ~/.codex of the default account.
+    let mut book = monocode_core::accounts::Book {
+        accounts: ["account-a", "account-b"]
+            .iter()
+            .map(|id| monocode_core::accounts::Account {
+                id: (*id).into(),
                 provider: "codex".into(),
-                label: "B".into(),
-            }],
-            ..Default::default()
-        })
-        .unwrap();
-    let mut allowed = Allowlist::only("codex", "default");
+                label: (*id).into(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let project_key = project.to_string_lossy().into_owned();
+    book.select(
+        monocode_core::provider::Kind::Codex,
+        &project_key,
+        "account-a",
+    )
+    .unwrap();
+    store.save_provider_accounts(&book).unwrap();
+    let mut allowed = Allowlist::only("codex", "account-a");
     allowed.accounts.push(AllowedAccount {
         priority: 1,
         ..AllowedAccount::new("codex", "account-b")
     });
-    save_allowlist(&store, Scope::Project(&project.to_string_lossy()), &allowed).unwrap();
+    save_allowlist(&store, Scope::Project(&project_key), &allowed).unwrap();
     started_task(&store, &project);
     let store: Database = Arc::new(Mutex::new(store));
     let coordinator = Coordinator::new("gpui-test", ExplicitStart);
@@ -297,7 +308,14 @@ fn a_worker_that_hits_its_usage_limit_continues_on_the_next_allowed_account() {
         .tick(&locked(&store).unwrap(), &launcher, 10)
         .unwrap();
     let (session, settings) = launcher.0.borrow()[0].clone();
-    assert_eq!(settings.account.id, "default");
+    assert_eq!(settings.account.id, "account-a");
+    assert!(
+        settings
+            .account
+            .home(monocode_core::provider::Kind::Codex)
+            .unwrap()
+            .starts_with(&base)
+    );
     monocode_core::tasks::confirm_started(&locked(&store).unwrap(), session.id, 11).unwrap();
     let brief = locked(&store)
         .unwrap()

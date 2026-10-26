@@ -39,10 +39,7 @@ pub(crate) fn mono_plan(
     let failed = allowlist.entry(kind.id(), current);
     eligibility::record_failure(store, &allowlist, &failed, failure, resets_at, now)?;
     let health = eligibility::health(store)?;
-    let book = store.provider_accounts()?;
-    let exists = |a: &AllowedAccount| {
-        Kind::parse(&a.provider).is_some_and(|k| book.exists(k, &a.account_id))
-    };
+    let exists = eligibility::known_accounts(store)?;
     // A chat stays on its provider: only accounts of the same one.
     let mut same = allowlist.clone();
     same.accounts.retain(|a| a.provider == kind.id());
@@ -144,16 +141,23 @@ impl Conversation {
                 self.switch_usage_account(profile, cx);
             }
             Ok(Some(AccountPlan::Wait { until })) => {
-                if let Some(limit) = &mut self.settings.usage_limit {
-                    limit.resets_at = Some(i64::try_from(until).unwrap_or(i64::MAX));
-                    limit.resume_at_reset = true;
-                }
-                self.status = format!(
-                    "No allowed account is available until its limit resets in {}; this chat resumes then.",
-                    monocode_core::usage::duration(
-                        i64::try_from(until.saturating_sub(now)).unwrap_or(0)
-                    )
+                let wait = monocode_core::usage::duration(
+                    i64::try_from(until.saturating_sub(now)).unwrap_or(0),
                 );
+                self.status = match (&mut self.settings.usage_limit, failure) {
+                    // A usage limit resumes itself at the reset.
+                    (Some(limit), Failure::UsageExhausted | Failure::SharedQuota) => {
+                        limit.resets_at = Some(i64::try_from(until).unwrap_or(i64::MAX));
+                        limit.resume_at_reset = true;
+                        format!(
+                            "No allowed account is available until a limit resets in {wait}; this chat retries on its account then."
+                        )
+                    }
+                    // Nothing resumes a sign-in failure by itself.
+                    _ => format!(
+                        "This account needs to sign in again. Sign in to resume, or choose another account (another allowed account's limit resets in {wait})."
+                    ),
+                };
                 self.save_settings(cx);
                 cx.notify();
             }
