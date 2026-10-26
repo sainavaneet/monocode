@@ -5,6 +5,11 @@ delegates, answers workers, reviews and reports. The app persists state,
 routes decisions, detects failures, switches authorized accounts and resumes
 interrupted work. Nothing below is built yet except where marked **exists**.
 
+**Update 2026-10-27:** phases 0 to 8 are now built on `feat/project-switcher`
+behind the `native-task-coordinator` setting (off by default). The sections
+below keep the original plan text; **Built** at the end says what exists,
+where, and what remains (phase 9, background execution).
+
 ## Baseline (verified)
 
 Native checkout: `/Users/navaneet/Developer/monocode-gpui-preview`, branch
@@ -212,18 +217,18 @@ authority later applies to active work deliberately.
 
 ## Order of work
 
-| Phase | Scope | Exit |
-|---|---|---|
-| 0 | Rebase `fix/orchestration-plan-card` onto `feat/project-switcher`; spike the `native_` task tables | Branch merges cleanly; migration runs on a copy of the shared database |
-| 1 | Models, migrations, states, events, lease | Transaction and transition tests pass |
-| 2 | Single-worker coordinator over `sessions.start` with workspace records | One assignment launches and reports durably |
-| 3 | Worker to Mono to user decisions | Automatic answers and persistent waiting both work and survive restart |
-| 4 | Review and correction | A failed check produces a correction and a verified completion |
-| 5 | Account and provider recovery for Mono and workers | Failures resume without duplicate edits or account cycling |
-| 6 | Restart, pause, cancel, steer | Interruptions preserve correct state |
-| 7 | Monitoring card and timeline | Reflect persisted state and live events |
-| 8 | Parallel scheduling and integration | Ownership and dependency order hold |
-| 9 | Background execution on the remote host model | UI and host cannot both execute one task |
+| Phase | Scope | Exit | Status |
+|---|---|---|---|
+| 0 | Rebase `fix/orchestration-plan-card` onto `feat/project-switcher`; spike the `native_` task tables | Branch merges cleanly; migration runs on a copy of the shared database | Built (tasks 1, 2) |
+| 1 | Models, migrations, states, events, lease | Transaction and transition tests pass | Built (task-2) |
+| 2 | Single-worker coordinator over `sessions.start` with workspace records | One assignment launches and reports durably | Built (tasks 3, 4) |
+| 3 | Worker to Mono to user decisions | Automatic answers and persistent waiting both work and survive restart | Built (task-6) |
+| 4 | Review and correction | A failed check produces a correction and a verified completion | Built (task-5) |
+| 5 | Account and provider recovery for Mono and workers | Failures resume without duplicate edits or account cycling | Built (task-7) |
+| 6 | Restart, pause, cancel, steer | Interruptions preserve correct state | Built (task-8; policy task-9) |
+| 7 | Monitoring card and timeline | Reflect persisted state and live events | Built (task-10) |
+| 8 | Parallel scheduling and integration | Ownership and dependency order hold | Built (task-11) |
+| 9 | Background execution on the remote host model | UI and host cannot both execute one task | **Not built** |
 
 Feature-flag each phase until its end-to-end check passes. Use fake providers
 (the python app-server fixtures in `provider.rs` and `parked.rs` are the
@@ -236,6 +241,8 @@ during a running attempt restarts as Interrupted; the Tauri app running
 alongside cannot take the task lease; a changed API key billing preference
 does not alter an in-flight task's policy.
 
+**Built:** each extra has a core test; see **Built > Proof** for the names.
+
 ## Release acceptance
 
 One task started in Mono's chat that plans, creates a workspace, launches a
@@ -243,3 +250,165 @@ worker, answers one question automatically, escalates one to the user and
 waits, resumes, survives a simulated account failure, catches a failed check,
 verifies the correction, reports with workspace and test evidence, and keeps
 its state across an app restart.
+
+**Built:** proven end to end by
+`tasks::acceptance_tests::a_task_from_a_mono_chat_survives_questions_failures_corrections_and_a_restart`;
+see **Built > Proof**.
+
+## Built (2026-10-27)
+
+Twelve tasks, each reviewed and merged on `feat/project-switcher`. Core paths
+are under `crates/monocode-core/src/`, app paths under
+`crates/monocode-gpui/src/`.
+
+### Turning it on
+
+Everything is off unless the setting `native-task-coordinator` is exactly
+`enabled` (`tasks::coordinator::FLAG`, read by `coordinator::enabled`). There
+is no UI toggle. Set it with `Store::save_setting("native-task-coordinator",
+"enabled")`. On the shared desktop database the native app keeps its settings
+in `monocode.db.gpui.sqlite3` (table `settings`); on a native-only database
+they are in `native_settings`. With it off, the coordinator, review, verify,
+integration, inbox and monitoring passes return at once, worker and Mono task
+commands refuse, no task tables are created, and the plan card's Start runs
+the old in-app scheduler. Use the Dev app (`Monocode Development` data) to try
+it, not the Preview, which shares the user's live agents.
+
+### What exists, by phase
+
+| Phase | Core | App |
+|---|---|---|
+| 0 | plan card merged from `fix/orchestration-plan-card` (`orchestration.rs`); `native_task*` tables created lazily on the first writable `Store::tasks()` | `conversation/orchestration_card.rs`, `shell/orchestration.rs` |
+| 1 | `tasks/model.rs`, `states.rs` (the one transition table with requesters, preconditions, events, eligibility, recovery), `events.rs` (events, deliveries, leases), `store.rs` | — |
+| 2 | `tasks/worker.rs` + `app_access.rs` `worker_action` (`tasks.worker.status/ask/result/blocked`, bound by session only); `tasks/coordinator.rs`, `launch.rs` (intent before dispatch, receipts, launch confirmation timeout), `workspaces.rs` (worktree per assignment, branch `mono/<task>/<assignment>`, base commit, owner), `brief.rs` | `runtime/coordinator.rs` (ticker, launcher, startup), `shell/app_commands` (worker route without operator access) |
+| 3 | `tasks/decisions.rs` (routing, answer, escalate, hand-off once, user reply matching), `inbox.rs` (Mono queue, receipts, reminders), `waiting.rs`, `app_access/mono_tasks.rs` (`tasks.decisions.*`, `tasks.review.*`, `tasks.criteria.verify`) | `monos/tasks.rs` (task pump: inbox to Mono's chat, answers to workers), `monos/decision_card.rs`, `conversation/task_questions.rs` (provider questions on worker sessions go to Mono) |
+| 4 | `tasks/review.rs`, `checks.rs` (no-shell check runner), `findings.rs`, `verify.rs` (stage driving, criterion rounds), `completion.rs` (verifications on checkpoint commits, `FinalReport`) | — |
+| 5 | `usage/failure.rs` (failure categories), `accounts/eligibility.rs` (allowlists, cooldown and health), `tasks/recovery.rs`, `replace.rs`, `handoff.rs` (durable redacted hand-off), one retry budget per lineage | `conversation/task_recovery.rs`, `shell/task_recovery.rs` (stops), `conversation/mono_accounts.rs` (Mono chat switches account in place) |
+| 6 | `tasks/lifecycle.rs` (pause, resume, cancel), `steer.rs`, `restart.rs` + `takeover.rs` (startup, lease takeover, Interrupted attempts, missing worktree condition), `workspace_check.rs` | `conversation/task_controls.rs`, plan-card controls |
+| 6 (policy) | `tasks/autonomy.rs` (per-Mono and per-project policy, snapshot into each task with revisions, live reductions), `policy.rs` (snapshot incl. API key billing, `start_plan`), `app_access/mono_policy.rs` (`tasks.policy.show/apply`, `tasks.unblock`) | `monos/autonomy.rs`, `monos/autonomy_view.rs` |
+| 7 | `tasks/view.rs` (monitor read model, badges), `timeline.rs` | `conversation/task_monitor.rs`, `monos/task_overview.rs`, sidebar badge |
+| 8 | `tasks/guard.rs` (workspace ownership), `integration.rs` + `merging.rs` (integration branch `mono/<task>/integration`, dependency-order merges, conflicts to corrections or decisions) | `shell/orchestration.rs` (Start under the flag creates a coordinator task for Mono-owned chats) |
+
+### Controller decisions that changed the plan
+
+- Task tables are created on first writable use, not at open, so opening the
+  shared database changes nothing (task-2).
+- A worker's `failed` claim is only recorded; the coordinator classifies it
+  (task-3).
+- An attempt stays Starting until the app confirms the session started;
+  unconfirmed after `LAUNCH_CONFIRM_TIMEOUT_MS` (60 s) it fails with
+  `launch.unconfirmed`. Investigation (checkout mode) briefs are read-only
+  (task-4).
+- Acceptance criteria carry `checks`. The coordinator drives Implementing to
+  Completed; check-less, missing or several-worktree criteria go to Mono
+  (`mono_review`); checkout work never runs checks (task-5).
+- Routed questions keep the provider request open (no 120 s auto-deny); open
+  decisions are re-sent to Mono at most 3 times, 30 minutes apart; a provider
+  `test_guard` refuses non-fixture binaries in test builds (task-6).
+- Failure categories are Temporary, UsageExhausted, SharedQuota, Auth,
+  ProviderUnavailable, Configuration, Policy, Unknown. The account allowlist
+  is read live (Mono, then project, then the start account); only billing and
+  the start account are snapshotted. A stop counts as done only when the turn
+  ended in every window or the session is gone for 10 s; a stop stalled for
+  2 minutes is reported (task-7).
+- A takeover is a restart only when the previous holder is provably dead;
+  otherwise its workers are held. Unknown holders need `confirmedStopped` to
+  resume. Only working tasks are leased each tick (task-8).
+- The allowlist is edited from the policy UI; every other policy field is
+  snapshotted with revisions; live reductions apply at once, more authority
+  needs `tasks.policy.apply`. Commit authority is enforced at review (task-9).
+- Coordinator tasks only start from Mono-owned chats; other chats keep the
+  in-app scheduler. Integration merges onto a task branch in its own
+  worktree, never the user's branch, and stops at the first conflict
+  (task-11).
+
+### Proof
+
+- Release acceptance, one core test driving the app's entry points with a
+  fake launcher, a temporary Git repository and a file-backed store:
+  `tasks::acceptance_tests::a_task_from_a_mono_chat_survives_questions_failures_corrections_and_a_restart`.
+  Steps: `policy::start_plan` from a Mono chat (as the plan card's Start);
+  worktree creation and launch; a competing holder refused; a routine
+  question answered through `tasks.decisions.answer` and handed to the worker
+  once; an escalated question open for 30 days of ticks and answered by the
+  user's reply; usage exhaustion recovered on the next allowed account in the
+  same worktree with a hand-off and one retry spent, while a flipped API key
+  preference leaves the snapshot alone; a failing criterion sent back and
+  relaunched with the finding; the app restarted with the running attempt
+  Interrupted and continued; the correction reviewed, verified and reported
+  with the worktree, commits, checkpoints and check evidence.
+- The app-side pumps those steps rely on are covered in the GUI suite:
+  `shell::orchestration::tests::with_the_coordinator_on_start_persists_a_task_the_coordinator_schedules`,
+  `runtime::coordinator_tests::{a_launched_worker_runs_its_brief_in_its_worktree_and_reports_durably, a_worker_that_hits_its_usage_limit_continues_on_the_next_allowed_account, startup_interrupts_workers_that_died_with_the_last_run}`,
+  `monos::task_tests::{a_routed_provider_question_gets_monos_answer_through_its_reply_once, an_escalated_decision_is_a_card_in_monos_chat_that_the_user_answers, habit_timeouts_never_stop_a_task_worker}`.
+- Matrix extras: habit timeouts,
+  `tasks::lifecycle::tests::the_coordinator_never_times_out_a_task_worker_past_habit_timeouts`;
+  quit during a running attempt,
+  `tasks::restart::tests::running_workers_are_interrupted_on_restart_and_continue_on_their_lineage`;
+  the other app cannot take the lease,
+  `tasks::coordinator::tests::two_coordinators_cannot_both_hold_a_task_lease`,
+  `tasks::restart::tests::a_lease_another_app_holds_keeps_startup_passive_until_it_expires`
+  and `a_live_holder_taken_over_keeps_its_workers_held_until_it_is_gone`;
+  API key preference,
+  `tasks::handoff::tests::the_api_key_choice_is_snapshotted_when_the_task_is_created`
+  and
+  `tasks::autonomy::tests::the_snapshot_taken_at_creation_ignores_later_policy_and_billing_changes`.
+
+### Known gaps (deferred minors)
+
+From the controller ledger, accepted for later:
+
+- Plan card: streaming reveal replay when the plan tag appears mid-stream;
+  stringly typed status labels and index-matched rows in
+  `orchestration_card.rs`; untested shell glue; planning state split across
+  `composer_features.rs` and `orchestration_card.rs`.
+- Store: `TaskStore::state` race; idempotent inserts ignore a differing
+  payload; `CriteriaSatisfied` is true with zero criteria; no events for
+  requirement edits; no secondary indexes; `tasks()` re-runs `CREATE TABLE IF
+  NOT EXISTS` per call.
+- Worker protocol: `NO_SESSION` matched by string between `app_access.rs` and
+  `store/shared.rs`; requester sets for Succeeded/NeedsReview kept aligned by
+  hand.
+- Coordinator: the store lock is held over a whole tick including Git (UI
+  stalls when the flag is on); GUI install/confirm receiver untested;
+  `dirtyBase` lost on a crash between `save_workspace` and the intent; no
+  remote:// refusal or rate limit on the worker route; first-call race refusal
+  does not say retry.
+- Review and verification: `Coordinator::verify` stops at the first per-task
+  error (tests only); snapshot refs, worktrees and integration branches are
+  never cleaned up (retention not built); checks block the background thread
+  up to their timeout; `checkpoint.rs` is 1296 lines.
+- Decisions: `batch_failed` is not one transaction; the decision card cannot
+  answer multi-part questions; `refresh_cards`/`batch_failed` lock on the UI
+  thread; a criterion check can race the coordinator's Git index lock;
+  reminders stop after 3 with no passive indicator; `test_guard` uses an
+  exe-name heuristic; the inbox re-scans history each tick.
+- Recovery: `record_failure` to the shared extras database is not atomic with
+  the task transaction; a stalled stop writes every tick after the first;
+  "failed to start" is matched loosely; grace is measured from the first pump
+  sighting.
+- Restart and steer: the `assignmentIds` takeover filter and the startup
+  panic guard are untested; `store/shared.rs` grew (`session_persisted`).
+- Policy: the commit check counts all commits since base, not only those after
+  a revocation; fail-closed check untested; core tests rely on unique Mono ids
+  for the live policy registry.
+- Monitoring: last status sync is derived from lease expiry; recovery lines
+  truncate at 160 characters; `ProgressStatus` and `WorkerState` both exist;
+  badge and card differ on Starting with a busy session.
+- Integration: stops at the first conflict; a revoked-merge clean record is
+  usable by Mono's manual Verifying; a committed file that is now gitignored
+  is falsely refused.
+
+### Remaining
+
+- **Phase 9, background execution on the remote host model**: not built.
+  Workers run only while the native app runs; quitting interrupts them and the
+  next start recovers them. The UI-versus-host exclusivity this phase needs
+  would build on the existing task lease (`coordinator::lease_resource`,
+  holder liveness in `restart.rs`).
+- Mono's own planning turn (inspect the repository, recall memory, write
+  criteria) is Mono's prompt work; the app persists and starts what Mono's
+  plan card holds. Plans from chats no Mono owns still use the in-app
+  scheduler.
+- Worktree retention and clean-up, spending controls, and deployment evidence
+  are not built (`deployed` is never inferred).
