@@ -309,19 +309,26 @@ impl Shell {
     /// The plan card's per-assignment status, with workers that wait on an
     /// approval or answer shown as needing input.
     fn orchestration_progress(&self, lead: i64, cx: &App) -> Vec<TaskProgress> {
-        let Some(summary) = self.orchestration_summaries.get(&lead) else {
+        let (Some(summary), Some(run)) = (
+            self.orchestration_summaries.get(&lead),
+            self.orchestrations.get(&lead),
+        ) else {
             return Vec::new();
         };
+        // The summary is built from the run's assignments, so each pairs
+        // with its assignment's id; the card matches rows by that id.
         summary
             .tasks
             .iter()
-            .map(|task| {
+            .zip(&run.tasks)
+            .map(|(task, assignment)| {
                 let needs_input = task
                     .session
                     .and_then(|id| self.sessions.get(&id))
                     .is_some_and(|view| view.read(cx).needs_approval());
                 TaskProgress {
-                    label: task.label(summary, needs_input),
+                    id: assignment.task.id.clone(),
+                    status: task.status_of(summary, needs_input),
                     session: task.session,
                 }
             })

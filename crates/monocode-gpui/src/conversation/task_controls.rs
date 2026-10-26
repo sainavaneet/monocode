@@ -2,8 +2,8 @@
 //! plan card (`orchestration_card`), next to its Start and Stop. The rows
 //! come from `monocode_core::tasks::lifecycle::controls`; a click is carried
 //! out by `shell::orchestration::apply_task_control` as the user. Steer takes
-//! the new requirements from the composer. The monitoring card (task-10)
-//! replaces this minimal row.
+//! the new requirements from the composer. The monitoring card
+//! (`task_monitor`) shows the same buttons in place of these rows.
 use super::*;
 use monocode_core::tasks::lifecycle::{ControlRow, Display};
 
@@ -66,10 +66,16 @@ impl Conversation {
     ) {
         match result {
             Ok(value) => {
-                if let Some(row) = self
+                let monitored = self
+                    .task_monitor
+                    .tasks
+                    .iter_mut()
+                    .map(|task| &mut task.control);
+                for row in self
                     .task_controls
                     .iter_mut()
-                    .find(|row| row.task_id == control.task_id)
+                    .chain(monitored)
+                    .filter(|row| row.task_id == control.task_id)
                 {
                     if let Some(revision) = value["revision"].as_u64() {
                         row.revision = revision;
@@ -114,12 +120,16 @@ impl Conversation {
         cx.emit(control);
     }
 
-    pub(super) fn task_control_rows(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.task_controls.is_empty() {
-            return None;
-        }
-        let rows = self.task_controls.iter().map(|row| {
-            let buttons = offered(row).into_iter().map(|(action, label)| {
+    /// The lifecycle buttons of a task row; a click carries out task-8's
+    /// control (`request_task_control`), the same for every surface.
+    pub(super) fn task_control_buttons(
+        &self,
+        row: &ControlRow,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        offered(row)
+            .into_iter()
+            .map(|(action, label)| {
                 let control = TaskControl {
                     task_id: row.task_id.clone(),
                     // A steer is checked against the plan it was written for.
@@ -132,8 +142,10 @@ impl Conversation {
                     requirements: None,
                     confirmed_stopped: action == "tasks.resume" && row.confirm_stopped,
                 };
+                let selector = format!("task-control-{}-{action}", row.task_id);
                 div()
                     .id(SharedString::from(format!("task-{}-{label}", row.task_id)))
+                    .debug_selector(move || selector.clone())
                     .role(Role::Button)
                     .aria_label(label)
                     .cursor_pointer()
@@ -147,7 +159,16 @@ impl Conversation {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.request_task_control(control.clone(), cx)
                     }))
-            });
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    pub(super) fn task_control_rows(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.task_controls.is_empty() {
+            return None;
+        }
+        let rows = self.task_controls.iter().map(|row| {
             let line = div()
                 .flex()
                 .items_center()
@@ -160,7 +181,7 @@ impl Conversation {
                         .text_color(content(0.6))
                         .child(row.display.label()),
                 )
-                .children(buttons);
+                .children(self.task_control_buttons(row, cx));
             div()
                 .flex()
                 .flex_col()

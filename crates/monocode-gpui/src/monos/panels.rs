@@ -1021,7 +1021,9 @@ impl Monos {
                 .on_click(cx.listener(|this, _, window, cx| this.filter_menu(window, cx))),
         );
         let no_matches = launches.is_empty() && !mono.launches.is_empty();
+        let tasks = self.task_overview(mono);
         div().size_full().flex().flex_col()
+            .children(tasks)
             .when(!mono.launches.is_empty(),|d|d.child(search_bar))
             .child(div().id("mono-session-list").debug_selector(|| "mono-session-list".into()).flex_1().min_h_0().overflow_y_scroll().px(px(6.)).py_2().flex().flex_col().gap_1()
                 .when(mono.launches.is_empty(),|d|d.child(empty_state("message-multiple",&format!("Ask {} to start a session on one of your projects, like a bug fix or a review, and it shows up here.",mono.label()))))

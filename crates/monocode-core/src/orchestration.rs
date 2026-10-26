@@ -26,23 +26,65 @@ pub struct SummaryTask {
     /// queued, running, completed, failed or blocked.
     pub status: String,
 }
+/// What the plan card and the sidebar show for one assignment of a run. The
+/// label is defined once here, so a renamed label cannot drift from the
+/// colors and the live state matched on the status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressStatus {
+    NeedsInput,
+    Saved,
+    Queued,
+    Working,
+    Done,
+    Failed,
+    NeedsReview,
+}
+impl ProgressStatus {
+    pub const ALL: [Self; 7] = [
+        Self::NeedsInput,
+        Self::Saved,
+        Self::Queued,
+        Self::Working,
+        Self::Done,
+        Self::Failed,
+        Self::NeedsReview,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "Needs input",
+            Self::Saved => "Saved",
+            Self::Queued => "Queued",
+            Self::Working => "Working",
+            Self::Done => "Done",
+            Self::Failed => "Failed",
+            Self::NeedsReview => "Needs review",
+        }
+    }
+    /// The run is still moving this assignment.
+    pub fn live(self) -> bool {
+        matches!(self, Self::Working | Self::Queued)
+    }
+}
 impl SummaryTask {
-    /// orchestrationTaskLabel, given whether the worker needs input.
-    pub fn label(&self, summary: &Summary, needs_input: bool) -> &'static str {
+    /// orchestrationTaskLabel's state, given whether the worker needs input.
+    pub fn status_of(&self, summary: &Summary, needs_input: bool) -> ProgressStatus {
         if needs_input {
-            return "Needs input";
+            return ProgressStatus::NeedsInput;
         }
         if !summary.live && matches!(self.status.as_str(), "running" | "queued") {
-            return "Saved";
+            return ProgressStatus::Saved;
         }
         match self.status.as_str() {
-            "queued" => "Queued",
-            "running" => "Working",
-            "completed" => "Done",
-            "failed" => "Failed",
-            "blocked" => "Needs review",
-            _ => "Queued",
+            "running" => ProgressStatus::Working,
+            "completed" => ProgressStatus::Done,
+            "failed" => ProgressStatus::Failed,
+            "blocked" => ProgressStatus::NeedsReview,
+            _ => ProgressStatus::Queued,
         }
+    }
+    /// orchestrationTaskLabel, given whether the worker needs input.
+    pub fn label(&self, summary: &Summary, needs_input: bool) -> &'static str {
+        self.status_of(summary, needs_input).label()
     }
 }
 
@@ -248,6 +290,33 @@ pub fn worker_prompt(task: &Task, previous: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_labels_are_defined_once_and_keep_their_text() {
+        let summary = |live| Summary {
+            tasks: Vec::new(),
+            live,
+        };
+        let label = |status: &str, live, input| {
+            let task = SummaryTask {
+                status: status.into(),
+                ..SummaryTask::default()
+            };
+            task.label(&summary(live), input)
+        };
+        assert_eq!(label("running", true, false), "Working");
+        assert_eq!(label("queued", true, false), "Queued");
+        assert_eq!(label("completed", true, false), "Done");
+        assert_eq!(label("failed", true, false), "Failed");
+        assert_eq!(label("blocked", true, false), "Needs review");
+        assert_eq!(label("running", false, false), "Saved");
+        assert_eq!(label("running", true, true), "Needs input");
+        let live: Vec<_> = ProgressStatus::ALL
+            .into_iter()
+            .filter(|s| s.live())
+            .collect();
+        assert_eq!(live, [ProgressStatus::Queued, ProgressStatus::Working]);
+    }
     fn task(id: &str, deps: &[&str], file: &str) -> Task {
         Task {
             id: id.into(),

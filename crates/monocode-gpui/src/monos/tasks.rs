@@ -4,18 +4,21 @@
 //! Everything here does nothing unless `native-task-coordinator` is enabled.
 use super::host::Effect;
 use super::*;
+use crate::conversation::task_monitor::LiveWorker;
 use monocode_core::app_access as app;
 use monocode_core::mono::bridge::Call;
 use monocode_core::tasks::decisions::{self, Handoff, ReplyMatch};
-use monocode_core::tasks::{Requester, coordinator, inbox, lifecycle};
+use monocode_core::tasks::view::{self, TaskMonitor};
+use monocode_core::tasks::{Requester, coordinator, inbox};
 use monocode_core::time::now_ms;
 
 /// What one pass found: per Mono the batch to deliver, answers owed to
-/// workers with their session handles, and per Mono its tasks' controls.
+/// workers with their session handles, and per Mono its tasks' monitoring
+/// view (which carries their controls).
 type Pass = (
     Vec<(String, inbox::Batch)>,
     Vec<(i64, Handoff)>,
-    Vec<(String, Vec<lifecycle::ControlRow>)>,
+    Vec<(String, Vec<TaskMonitor>)>,
 );
 
 impl Monos {
@@ -81,10 +84,8 @@ impl Monos {
             }
             let now = now_ms();
             let mut batches = Vec::new();
-            let mut controls = Vec::new();
+            let ids: Vec<String> = monos.iter().map(|(mono, _)| mono.clone()).collect();
             for (mono, session) in monos {
-                let rows = lifecycle::controls(&db, &mono).map_err(|e| e.to_string())?;
-                controls.push((mono.clone(), rows));
                 if let Some(session) = session {
                     inbox::acknowledge_delivered(&db, &mono, session, now)
                         .map_err(|e| e.to_string())?;
@@ -106,19 +107,27 @@ impl Monos {
                     handoffs.push((handle, handoff));
                 }
             }
-            Ok(Some((batches, handoffs, controls)))
+            // Display last, and per Mono: a view that cannot be read never
+            // holds back deliveries or another Mono's card.
+            let monitors = ids
+                .into_iter()
+                .filter_map(|mono| match view::monitor(&db, &mono, now) {
+                    Ok(tasks) => Some((mono, tasks)),
+                    Err(error) => {
+                        eprintln!("Mono task monitor for {mono}: {error}");
+                        None
+                    }
+                })
+                .collect();
+            Ok(Some((batches, handoffs, monitors)))
         });
         cx.spawn(async move |this, cx| {
             let pass = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.pumping_tasks = false;
                 match pass {
-                    Ok(Some((batches, handoffs, controls))) => {
-                        for (mono, rows) in controls {
-                            if let Some(chat) = this.chats.get(&mono) {
-                                chat.update(cx, |chat, cx| chat.set_task_controls(rows, cx));
-                            }
-                        }
+                    Ok(Some((batches, handoffs, monitors))) => {
+                        this.show_task_monitors(monitors, cx);
                         for (mono, batch) in batches {
                             this.deliver_batch(&mono, batch, cx);
                         }
@@ -132,6 +141,111 @@ impl Monos {
             });
         })
         .detach();
+    }
+
+    /// Each Mono's tasks as the store has them now: the chat's monitoring
+    /// card and controls, the live state of their worker sessions, and the
+    /// sidebar badge.
+    fn show_task_monitors(
+        &mut self,
+        monitors: Vec<(String, Vec<TaskMonitor>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let live: HashMap<i64, LiveWorker> = self
+            .owner
+            .upgrade()
+            .map(|owner| {
+                owner
+                    .read(cx)
+                    .mono_session_views(cx)
+                    .iter()
+                    .map(|s| (s.id, LiveWorker::from(s)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut changed = false;
+        for (mono, tasks) in monitors {
+            if let Some(chat) = self.chats.get(&mono) {
+                let rows = tasks.iter().map(|t| t.control.clone()).collect();
+                let sessions: Vec<i64> = tasks
+                    .iter()
+                    .flat_map(|t| t.workers.iter().filter_map(|w| w.session))
+                    .collect();
+                let shown = tasks.clone();
+                chat.update(cx, |chat, cx| {
+                    chat.set_task_controls(rows, cx);
+                    chat.set_task_monitor(shown, cx);
+                    for session in sessions {
+                        if let Some(state) = live.get(&session) {
+                            chat.set_worker_live(session, *state, cx);
+                        }
+                    }
+                });
+            }
+            if self.task_monitors.get(&mono) != Some(&tasks) {
+                self.task_monitors.insert(mono, tasks);
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The sidebar badge of a Mono's tasks (see `tasks::view::Badge`).
+    pub(crate) fn task_badge(&self, mono: &str) -> Option<view::Badge> {
+        self.task_monitors
+            .get(mono)
+            .and_then(|tasks| view::badge(tasks))
+    }
+
+    /// Every Mono's badge, in a stable order.
+    pub(super) fn task_badges(&self) -> Vec<(String, view::Badge)> {
+        let mut badges: Vec<_> = self
+            .task_monitors
+            .iter()
+            .filter_map(|(mono, tasks)| view::badge(tasks).map(|b| (mono.clone(), b)))
+            .collect();
+        badges.sort();
+        badges
+    }
+
+    /// A worker session changed in the app: its Mono's card shows it now,
+    /// before the next store read.
+    pub(crate) fn task_worker_changed(
+        &mut self,
+        session: i64,
+        live: LiveWorker,
+        cx: &mut Context<Self>,
+    ) {
+        for (mono, tasks) in &self.task_monitors {
+            let ours = tasks
+                .iter()
+                .any(|t| t.workers.iter().any(|w| w.session == Some(session)));
+            if let (true, Some(chat)) = (ours, self.chats.get(mono)) {
+                chat.update(cx, |chat, cx| chat.set_worker_live(session, live, cx));
+            }
+        }
+    }
+
+    /// Opens a worker's session in the Mono panel, as a session card does.
+    pub(super) fn open_task_session(&mut self, session: i64, cx: &mut Context<Self>) {
+        self.route = Some(Route::Session(session));
+        self.show_overview(cx);
+        self.overview_tab = OverviewTab::Sessions;
+        cx.notify();
+    }
+
+    /// Opens an assignment's worktree changes in the app's Changes review.
+    pub(super) fn open_task_changes(&mut self, cwd: String, cx: &mut Context<Self>) {
+        let (Some(handle), Some(owner)) = (self.parent_window, self.owner.upgrade()) else {
+            return;
+        };
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                owner.update(cx, |shell, cx| shell.mono_open_changes(cwd, window, cx))
+            });
+        });
     }
 
     /// Queues the batch in the Mono's outbox under its own id, once. The

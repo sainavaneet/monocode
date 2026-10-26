@@ -21,6 +21,7 @@ mod response_menu;
 #[cfg(test)]
 mod submission_tests;
 pub(crate) mod task_controls;
+pub(crate) mod task_monitor;
 mod task_questions;
 pub(crate) mod task_recovery;
 mod title;
@@ -170,6 +171,7 @@ pub(crate) struct Conversation {
     pub(crate) orchestration_progress: Option<Vec<orchestration_card::TaskProgress>>,
     /// The Mono's durable tasks with their pause, resume, cancel and steer.
     pub(crate) task_controls: Vec<monocode_core::tasks::lifecycle::ControlRow>,
+    pub(crate) task_monitor: task_monitor::TaskMonitorState,
     /// Plan assignments whose full instructions are unfolded in the card.
     orchestration_open: std::collections::HashSet<String>,
     status: String,
@@ -610,6 +612,7 @@ impl Conversation {
             orchestration_error: None,
             orchestration_progress: None,
             task_controls: Vec::new(),
+            task_monitor: Default::default(),
             orchestration_open: Default::default(),
             status: "Loading conversation…".into(),
             loaded: false,
