@@ -4,6 +4,21 @@ use monocode_core::{
     accounts::Profile,
     usage::{self, Limit},
 };
+const BUSY_SWITCH_MESSAGE: &str = "Wait for the current turn to finish before switching accounts.";
+/// The account's label as the picker shows it, falling back to its id.
+fn account_label(kind: Kind, id: &str, cx: &App) -> String {
+    crate::accounts::get(cx)
+        .and_then(|center| {
+            center
+                .read(cx)
+                .book
+                .list(kind)
+                .into_iter()
+                .find(|account| account.id == id)
+                .map(|account| account.label)
+        })
+        .unwrap_or_else(|| id.to_owned())
+}
 pub(crate) struct UsageResumed;
 impl EventEmitter<UsageResumed> for Conversation {}
 impl Conversation {
@@ -85,6 +100,10 @@ impl Conversation {
         if let Some(center) = crate::accounts::get(cx) {
             self.settings.account.root = Some(center.read(cx).root.clone());
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn status_text(&self) -> &str {
+        &self.status
     }
     pub(crate) fn account_model(&self) -> Option<&str> {
         self.model.as_deref().or(self.resolved_model.as_deref())
@@ -243,6 +262,37 @@ impl Conversation {
             return;
         };
         self.settings.usage_limit = Some(limit);
+        self.carry_over(profile, true, cx);
+    }
+    /// Move this conversation to another account without a usage limit. The
+    /// provider thread is carried over so the next message resumes with its
+    /// history; nothing is sent automatically.
+    pub(crate) fn switch_account(&mut self, profile: Profile, cx: &mut Context<Self>) {
+        if self.editing_last_turn.pending() {
+            return;
+        }
+        if self.needs_history_restore() {
+            self.defer_history_action(move |this, cx| this.switch_account(profile, cx), cx);
+            return;
+        }
+        if self.settings.account.id == profile.id || self.account_switching {
+            return;
+        }
+        if self.busy || self.stopping {
+            self.status = BUSY_SWITCH_MESSAGE.into();
+            cx.notify();
+            return;
+        }
+        if !self.summary.has_messages {
+            self.set_blank_account(profile, cx);
+            return;
+        }
+        self.carry_over(profile, false, cx);
+    }
+    /// Carry the provider thread to `profile` and switch to it in place. A
+    /// `limited` switch resumes the interrupted turn afterwards; a plain one
+    /// reports the switch and waits for the next message.
+    fn carry_over(&mut self, profile: Profile, limited: bool, cx: &mut Context<Self>) {
         self.attach_account(cx);
         let from = self.settings.account.clone();
         let thread = self.summary.provider_id.clone();
@@ -262,7 +312,7 @@ impl Conversation {
             let _ = this.update(cx, |this, cx| {
                 this.account_switching = false;
                 if this.busy
-                    || this.settings.usage_limit.is_none()
+                    || (limited && this.settings.usage_limit.is_none())
                     || this.settings.account.id != old
                     || this.summary.provider_id != expected
                     || crate::accounts::get(cx)
@@ -312,11 +362,26 @@ impl Conversation {
                         Path::new(this.execution_cwd()),
                     );
                 }
+                let label = account_label(kind, &profile.id, cx);
                 this.settings.account = profile;
                 this.catalog.clear();
                 this.refresh_catalog(cx);
                 this.save_settings(cx);
-                this.resume_usage(cx);
+                if limited {
+                    this.resume_usage(cx);
+                } else {
+                    this.status = if carried {
+                        format!(
+                            "Switched to {label}. This conversation will resume with its history on your next message."
+                        )
+                    } else {
+                        format!(
+                            "Switched to {label}. Its history could not be carried over, so your next message continues from a summary."
+                        )
+                    };
+                    cx.emit(SessionChanged);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -690,6 +755,48 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn composer_account_menu_switches_without_a_usage_limit(cx: &mut gpui::TestAppContext) {
+        let store = Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let mut summary = locked(&store)
+            .unwrap()
+            .create("claude", "/fixture")
+            .unwrap();
+        summary.has_messages = true;
+        let (window, other) = cx.update(|cx| {
+            crate::accounts::install(store.clone(), cx);
+            let other = crate::accounts::get(cx).unwrap().update(cx, |center, _| {
+                center.book.add(Kind::Claude, "Other account").unwrap()
+            });
+            let window = cx
+                .open_window(Default::default(), |_, cx| {
+                    cx.new(|cx| {
+                        let mut view = Conversation::new(summary, store, cx);
+                        view.loaded = true;
+                        view
+                    })
+                })
+                .unwrap();
+            (window, other)
+        });
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.account_recovery_limit(cx).is_none());
+                view.menu_choice(&format!("usage-account:{}", other.id), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.settings.account.id, other.id);
+                assert!(view.settings.usage_limit.is_none());
+                assert!(view.settings.handoff.is_some(), "no transcript to carry");
+                assert!(!view.busy);
+            })
+            .unwrap();
+    }
     #[gpui::test]
     fn usage_banner_matches_the_composer_and_can_arm_cancel_and_dismiss(
         cx: &mut gpui::TestAppContext,

@@ -116,44 +116,9 @@ impl Shell {
             self.update_usage_provider(cx);
             return;
         }
-        let mut settings = current.settings.clone();
-        settings.account = profile;
-        settings.mono = None;
-        settings.usage_limit = None;
-        settings.handoff = None;
-        settings.turns.clear();
-        settings.operator_enabled = false;
-        settings.revision = 0;
-        let cwd = current.summary.cwd.clone();
-        let store = self.store.clone();
-        let revision = self.navigation_revision;
-        let work = cx.background_executor().spawn(async move {
-            let store = locked(&store)?;
-            let summary = store.create(kind.id(), &cwd)?;
-            store.save_agent_settings(summary.id, &settings)?;
-            Ok::<_, String>((summary, settings))
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok((summary, settings)) => {
-                    let id = summary.id;
-                    this.add(summary, cx);
-                    this.sessions[&id].update(cx, |v, cx| v.install_transfer(settings, None, cx));
-                    if this.navigation_revision == revision {
-                        this.activate_session(id, window, cx);
-                    } else {
-                        this.invalidate_chrome(cx);
-                        cx.notify();
-                    }
-                }
-                Err(error) => {
-                    this.error = Some(error);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        // The conversation keeps its history and identity: the provider thread
+        // is carried to the chosen account, or a busy turn is refused.
+        view.update(cx, |v, cx| v.switch_account(profile, cx));
     }
 }
 
@@ -162,6 +127,11 @@ mod tests {
     use super::*;
 
     fn limit_switch(cx: &mut gpui::TestAppContext, carry: bool, cold: bool) {
+        switch(cx, carry, cold, true);
+    }
+    /// `limited` adds the rate-limit row that makes this a usage-limit switch;
+    /// without it the user is simply choosing another account.
+    fn switch(cx: &mut gpui::TestAppContext, carry: bool, cold: bool, limited: bool) {
         use monocode_core::{accounts::Profile, transcript::Row};
         let (window, _, id) = crate::shell::tests::window(cx);
         let (target, destination, original_count, active, tab_count) = window
@@ -187,7 +157,7 @@ mod tests {
                     std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
                     std::fs::write(transcript, "{\"conversation\":\"original\"}\n").unwrap();
                 }
-                let rows = vec![
+                let mut rows = vec![
                     Row {
                         role: "user".into(),
                         text: "Finish the integration".into(),
@@ -200,15 +170,17 @@ mod tests {
                         first: true,
                         sent_at: None,
                     },
+                ];
+                if limited {
                     // Older native saves persisted this as a system notice and
                     // have no structured usage_limit setting.
-                    Row {
+                    rows.push(Row {
                         role: "system".into(),
                         text: "rate_limit".into(),
                         first: true,
                         sent_at: None,
-                    },
-                ];
+                    });
+                }
                 {
                     let mut store = locked(&shell.store).unwrap();
                     store.save_provider_accounts(&center.read(cx).book).unwrap();
@@ -267,6 +239,15 @@ mod tests {
                 let view = shell.sessions[&id].read(cx);
                 assert_eq!(view.summary.id, id);
                 assert_eq!(view.settings.account.id, target);
+                if !limited {
+                    assert!(view.settings.usage_limit.is_none());
+                    assert!(!view.busy, "a plain switch sends nothing by itself");
+                    assert!(
+                        view.status_text().starts_with("Switched to Available."),
+                        "status was {:?}",
+                        view.status_text()
+                    );
+                }
                 assert!(
                     view.transcript
                         .read(cx)
@@ -313,7 +294,57 @@ mod tests {
     }
 
     #[gpui::test]
-    fn switching_blank_accounts_reuses_the_session_and_existing_threads_stay_pinned(
+    fn footer_account_switch_carries_an_unlimited_conversation_in_place(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        switch(cx, true, false, false);
+    }
+
+    #[gpui::test]
+    fn footer_account_switch_without_native_history_keeps_the_session_with_a_handoff(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        switch(cx, false, false, false);
+    }
+
+    #[gpui::test]
+    fn account_switch_waits_for_a_running_turn(cx: &mut gpui::TestAppContext) {
+        let (window, _, id) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let center = crate::accounts::get(cx).unwrap();
+                let account = center.update(cx, |center, _| {
+                    center.book.add(Kind::Claude, "Work").unwrap()
+                });
+                locked(&shell.store)
+                    .unwrap()
+                    .save_provider_accounts(&center.read(cx).book)
+                    .unwrap();
+                shell.sessions[&id].update(cx, |v, _| {
+                    v.summary.has_messages = true;
+                    v.busy = true;
+                });
+                let count = shell.sessions.len();
+                shell.select_provider_account(
+                    Kind::Claude,
+                    &account.id,
+                    "/work/monocode",
+                    Some(id),
+                    cx,
+                );
+                assert_eq!(shell.sessions.len(), count);
+                let view = shell.sessions[&id].read(cx);
+                assert_eq!(view.settings.account.id, monocode_core::accounts::DEFAULT);
+                assert_eq!(
+                    view.status_text(),
+                    "Wait for the current turn to finish before switching accounts."
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn switching_blank_accounts_reuses_the_session_and_threads_with_messages_carry_over(
         cx: &mut gpui::TestAppContext,
     ) {
         let (window, _, id) = crate::shell::tests::window(cx);
@@ -351,13 +382,23 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
-                assert_eq!(shell.sessions[&id].read(cx).settings.account.id, account.id);
-                assert!(shell.sessions.values().any(|v| {
-                    let v = v.read(cx);
-                    v.summary.id != id
-                        && v.summary.provider == "claude"
-                        && v.settings.account.id == monocode_core::accounts::DEFAULT
-                }));
+                let view = shell.sessions[&id].read(cx);
+                assert_eq!(view.settings.account.id, monocode_core::accounts::DEFAULT);
+                assert!(
+                    view.settings.handoff.is_some(),
+                    "no native history to carry"
+                );
+                assert!(
+                    !shell.sessions.values().any(|v| {
+                        let v = v.read(cx);
+                        v.summary.id != id
+                            && v.summary.provider == "claude"
+                            && v.summary.cwd == "/work/monocode"
+                            && !v.summary.has_messages
+                    }),
+                    "no new conversation is created for an account switch"
+                );
+                let _ = account;
             })
             .unwrap();
     }

@@ -1935,7 +1935,11 @@ impl Conversation {
                 let kind = Kind::from_id(&self.summary.provider);
                 if center.read(cx).book.exists(kind, id) {
                     let profile = center.read(cx).profile(id);
-                    self.switch_usage_account(profile, cx);
+                    if self.account_recovery_limit(cx).is_some() {
+                        self.switch_usage_account(profile, cx);
+                    } else {
+                        self.switch_account(profile, cx);
+                    }
                 }
             }
             return;
