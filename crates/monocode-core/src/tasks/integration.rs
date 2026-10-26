@@ -87,8 +87,9 @@ fn unresolved(conn: &Connection, task: &str) -> Result<bool, TaskError> {
     )?)
 }
 
-/// The snapshot the assignment's acceptance checked: the checkpoint of its
-/// latest review that accepted it or handed it to Mono's judgement.
+/// The snapshot the assignment's acceptance rests on: the checkpoint of its
+/// latest review that has one, whatever its outcome (the state Mono saw
+/// when it accepted over a correction, or what review accepted).
 fn accepted_checkpoint(
     tasks: &TaskStore<'_>,
     task: &str,
@@ -98,12 +99,6 @@ fn accepted_checkpoint(
         .reviews(task, assignment)?
         .into_iter()
         .rev()
-        .filter(|r| {
-            matches!(
-                r.outcome,
-                ReviewOutcome::Accepted | ReviewOutcome::NeedsMonoReview
-            )
-        })
         .find_map(|r| r.checkpoint))
 }
 

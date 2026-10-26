@@ -238,3 +238,47 @@ fn a_clean_integration_older_than_an_acceptance_is_not_verified() {
         .to_string()
         .contains("without a clean integration"));
 }
+
+#[test]
+fn a_mono_acceptance_after_a_correction_is_checked_against_what_mono_saw() {
+    let repo = repo();
+    let run = accepted(&repo);
+    // Attempt 2 of a left a change uncommitted; review sent it back with a
+    // snapshot of that state, and Mono then accepted it anyway.
+    let tree = run.tree("a");
+    std::fs::write(tree.join("src/a_late.rs"), "pub fn late() {}\n").unwrap();
+    let snapshot = crate::checkpoint::snapshot_workspace(
+        tree.to_str().unwrap(),
+        "refs/monocode/tasks/t/attempts/a/second/before",
+    )
+    .unwrap();
+    let correction = crate::tasks::Review {
+        attempt_id: "second".into(),
+        assignment_id: "a".into(),
+        outcome: ReviewOutcome::Correction,
+        checkpoint: Some(snapshot),
+        changed_files: vec!["src/a_late.rs".into()],
+        findings: Vec::new(),
+        verifications: Vec::new(),
+    };
+    let tasks = run.store.tasks().unwrap();
+    tasks
+        .append_event(
+            &crate::tasks::NewEvent {
+                id: "reviewed:second".into(),
+                task_id: "t".into(),
+                assignment_id: Some("a".into()),
+                attempt_id: None,
+                kind: "assignment.reviewed".into(),
+                payload: serde_json::to_value(&correction).unwrap(),
+            },
+            NOW + 35,
+        )
+        .unwrap();
+    let records = run.integrate(NOW + 40);
+    assert!(
+        matches!(&records[0].outcome, Outcome::Uncommitted { assignment, files, .. }
+            if assignment == "a" && files == &["src/a_late.rs".to_owned()]),
+        "{records:?}"
+    );
+}
