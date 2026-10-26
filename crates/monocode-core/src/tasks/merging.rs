@@ -28,6 +28,13 @@ pub enum Outcome {
     /// there is nothing of it to merge (work left uncommitted in its
     /// worktree is never merged).
     NoCommits { assignment: String, branch: String },
+    /// The work review accepted (its checkpoint snapshot) differs from the
+    /// branch tip in `files`: part of it was never committed.
+    Uncommitted {
+        assignment: String,
+        branch: String,
+        files: Vec<String>,
+    },
     /// Git refused for another reason; retried, then Mono decides.
     Failed { reason: String },
 }
@@ -85,6 +92,9 @@ pub(super) struct Step {
     /// The base recorded for the assignment's worktree; only its branch is
     /// read (an accepted worktree may have been cleaned up).
     pub(super) base: Option<String>,
+    /// The snapshot of the worktree its acceptance checked (the latest
+    /// accepted, or Mono-judged, review's checkpoint).
+    pub(super) checkpoint: Option<String>,
 }
 
 /// A task ready to integrate, read from the store.
@@ -223,13 +233,29 @@ impl IntegrationJob {
             let Some(tip) = rev(tree, &reference) else {
                 return failed(format!("The branch {} cannot be read.", step.branch));
             };
-            // Only the branch is integrated; one with nothing committed
-            // since its base has nothing to merge.
-            if step.base.as_deref() == Some(tip.as_str()) {
-                return Outcome::NoCommits {
-                    assignment: step.assignment.clone(),
-                    branch: step.branch.clone(),
-                };
+            // Only the branch is integrated, so it must hold exactly what
+            // review accepted. A tip equal to its base whose accepted
+            // snapshot is the base too is a legitimate no-op (contained
+            // below). Without a checkpoint, an empty branch is suspect.
+            match &step.checkpoint {
+                Some(checkpoint) => match git(tree, &["diff", "--name-only", &tip, checkpoint]) {
+                    Ok(out) if !out.trim().is_empty() => {
+                        return Outcome::Uncommitted {
+                            assignment: step.assignment.clone(),
+                            branch: step.branch.clone(),
+                            files: out.lines().map(str::to_owned).collect(),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => return failed(error),
+                },
+                None if step.base.as_deref() == Some(tip.as_str()) => {
+                    return Outcome::NoCommits {
+                        assignment: step.assignment.clone(),
+                        branch: step.branch.clone(),
+                    }
+                }
+                None => {}
             }
             let mut merge = Merge {
                 assignment: step.assignment.clone(),

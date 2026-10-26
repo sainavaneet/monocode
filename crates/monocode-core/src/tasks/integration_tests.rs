@@ -526,7 +526,7 @@ fn merging_without_merge_authority_raises_a_decision_instead() {
 }
 
 #[test]
-fn dirty_worktrees_are_never_deleted_and_a_branch_without_commits_is_sent_back() {
+fn dirty_worktrees_are_never_deleted_and_uncommitted_accepted_work_is_sent_back() {
     let repo = repo();
     let parts = vec![
         part("a", &["src/a.rs"], &[], "test -f src/a.rs"),
@@ -549,8 +549,8 @@ fn dirty_worktrees_are_never_deleted_and_a_branch_without_commits_is_sent_back()
         .is_empty());
     let records = run.integrate(NOW + 40);
     assert!(
-        matches!(&records[0].outcome, Outcome::NoCommits { assignment, branch }
-            if assignment == "b" && *branch == crate::tasks::workspaces::branch_for("t", "b")),
+        matches!(&records[0].outcome, Outcome::Uncommitted { assignment, files, .. }
+            if assignment == "b" && files == &["src/b.rs".to_owned()]),
         "{records:?}"
     );
     // Sent back to commit it; the dirty worktree and its work stay.
@@ -577,7 +577,7 @@ fn dirty_worktrees_are_never_deleted_and_a_branch_without_commits_is_sent_back()
     assert!(correction
         .findings
         .iter()
-        .any(|f| matches!(f, Finding::NoCommits { .. })));
+        .any(|f| matches!(f, Finding::UncommittedWork { .. })));
 }
 
 #[test]

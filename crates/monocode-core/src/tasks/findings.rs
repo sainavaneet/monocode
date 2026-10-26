@@ -88,6 +88,12 @@ pub enum Finding {
     NoCommits {
         branch: String,
     },
+    /// The accepted work differs from the branch's last commit in `files`:
+    /// integration merges commits, so those changes would be lost.
+    UncommittedWork {
+        branch: String,
+        files: Vec<String>,
+    },
 }
 
 fn check_failure(check: &str, exit_code: Option<i32>, timed_out: bool, output: &str) -> String {
@@ -117,6 +123,7 @@ impl Finding {
                 | Self::UnauthorizedCommits { .. }
                 | Self::IntegrationConflict { .. }
                 | Self::NoCommits { .. }
+                | Self::UncommittedWork { .. }
         )
     }
 
@@ -184,6 +191,10 @@ impl Finding {
                 files,
             } => format!(
                 "Merging your branch onto the task's integration branch {branch} (at {onto}) conflicted in {}. Rebase your branch onto it (git rebase {branch}), resolve the conflicts keeping the intent of both changes, make sure the checks pass, commit, and report again.",
+                files.join(", ")
+            ),
+            Self::UncommittedWork { branch, files } => format!(
+                "The work review accepted is not all committed on {branch}: {} differ from your last commit. Integration merges commits only, so commit them on your branch and report again.",
                 files.join(", ")
             ),
             Self::NoCommits { branch } => format!(

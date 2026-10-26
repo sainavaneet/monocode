@@ -140,3 +140,101 @@ fn a_leftover_integration_branch_is_recorded_as_it_is() {
         .unwrap();
     assert_eq!(recorded.base_commit.as_deref(), Some(record.base.as_str()));
 }
+
+#[test]
+fn partly_committed_accepted_work_is_sent_back_instead_of_merged_without_its_rest() {
+    let repo = repo();
+    let parts = vec![
+        part("a", &["src"], &[], "test -f src/a.rs"),
+        part("b", &["docs"], &[], "test -f README.md"),
+    ];
+    let run = started(&repo, Live::merging(), parts, &["test -f src/a.rs"]);
+    assert_eq!(run.tick(NOW).launched.len(), 2);
+    // a commits one file and leaves another uncommitted; review accepted
+    // the whole worktree.
+    let reviews = run.work("a", NOW + 10, |tree| {
+        commit(tree, "src/a.rs", "pub fn a() {}\n");
+        std::fs::write(tree.join("src/a_more.rs"), "pub fn more() {}\n").unwrap();
+    });
+    assert_eq!(reviews[0].outcome, ReviewOutcome::Accepted, "{reviews:?}");
+    run.work("b", NOW + 20, |tree| {
+        std::fs::create_dir_all(tree.join("docs")).unwrap();
+        commit(tree, "docs/b.md", "# b\n");
+    });
+    assert!(run
+        .coordinator
+        .verify(&run.store, NOW + 30)
+        .unwrap()
+        .is_empty());
+    let records = run.integrate(NOW + 40);
+    assert!(
+        matches!(&records[0].outcome, Outcome::Uncommitted { assignment, files, .. }
+            if assignment == "a" && files == &["src/a_more.rs".to_owned()]),
+        "{records:?}"
+    );
+    assert_eq!(run.status("a"), AssignmentState::Queued);
+    assert_ne!(run.task().stage, TaskStage::Verifying);
+}
+
+#[test]
+fn an_assignment_that_changed_nothing_is_skipped_without_a_correction() {
+    let repo = repo();
+    let parts = vec![
+        part("a", &["src/a.rs"], &[], "test -f src/a.rs"),
+        // An investigation-like part with nothing to change.
+        part("b", &["docs"], &[], "test -f README.md"),
+    ];
+    let run = started(&repo, Live::merging(), parts, &["test -f src/a.rs"]);
+    assert_eq!(run.tick(NOW).launched.len(), 2);
+    run.work("a", NOW + 10, |tree| {
+        commit(tree, "src/a.rs", "pub fn a() {}\n")
+    });
+    let reviews = run.work("b", NOW + 20, |_| {});
+    assert_eq!(reviews[0].outcome, ReviewOutcome::Accepted, "{reviews:?}");
+    assert!(run
+        .coordinator
+        .verify(&run.store, NOW + 30)
+        .unwrap()
+        .is_empty());
+    let records = run.integrate(NOW + 40);
+    assert_eq!(records[0].outcome, Outcome::Clean, "{records:?}");
+    let merged: Vec<(&str, bool)> = records[0]
+        .merges
+        .iter()
+        .map(|m| (m.assignment.as_str(), m.merged))
+        .collect();
+    assert_eq!(merged, [("a", true), ("b", false)]);
+    assert_eq!(run.status("b"), AssignmentState::Accepted);
+    assert_eq!(run.task().stage, TaskStage::Verifying);
+}
+
+#[test]
+fn a_clean_integration_older_than_an_acceptance_is_not_verified() {
+    let repo = repo();
+    let run = accepted(&repo);
+    let records = run.integrate(NOW + 40);
+    assert_eq!(records[0].outcome, Outcome::Clean);
+    // b is accepted again after that integration (Mono re-judged it).
+    let tasks = run.store.tasks().unwrap();
+    tasks
+        .append_event(
+            &crate::tasks::NewEvent {
+                id: "reaccepted-b".into(),
+                task_id: "t".into(),
+                assignment_id: Some("b".into()),
+                attempt_id: None,
+                kind: "assignment.accepted".into(),
+                payload: serde_json::json!({}),
+            },
+            NOW + 41,
+        )
+        .unwrap();
+    let rounds = run.coordinator.verify(&run.store, NOW + 50).unwrap();
+    assert!(rounds.is_empty(), "{rounds:?}");
+    let refused = events(&run.store, "task.needs_integration");
+    assert_eq!(refused.len(), 1);
+    assert!(refused[0]
+        .payload
+        .to_string()
+        .contains("without a clean integration"));
+}

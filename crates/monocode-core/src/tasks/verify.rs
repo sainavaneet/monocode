@@ -253,11 +253,11 @@ impl<P: Policy> Coordinator<P> {
             return Ok(None);
         }
         if results.len() > 1 {
-            // Only a clean integration is a result to verify; a task moved
-            // here without one (by Mono) is refused explicitly, once.
-            let clean = tasks
-                .integration(id)?
-                .is_some_and(|r| r["outcome"]["state"] == "clean");
+            // Only a clean integration newer than every acceptance of the
+            // work it merged is a result to verify; a task moved here
+            // without one (by Mono) is refused explicitly, once.
+            let integrated: Vec<String> = results.iter().map(|(a, _)| a.id.clone()).collect();
+            let clean = tasks.integration_current(id, &integrated)?;
             let integrated = workspaces
                 .into_iter()
                 .find(|w| w.id == super::integration::workspace_id(id))

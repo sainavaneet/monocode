@@ -87,6 +87,26 @@ fn unresolved(conn: &Connection, task: &str) -> Result<bool, TaskError> {
     )?)
 }
 
+/// The snapshot the assignment's acceptance checked: the checkpoint of its
+/// latest review that accepted it or handed it to Mono's judgement.
+fn accepted_checkpoint(
+    tasks: &TaskStore<'_>,
+    task: &str,
+    assignment: &str,
+) -> Result<Option<String>, TaskError> {
+    Ok(tasks
+        .reviews(task, assignment)?
+        .into_iter()
+        .rev()
+        .filter(|r| {
+            matches!(
+                r.outcome,
+                ReviewOutcome::Accepted | ReviewOutcome::NeedsMonoReview
+            )
+        })
+        .find_map(|r| r.checkpoint))
+}
+
 /// Raises a task-wide decision for Mono, inside the caller's transaction.
 fn raise(
     conn: &Connection,
@@ -319,12 +339,15 @@ impl<P: Policy> Coordinator<P> {
         };
         let steps = dependency_order(results)
             .into_iter()
-            .map(|(a, w)| Step {
-                assignment: a.id,
-                branch: w.branch.unwrap_or_default(),
-                base: w.base_commit,
+            .map(|(a, w)| {
+                Ok(Step {
+                    checkpoint: accepted_checkpoint(tasks, id, &a.id)?,
+                    assignment: a.id,
+                    branch: w.branch.unwrap_or_default(),
+                    base: w.base_commit,
+                })
             })
-            .collect();
+            .collect::<Result<_, TaskError>>()?;
         Ok(Some(IntegrationJob {
             task,
             branch,
@@ -386,7 +409,9 @@ impl<P: Policy> Coordinator<P> {
             return Ok(None);
         }
         let fix = match &record.outcome {
-            Outcome::Conflict { assignment, .. } | Outcome::NoCommits { assignment, .. } => {
+            Outcome::Conflict { assignment, .. }
+            | Outcome::NoCommits { assignment, .. }
+            | Outcome::Uncommitted { assignment, .. } => {
                 Some(self.correctable(store, id, assignment)?)
             }
             _ => None,
@@ -464,6 +489,22 @@ impl<P: Policy> Coordinator<P> {
                     "Merging assignment {assignment}'s branch {branch} onto the integration branch {} conflicted in {}. The merge was aborted; the integration worktree is clean.",
                     job.branch,
                     files.join(", ")
+                );
+                settle(&tx, job, assignment, finding, what, fix, n, now)?;
+            }
+            Outcome::Uncommitted {
+                assignment,
+                branch,
+                files,
+            } => {
+                let finding = Finding::UncommittedWork {
+                    branch: branch.clone(),
+                    files: files.clone(),
+                };
+                let what = format!(
+                    "Assignment {assignment}'s accepted work is not all committed on {branch} ({} differ from its last commit), so it cannot be merged onto {} as accepted.",
+                    files.join(", "),
+                    job.branch
                 );
                 settle(&tx, job, assignment, finding, what, fix, n, now)?;
             }
@@ -583,6 +624,36 @@ impl TaskStore<'_> {
             |row| row.get(0),
         )?;
         Ok(u64::try_from(n).unwrap_or_default())
+    }
+
+    /// Whether the task's latest integration record is clean and newer
+    /// (by event order) than the latest acceptance of each of
+    /// `assignments`, so it holds the work as accepted now.
+    pub fn integration_current(
+        &self,
+        task: &str,
+        assignments: &[String],
+    ) -> Result<bool, TaskError> {
+        let latest = |kind: &str, assignment: Option<&str>| -> Result<Option<i64>, TaskError> {
+            Ok(self.conn.query_row(
+                "SELECT MAX(seq) FROM native_task_events WHERE task_id=?1 AND kind=?2
+                   AND (?3 IS NULL OR assignment_id=?3)",
+                params![task, kind, assignment],
+                |row| row.get(0),
+            )?)
+        };
+        let clean = self
+            .integration(task)?
+            .is_some_and(|r| r["outcome"]["state"] == "clean");
+        let Some(integrated) = latest(INTEGRATION, None)?.filter(|_| clean) else {
+            return Ok(false);
+        };
+        for assignment in assignments {
+            if latest("assignment.accepted", Some(assignment))?.is_some_and(|s| s > integrated) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// The task's latest integration record.

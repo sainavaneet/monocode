@@ -117,7 +117,9 @@ impl<P: Policy> Coordinator<P> {
             return Ok(false);
         };
         let waiting = format!("workspace.owned:{task}/{assignment}@{owner}");
-        let since = match super::worker::payload_of(tasks.conn, &waiting)? {
+        // The wait marker, and the notice once due, are written together.
+        let tx = tasks.begin()?;
+        let since = match super::worker::payload_of(&tx, &waiting)? {
             Some(payload) => serde_json::from_str::<serde_json::Value>(&payload)?["since"]
                 .as_u64()
                 .unwrap_or(now),
@@ -130,18 +132,17 @@ impl<P: Policy> Coordinator<P> {
                     kind: "workspace.owned".into(),
                     payload: json!({"since": now, "owner": owner}),
                 };
-                append(tasks.conn, &event, now)?;
+                append(&tx, &event, now)?;
                 now
             }
         };
         let notice = format!("{waiting}#notice");
         if now >= since.saturating_add(OWNED_NOTICE_MS)
-            && super::worker::payload_of(tasks.conn, &notice)?.is_none()
+            && super::worker::payload_of(&tx, &notice)?.is_none()
         {
             let reason = format!(
                 "Assignment {assignment} has waited since {since} for its worktree, which attempt {owner} still works in; it starts once that attempt ends."
             );
-            let tx = tasks.begin()?;
             let marker = super::NewEvent {
                 id: notice,
                 task_id: task.into(),
@@ -152,8 +153,8 @@ impl<P: Policy> Coordinator<P> {
             };
             append(&tx, &marker, now)?;
             super::notices::notify(&tx, task, Some(assignment), OWNED_ELSEWHERE, &reason, now)?;
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(true)
     }
 }
