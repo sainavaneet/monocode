@@ -145,6 +145,8 @@ impl Conversation {
             }
             self.tick_usage(cx);
         }
+        // A Mono's own chat follows its account allowlist (mono_accounts.rs).
+        self.recover_mono_account(cx);
     }
     /// Account recovery also works for saved conversations from before native
     /// limit metadata was recorded, and after dismissing the banner. Inspect

@@ -749,6 +749,7 @@ impl Accounts {
                             this.persist(book, cx);
                         }
                         this.invalidate(kind, &id, cx);
+                        this.signed_in_again(kind, &id, cx);
                         cx.emit(AccountEvent::Authenticated(kind, id));
                     }
                 }

@@ -5,7 +5,7 @@
 //! and the result is reported back: confirmed (attempt Running) or failed.
 use super::{Database, locked};
 use crate::shell::Shell;
-use gpui::{App, Global, WeakEntity};
+use gpui::{App, AsyncApp, Global, WeakEntity};
 use monocode_core::agent::Settings;
 use monocode_core::store::Session;
 use monocode_core::tasks;
@@ -92,6 +92,59 @@ fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> R
     Ok(())
 }
 
+/// Carries out recovery's stop requests: each failed worker's session is
+/// stopped through the Shell's `sessions.stop` path, then the request is
+/// recorded as done so its replacement may launch.
+async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
+    let lookup = store.clone();
+    let requests = cx
+        .background_executor()
+        .spawn(async move {
+            let store = locked(&lookup)?;
+            let stops = tasks::recovery::pending_stops(&store).map_err(|e| e.to_string())?;
+            Ok::<_, String>(
+                stops
+                    .into_iter()
+                    .map(|stop| {
+                        let handle = store.resolve_session_id(&stop.session_id).ok();
+                        (stop.delivery, handle)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await;
+    let requests = match requests {
+        Ok(requests) if !requests.is_empty() => requests,
+        Ok(_) => return,
+        Err(error) => {
+            eprintln!("Task recovery: {error}");
+            return;
+        }
+    };
+    let sessions: Vec<i64> = requests.iter().filter_map(|(_, h)| *h).collect();
+    cx.update(|cx| {
+        let shell = cx.try_global::<Service>().and_then(|s| s.shell.upgrade());
+        if let Some(shell) = shell {
+            shell.update(cx, |shell, cx| shell.stop_task_workers(&sessions, cx));
+        }
+    });
+    let store = store.clone();
+    let recorded = cx
+        .background_executor()
+        .spawn(async move {
+            let store = locked(&store)?;
+            let now = monocode_core::time::now_ms();
+            for (delivery, _) in requests {
+                tasks::recovery::stopped(&store, &delivery, now).map_err(|e| e.to_string())?;
+            }
+            Ok::<_, String>(())
+        })
+        .await;
+    if let Err(error) = recorded {
+        eprintln!("Task recovery: could not record a stopped worker: {error}");
+    }
+}
+
 /// A name for this process in task leases; never shared with another process.
 fn holder() -> String {
     format!(
@@ -110,11 +163,38 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
     }
     cx.set_global(Service { shell });
     let (launches, receive) = async_channel::unbounded::<(Session, Settings)>();
+    // Wakes the stop pump: after each tick and after each confirmation.
+    let (pumps, pumped) = async_channel::unbounded::<()>();
+    let stopping = store.clone();
+    cx.spawn(async move |cx| {
+        while pumped.recv().await.is_ok() {
+            while pumped.try_recv().is_ok() {}
+            stop_failed_workers(&stopping, cx).await;
+        }
+    })
+    .detach();
     let confirmations = store.clone();
+    let confirmed = pumps.clone();
     cx.spawn(async move |cx| {
         while let Ok((session, settings)) = receive.recv().await {
             let id = session.id;
+            // A launch whose attempt stopped waiting (it timed out) is not
+            // installed: two workers never share a worktree.
+            let check = confirmations.clone();
+            let allowed = cx
+                .background_executor()
+                .spawn(async move {
+                    locked(&check)
+                        .and_then(|store| {
+                            tasks::recovery::launch_allowed(&store, id).map_err(|e| e.to_string())
+                        })
+                        .unwrap_or(true)
+                })
+                .await;
             let installed = cx.update(|cx| {
+                if !allowed {
+                    return Err("The worker's launch was given up before the app started it.");
+                }
                 let shell = cx.try_global::<Service>().and_then(|s| s.shell.upgrade());
                 match shell {
                     Some(shell) => {
@@ -135,7 +215,10 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                     let store = locked(&store)?;
                     let now = monocode_core::time::now_ms();
                     match installed {
+                        // A late confirmation records an orphan and asks
+                        // for its session to be stopped.
                         Ok(()) => tasks::confirm_started(&store, id, now).map(|_| ()),
+                        Err(_) if !allowed => tasks::confirm_started(&store, id, now).map(|_| ()),
                         Err(reason) => tasks::start_failed(&store, id, reason, now),
                     }
                     .map_err(|e| e.to_string())
@@ -144,6 +227,7 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
             if let Err(error) = recorded {
                 eprintln!("Task coordinator: could not record worker {id}'s start: {error}");
             }
+            let _ = confirmed.try_send(());
         }
     })
     .detach();
@@ -174,6 +258,7 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                 if let Err(error) = verify_tasks(&coordinator, &store) {
                     eprintln!("Task coordinator verification: {error}");
                 }
+                let _ = pumps.try_send(());
             }
         })
         .detach();

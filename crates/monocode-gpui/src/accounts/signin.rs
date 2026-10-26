@@ -3,6 +3,22 @@ use crate::theme::*;
 use gpui::{AnyElement, FontWeight, Role, SharedString, div, px};
 
 impl Accounts {
+    /// The account signed in again: task and Mono recovery may use it again
+    /// (`accounts::eligibility` clears its unhealthy mark).
+    pub(super) fn signed_in_again(&self, kind: Kind, id: &str, cx: &mut Context<Self>) {
+        let (store, account) = (self.store.clone(), id.to_owned());
+        cx.background_executor()
+            .spawn(async move {
+                let now = monocode_core::time::now_ms();
+                let cleared = locked(&store).and_then(|store| {
+                    accounts::eligibility::mark_healthy(&store, kind.id(), &account, now)
+                });
+                if let Err(error) = cleared {
+                    eprintln!("Account health: {error}");
+                }
+            })
+            .detach();
+    }
     pub(crate) fn has_modal_auth(&self) -> bool {
         self.signin
             .as_ref()

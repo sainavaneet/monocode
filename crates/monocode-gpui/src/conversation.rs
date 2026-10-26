@@ -12,6 +12,7 @@ pub(crate) mod git_actions;
 mod history;
 mod mobile;
 mod mono;
+mod mono_accounts;
 mod notifications;
 pub(crate) mod orchestration_card;
 mod remote;
@@ -20,6 +21,7 @@ mod response_menu;
 #[cfg(test)]
 mod submission_tests;
 mod task_questions;
+pub(crate) mod task_recovery;
 mod title;
 use crate::{
     composer_motion::ComposerMotion,
@@ -1080,9 +1082,11 @@ impl Conversation {
         settings.disable_claude_hooks = cx
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|p| !p.claude_hooks);
-        settings.use_api_key = cx
-            .try_global::<crate::settings::Preferences>()
-            .is_some_and(|p| p.api_key_enabled(Kind::from_id(&self.summary.provider)));
+        // A task worker bills as its task's policy snapshot says.
+        settings.use_api_key = settings.api_key_pin.unwrap_or_else(|| {
+            cx.try_global::<crate::settings::Preferences>()
+                .is_some_and(|p| p.api_key_enabled(Kind::from_id(&self.summary.provider)))
+        });
         settings.model = self.model.clone();
         settings.environment.extend(self.app_environment.clone());
         if settings.remote_action.as_ref().is_none_or(|action| {
@@ -1400,6 +1404,7 @@ impl Conversation {
                             }
                             if !this.is_remote() {
                                 this.detect_usage_limit(cx);
+                                this.report_task_turn(stopping, cx);
                             }
                             this.review
                                 .update(cx, |review, cx| review.set_busy(false, cx));

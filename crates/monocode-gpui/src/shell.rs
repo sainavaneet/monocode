@@ -37,6 +37,7 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+mod task_recovery;
 mod terminal_dock;
 mod title_tabs;
 mod worktrees;

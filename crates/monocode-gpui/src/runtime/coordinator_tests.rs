@@ -225,3 +225,152 @@ fn a_launched_worker_runs_its_brief_in_its_worktree_and_reports_durably() {
     assert_eq!(tasks.pending_deliveries(REVIEW).unwrap().len(), 1);
     assert_eq!(launcher.0.borrow().len(), 1);
 }
+
+const FAILING_PROVIDER: &str = r#"#!/usr/bin/env python3
+import json, sys
+def send(value):
+    print(json.dumps(value), flush=True)
+for line in sys.stdin:
+    value = json.loads(line)
+    method = value.get('method')
+    if method == 'initialize':
+        send({'id': value['id'], 'result': {}})
+    elif method == 'thread/start':
+        send({'id': value['id'], 'result': {'thread': {'id': 'thread'}}})
+    elif method == 'turn/start':
+        send({'id': value['id'], 'result': {'turn': {'id': 'turn'}}})
+        send({'method': 'turn/completed', 'params': {'turn': {'status': 'failed', 'error': {
+            'message': 'Fixture subscription exhausted', 'codexErrorInfo': 'usageLimitExceeded'}}}})
+        break
+"#;
+
+#[test]
+fn a_worker_that_hits_its_usage_limit_continues_on_the_next_allowed_account() {
+    use monocode_core::accounts::eligibility::{AllowedAccount, Allowlist, Scope, save_allowlist};
+    use monocode_core::tasks::recovery::{self, Outcome};
+    let dir = Fixture(std::env::temp_dir().join(format!(
+        "monocode-task-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let base = std::fs::canonicalize(&dir.0).unwrap();
+    let project = base.join("project");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["config", "user.email", "test@example.com"]);
+    git(&project, &["config", "user.name", "Test"]);
+    git(&project, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(project.join("src/lib.rs"), "pub fn one() {}\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    let binary = base.join("failing-provider");
+    std::fs::write(&binary, FAILING_PROVIDER).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let store = Store::open(&base.join("monocode.db")).unwrap();
+    store.save_setting(FLAG, "enabled").unwrap();
+    store
+        .save_provider_accounts(&monocode_core::accounts::Book {
+            accounts: vec![monocode_core::accounts::Account {
+                id: "account-b".into(),
+                provider: "codex".into(),
+                label: "B".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut allowed = Allowlist::only("codex", "default");
+    allowed.accounts.push(AllowedAccount {
+        priority: 1,
+        ..AllowedAccount::new("codex", "account-b")
+    });
+    save_allowlist(&store, Scope::Project(&project.to_string_lossy()), &allowed).unwrap();
+    started_task(&store, &project);
+    let store: Database = Arc::new(Mutex::new(store));
+    let coordinator = Coordinator::new("gpui-test", ExplicitStart);
+    let launcher = Recorded::default();
+    coordinator
+        .tick(&locked(&store).unwrap(), &launcher, 10)
+        .unwrap();
+    let (session, settings) = launcher.0.borrow()[0].clone();
+    assert_eq!(settings.account.id, "default");
+    monocode_core::tasks::confirm_started(&locked(&store).unwrap(), session.id, 11).unwrap();
+    let brief = locked(&store)
+        .unwrap()
+        .follow_ups(session.id)
+        .unwrap()
+        .draft
+        .unwrap()
+        .text;
+
+    // The fake provider fails the worker's turn with a usage limit.
+    let (updates, receive) = async_channel::bounded(64);
+    let (_controls, control_rx) = std::sync::mpsc::channel();
+    let worker_store = store.clone();
+    let id = session.id;
+    let worker = std::thread::spawn(move || {
+        run_turn_using(
+            TurnInput {
+                summary: session,
+                prompt: brief,
+                settings: Settings {
+                    text_only: true,
+                    ..settings
+                },
+            },
+            control_rx,
+            worker_store,
+            Arc::new(AtomicBool::new(false)),
+            updates,
+            |_| Some(binary),
+        );
+    });
+    let finished = loop {
+        let update = receive.recv_blocking().expect("runtime closed early");
+        if update.finished {
+            break update;
+        }
+    };
+    worker.join().unwrap();
+    assert!(
+        finished.status.starts_with("Usage limit reached"),
+        "{}",
+        finished.status
+    );
+
+    // What the conversation reports when the turn finishes.
+    let end = crate::conversation::task_recovery::turn_end(
+        &finished.status,
+        false,
+        finished.usage_limit.as_ref(),
+    );
+    let outcome = recovery::turn_ended(&locked(&store).unwrap(), id, &end, 20).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::Retry { account, .. } if account == "account-b"),
+        "{outcome:?}"
+    );
+    let stops = recovery::pending_stops(&locked(&store).unwrap()).unwrap();
+    assert_eq!(stops.len(), 1);
+    for stop in stops {
+        recovery::stopped(&locked(&store).unwrap(), &stop.delivery, 21).unwrap();
+    }
+    coordinator
+        .tick(&locked(&store).unwrap(), &launcher, 22)
+        .unwrap();
+    assert_eq!(launcher.0.borrow().len(), 2);
+    let (replacement, settings) = launcher.0.borrow()[1].clone();
+    assert_eq!(settings.account.id, "account-b");
+    let brief = locked(&store)
+        .unwrap()
+        .follow_ups(replacement.id)
+        .unwrap()
+        .draft
+        .unwrap()
+        .text;
+    assert!(brief.contains("Hand-off from attempt"), "{brief}");
+    assert!(brief.contains("Write src/feature.rs"));
+}
