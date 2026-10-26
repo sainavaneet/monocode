@@ -73,6 +73,7 @@ fn started_task(store: &Store, project: &Path) {
                     id: "c1".into(),
                     description: "Tests pass".into(),
                     required: true,
+                    checks: Vec::new(),
                 }],
             },
             1,

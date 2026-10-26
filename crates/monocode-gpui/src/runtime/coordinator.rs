@@ -33,21 +33,51 @@ impl Launcher for ShellLauncher {
 /// recording the outcomes hold the store lock; snapshotting the workspace and
 /// running the plan's checks (which may take minutes) do not.
 fn review_claims(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> Result<(), String> {
+    let now = monocode_core::time::now_ms;
     let jobs = {
         let store = locked(store)?;
         if !tasks::coordinator::enabled(&store) {
             return Ok(());
         }
         coordinator
-            .review_jobs(&store, monocode_core::time::now_ms())
+            .review_jobs(&store, now())
+            .map_err(|e| e.to_string())?
+    };
+    // One failing review must not stop the others; each failure counts
+    // toward the request's retry limit, after which Mono reviews it.
+    for job in jobs {
+        let inspection = job.inspect();
+        let store = locked(store)?;
+        if let Err(error) = coordinator.record_review(&store, &job, inspection, now()) {
+            eprintln!("Task coordinator review {}: {error}", job.delivery_id());
+            let error = error.to_string();
+            if let Err(failed) = coordinator.review_failed(&store, &job, &error, now()) {
+                eprintln!("Task coordinator review {}: {failed}", job.delivery_id());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Moves tasks whose work is accepted toward completion and checks their
+/// acceptance criteria, again running the checks without the store lock.
+fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> Result<(), String> {
+    let now = monocode_core::time::now_ms;
+    let jobs = {
+        let store = locked(store)?;
+        if !tasks::coordinator::enabled(&store) {
+            return Ok(());
+        }
+        coordinator
+            .verify_jobs(&store, now())
             .map_err(|e| e.to_string())?
     };
     for job in jobs {
         let inspection = job.inspect();
         let store = locked(store)?;
-        coordinator
-            .record_review(&store, &job, inspection, monocode_core::time::now_ms())
-            .map_err(|e| e.to_string())?;
+        if let Err(error) = coordinator.record_round(&store, &job, inspection, now()) {
+            eprintln!("Task coordinator verification: {error}");
+        }
     }
     Ok(())
 }
@@ -130,6 +160,9 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                 }
                 if let Err(error) = review_claims(&coordinator, &store) {
                     eprintln!("Task coordinator review: {error}");
+                }
+                if let Err(error) = verify_tasks(&coordinator, &store) {
+                    eprintln!("Task coordinator verification: {error}");
                 }
             }
         })
