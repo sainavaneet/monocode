@@ -64,10 +64,40 @@ pub const INSTRUCTIONS: &str = r#"Prepare an orchestration plan for the user's r
 Return a short explanation followed by exactly one JSON block between <monocode_orchestration> and </monocode_orchestration>.
 Schema: {"title":"short title","summary":"approach","tasks":[{"id":"task-1","title":"assignment title","prompt":"complete self-contained instructions, validation and expected report","files":["src/path"],"depends_on":[]}]}
 Use 1 to 12 assignments, unique ASCII IDs, exact project-relative file or directory scopes ('.' for the whole project), and dependency IDs. Independent assignments may run concurrently (up to four); overlapping scopes run serially. Each worker uses this session's provider, model and access policy. Include verification in the assignments. Never claim that workers have already started."#;
+const OPEN: &str = "<monocode_orchestration>";
+const CLOSE: &str = "</monocode_orchestration>";
+/// The reply as the transcript shows it, or None when nothing is hidden. The
+/// plan card presents the plan, so its JSON block stays out of the prose, also
+/// while it streams. A tag that is not followed by JSON stays visible.
+pub fn display_text(text: &str) -> Option<String> {
+    let mut shown = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut hidden = false;
+    while let Some((before, after)) = rest.split_once(OPEN) {
+        shown.push_str(before);
+        let body = after.trim_start();
+        if !(body.is_empty() || body.starts_with('{')) {
+            shown.push_str(OPEN);
+            rest = after;
+            continue;
+        }
+        hidden = true;
+        rest = after.split_once(CLOSE).map_or("", |(_, tail)| tail);
+    }
+    shown.push_str(rest);
+    // A streaming reply can end inside the opening tag itself.
+    if let Some(start) = shown.rfind('<') {
+        if shown.len() - start > 1 && OPEN.starts_with(&shown[start..]) {
+            shown.truncate(start);
+            hidden = true;
+        }
+    }
+    hidden.then(|| shown.trim_end().to_owned())
+}
 pub fn parse(text: &str) -> Result<Plan, String> {
     let body = text
-        .split_once("<monocode_orchestration>")
-        .and_then(|(_, s)| s.split_once("</monocode_orchestration>").map(|(s, _)| s))
+        .split_once(OPEN)
+        .and_then(|(_, s)| s.split_once(CLOSE).map(|(s, _)| s))
         .ok_or("The response did not include a task plan. Retry Orchestrator to prepare one.")?;
     if body.len() > 256 * 1024 {
         return Err("Task plan is too large.".into());
@@ -186,5 +216,28 @@ mod tests {
         assert!(validate(&plan).is_err());
         assert!(overlaps(&["src".into()], &["src/main.rs".into()]));
         assert!(!overlaps(&["src".into()], &["src2/main.rs".into()]));
+    }
+    #[test]
+    fn display_text_hides_plan_json_including_while_streaming() {
+        let plan =
+            "Ready.\n\n<monocode_orchestration>\n{\"title\":\"x\"}\n</monocode_orchestration>\n";
+        assert_eq!(display_text(plan).as_deref(), Some("Ready."));
+        let tail =
+            "Ready.\n<monocode_orchestration>{\"title\":\"x\"}</monocode_orchestration>\nAfter.";
+        assert_eq!(display_text(tail).as_deref(), Some("Ready.\n\nAfter."));
+        assert_eq!(
+            display_text("Ready.\n<monocode_orchestration>\n{\"tit").as_deref(),
+            Some("Ready.")
+        );
+        assert_eq!(
+            display_text("Ready.\n<monocode_orch").as_deref(),
+            Some("Ready.")
+        );
+        assert_eq!(display_text("Ready.\n<").as_deref(), None);
+        assert_eq!(display_text("No plan here."), None);
+        let prose = "The <monocode_orchestration> tag wraps the plan.";
+        assert_eq!(display_text(prose), None);
+        let parsed = parse(plan.replace("{\"title\":\"x\"}", r#"{"title":"T","summary":"","tasks":[{"id":"a","title":"A","prompt":"p","files":["src"]}]}"#).as_str());
+        assert_eq!(parsed.unwrap().tasks.len(), 1);
     }
 }

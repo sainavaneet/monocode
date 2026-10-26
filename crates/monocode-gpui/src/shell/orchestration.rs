@@ -1,6 +1,7 @@
 //! Orchestrator's reviewed plans create real native sessions. Dependencies and
 //! overlapping file scopes gate dispatch; approvals stay in each worker's chat.
 use super::*;
+use crate::conversation::orchestration_card::TaskProgress;
 use monocode_core::{
     agent::Settings,
     orchestration::{self, Plan, Task},
@@ -35,7 +36,10 @@ impl Shell {
         id: i64,
         cx: &mut Context<Self>,
     ) {
-        use crate::conversation::composer_features::{StartOrchestration, StopOrchestration};
+        use crate::conversation::{
+            composer_features::{StartOrchestration, StopOrchestration},
+            orchestration_card::OpenOrchestrationWorker,
+        };
         self.observations.push(cx.subscribe(
             view,
             move |this, _, event: &StartOrchestration, cx| {
@@ -47,6 +51,14 @@ impl Shell {
                 this.stop_orchestration(id, cx)
             }),
         );
+        self.observations.push(cx.subscribe(
+            view,
+            |this, _, event: &OpenOrchestrationWorker, cx| {
+                // Activation needs the window, so the next render opens it.
+                this.pending_activation = Some(event.0);
+                cx.notify();
+            },
+        ));
     }
     fn start_orchestration(&mut self, lead: i64, plan: Plan, cx: &mut Context<Self>) {
         if self.orchestrations.contains_key(&lead) {
@@ -148,6 +160,27 @@ impl Shell {
             self.schedule_orchestration(lead, cx);
         }
     }
+    /// The plan card's per-assignment status, with workers that wait on an
+    /// approval or answer shown as needing input.
+    fn orchestration_progress(&self, lead: i64, cx: &App) -> Vec<TaskProgress> {
+        let Some(summary) = self.orchestration_summaries.get(&lead) else {
+            return Vec::new();
+        };
+        summary
+            .tasks
+            .iter()
+            .map(|task| {
+                let needs_input = task
+                    .session
+                    .and_then(|id| self.sessions.get(&id))
+                    .is_some_and(|view| view.read(cx).needs_approval());
+                TaskProgress {
+                    label: task.label(summary, needs_input),
+                    session: task.session,
+                }
+            })
+            .collect()
+    }
     fn schedule_orchestration(&mut self, lead: i64, cx: &mut Context<Self>) {
         let Some(run) = self.orchestrations.get_mut(&lead) else {
             return;
@@ -222,28 +255,6 @@ impl Shell {
             .tasks
             .iter()
             .all(|t| matches!(t.state, State::Done | State::Failed | State::Blocked));
-        let progress = run
-            .tasks
-            .iter()
-            .map(|t| {
-                format!(
-                    "{}: {}{}",
-                    t.task.title,
-                    match t.state {
-                        State::Pending => "waiting",
-                        State::Starting => "starting",
-                        State::Running => "working",
-                        State::Done => "done",
-                        State::Failed => "failed",
-                        State::Blocked => "blocked",
-                    },
-                    t.session
-                        .map(|id| format!(" (session {id})"))
-                        .unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
         // The sidebar lists the lead's agents from this, during and after the run.
         let summary = orchestration::Summary {
             live: !done,
@@ -277,12 +288,13 @@ impl Shell {
             self.orchestration_summaries.insert(lead, summary);
             self.invalidate_chrome(cx);
         }
-        let Some(run) = self.orchestrations.get_mut(&lead) else {
-            return;
-        };
+        let progress = self.orchestration_progress(lead, cx);
         if let Some(view) = self.sessions.get(&lead) {
             view.update(cx, |v, cx| v.set_orchestration_progress(Some(progress), cx));
         }
+        let Some(run) = self.orchestrations.get_mut(&lead) else {
+            return;
+        };
         if done {
             let stopped = run.stopped;
             let reports = run

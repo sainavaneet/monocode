@@ -13,6 +13,7 @@ mod history;
 mod mobile;
 mod mono;
 mod notifications;
+pub(crate) mod orchestration_card;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
@@ -162,7 +163,9 @@ pub(crate) struct Conversation {
     planning_orchestration: bool,
     pub(crate) orchestration_plan: Option<monocode_core::orchestration::Plan>,
     orchestration_error: Option<String>,
-    pub(crate) orchestration_progress: Option<String>,
+    pub(crate) orchestration_progress: Option<Vec<orchestration_card::TaskProgress>>,
+    /// Plan assignments whose full instructions are unfolded in the card.
+    orchestration_open: std::collections::HashSet<String>,
     status: String,
     loaded: bool,
     history_unloaded: bool,
@@ -598,6 +601,7 @@ impl Conversation {
             orchestration_plan: None,
             orchestration_error: None,
             orchestration_progress: None,
+            orchestration_open: Default::default(),
             status: "Loading conversation…".into(),
             loaded: false,
             history_unloaded: false,
