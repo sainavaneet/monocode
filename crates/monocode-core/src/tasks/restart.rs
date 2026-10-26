@@ -1,34 +1,85 @@
-//! Restart reconciliation: what a coordinator does with a task it takes over
-//! from a holder that is gone (this app before it quit, or another process).
+//! Restart reconciliation: what a coordinator does with a task whose lease it
+//! took from another holder.
 //!
-//! Sequence, per task, once this holder owns its lease: every attempt that
-//! was Starting with a session, Running or Waiting is Interrupted, because
-//! quitting kills the worker process groups (`process::shutdown_all`); it
+//! Whether the previous holder's workers died with it decides everything.
+//! A native holder names its process (`monocode-native:<pid>:…`); when that
+//! process is gone (this app before it quit), every attempt that was
+//! Starting with a session, Running or Waiting is Interrupted, because
+//! quitting kills the worker process groups (`process::shutdown_all`), and
 //! continues through task-7's recovery path on the same lineage when the
-//! task's policy allows restart continuation, otherwise it is held and the
-//! task waits with the reason. Recorded workspaces must still exist on their
-//! branch and base; a missing or moved one is an explicit recovery condition
-//! (event, task Blocked with the reason, Mono told), never a fresh start.
-//! Waiting decisions are restored to Mono's queue (idempotently), a
+//! task's policy allows restart continuation (otherwise it is held and the
+//! task waits with the reason). When the previous holder may still be alive
+//! (a live process that stalled past its lease, or another app such as the
+//! desktop app, which cannot be checked), its workers are Interrupted and
+//! held, nothing is relaunched over them, the task waits with the reason and
+//! Mono is told; they continue once that process is gone, or when the user
+//! or Mono resumes the task.
+//!
+//! Then: recorded workspaces must still exist on their branch and base (a
+//! missing or moved one is the explicit recovery condition, never a fresh
+//! start), waiting decisions are restored to Mono's queue (idempotently), a
 //! task-wide open question keeps the task Waiting, and paused tasks stay
-//! paused: nothing here resumes them.
+//! paused. The Git checks can run without the store lock: [`Coordinator::
+//! startup_prepare`], [`workspace_check::check`], [`Coordinator::
+//! startup_finish`].
 use super::coordinator::{enabled, lease_resource, Coordinator, Policy};
 use super::decisions::queue_for_mono;
-use super::events::{append, NewEvent};
-use super::lifecycle::{notify, sync_waiting, wait_for};
+use super::guard::{may_be_running, task_or_missing};
+use super::notices::notify;
 use super::park::park;
-use super::recovery::{self, HELD, SCHEDULED};
-use super::{Attempt, AttemptState, Task, TaskError, TaskLifecycle, TaskStore, Workspace};
-use crate::orchestration::WorkspaceMode;
+use super::recovery::{HELD, SCHEDULED};
+use super::waiting::{activate, sync_waiting, wait_for, waiting_cause, TAKEOVER};
+use super::workspace_check::{self, Problem};
+use super::{NewEvent, Task, TaskError, TaskLifecycle, TaskStore, Workspace};
 use crate::store::Store;
 use rusqlite::OptionalExtension;
 use serde_json::json;
-use std::path::Path;
 
-/// The recovery category of an attempt interrupted by a restart.
-pub const RESTART: &str = "restart";
+pub use super::waiting::RESTART;
 const RESTART_REASON: &str =
     "The app quit while this worker ran, and quitting stops the worker's process.";
+const TAKEOVER_REASON: &str = "Another app or process held this task and may still be running this worker; it is held until that process is gone or the task is resumed.";
+
+/// Whether a lease holder's process is still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    Dead,
+    Alive,
+    /// Not a holder this app can check (another app).
+    Unknown,
+}
+
+/// The liveness of a native holder (`monocode-native:<pid>:<random>`) on
+/// this machine; any other holder is Unknown.
+pub fn native_liveness(holder: &str) -> Liveness {
+    let Some(pid) = holder
+        .strip_prefix("monocode-native:")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+    else {
+        return Liveness::Unknown;
+    };
+    if pid == std::process::id() || running(pid) {
+        Liveness::Alive
+    } else {
+        Liveness::Dead
+    }
+}
+
+#[cfg(unix)]
+fn running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // Signal 0 only checks that the process exists.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn running(_pid: u32) -> bool {
+    true
+}
 
 /// What startup reconciliation did, by task, attempt, workspace or decision.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -36,19 +87,22 @@ pub struct Startup {
     /// False when the flag is off and nothing was read or written.
     pub enabled: bool,
     pub reconciled: Vec<String>,
-    /// Attempts moved to Interrupted that recovery continues.
+    /// Attempts moved to Interrupted.
     pub interrupted: Vec<String>,
-    /// Interrupted attempts held because the policy does not continue them.
+    /// Interrupted attempts held (policy, or a previous holder that may be
+    /// alive).
     pub held: Vec<String>,
     /// Workspaces that are missing or moved.
     pub missing: Vec<String>,
     /// Open decisions put back in their Mono's queue.
     pub restored: Vec<String>,
-    /// Tasks another holder (such as the desktop app) still leases; the
-    /// coordinator's ticks retry them.
+    /// Tasks another holder still leases; the coordinator's ticks retry them.
     pub leased_elsewhere: Vec<String>,
     pub errors: Vec<String>,
 }
+
+/// Workspaces startup still has to check, per task.
+pub type Pending = Vec<(String, Vec<Workspace>)>;
 
 fn takeover_event(task: &str, holder: &str) -> String {
     format!("takeover:{task}:{holder}")
@@ -56,10 +110,6 @@ fn takeover_event(task: &str, holder: &str) -> String {
 
 fn restarted_event(task: &str, holder: &str) -> String {
     format!("restart:{task}:{holder}")
-}
-
-fn exists(tasks: &TaskStore<'_>, event: &str) -> Result<bool, TaskError> {
-    Ok(super::worker::payload_of(tasks.conn, event)?.is_some())
 }
 
 /// Every task that is neither cancelled nor completed, in creation order.
@@ -71,25 +121,39 @@ fn unfinished(tasks: &TaskStore<'_>) -> Result<Vec<String>, TaskError> {
     Ok(ids.collect::<Result<_, _>>()?)
 }
 
-/// Whether the attempt's worker process was running when its holder quit.
-fn was_running(tasks: &TaskStore<'_>, attempt: &Attempt) -> Result<bool, TaskError> {
-    let running = match attempt.status {
-        AttemptState::Running | AttemptState::Waiting => true,
-        AttemptState::Starting => attempt.session_id.is_some(),
-        _ => false,
-    };
-    Ok(running && tasks.claim(&attempt.id)?.is_none())
+fn marker(id: String, task: &str, kind: &str, payload: serde_json::Value) -> NewEvent {
+    NewEvent {
+        id,
+        task_id: task.into(),
+        assignment_id: None,
+        attempt_id: None,
+        kind: kind.into(),
+        payload,
+    }
 }
 
 impl<P: Policy> Coordinator<P> {
-    /// The startup sequence for every unfinished task: take its lease (one
-    /// held by another live holder is left alone and retried by later
-    /// ticks), then reconcile it if this holder took it over. Nothing happens
-    /// unless the coordinator flag is enabled.
+    /// The whole startup sequence with the store held throughout (tests,
+    /// and callers that do not share the store).
     pub fn startup(&self, store: &Store, now: u64) -> Result<Startup, TaskError> {
+        let (mut out, pending) = self.startup_prepare(store, now)?;
+        let problems = check_pending(&pending);
+        self.startup_finish(store, &mut out, problems, now)?;
+        Ok(out)
+    }
+
+    /// Startup's store part: take each unfinished task's lease (one held by
+    /// another holder is left alone; later ticks retry), reconcile what this
+    /// holder took over, and return the workspaces to check.
+    pub fn startup_prepare(
+        &self,
+        store: &Store,
+        now: u64,
+    ) -> Result<(Startup, Pending), TaskError> {
         let mut out = Startup::default();
+        let mut pending = Vec::new();
         if !enabled(store) {
-            return Ok(out);
+            return Ok((out, pending));
         }
         out.enabled = true;
         let tasks = store.tasks()?;
@@ -97,20 +161,40 @@ impl<P: Policy> Coordinator<P> {
             match self.take(&tasks, &id, now) {
                 Err(TaskError::LeaseHeld { .. }) => out.leased_elsewhere.push(id),
                 Err(error) => out.errors.push(format!("{id}: {error}")),
-                Ok(()) => {
-                    if let Err(error) = self.reconcile_restart(store, &id, now, &mut out) {
-                        out.errors.push(format!("{id}: {error}"));
-                    }
-                }
+                Ok(()) => match self.reconcile_store(store, &id, now, &mut out) {
+                    Ok(Some(workspaces)) => pending.push((id, workspaces)),
+                    Ok(None) => {}
+                    Err(error) => out.errors.push(format!("{id}: {error}")),
+                },
             }
         }
-        Ok(out)
+        Ok((out, pending))
     }
 
-    /// Takes or renews the task's lease. Taking it from another holder (a
-    /// process that quit or stopped coordinating) is recorded, so restart
-    /// reconciliation runs for this holder exactly once, even if it fails
-    /// midway and a later tick retries it.
+    /// Startup's last store part: records the recovery condition for the
+    /// workspaces the checks found missing or moved.
+    pub fn startup_finish(
+        &self,
+        store: &Store,
+        out: &mut Startup,
+        problems: Vec<(String, Vec<Problem>)>,
+        now: u64,
+    ) -> Result<(), TaskError> {
+        if !out.enabled {
+            return Ok(());
+        }
+        let tasks = store.tasks()?;
+        for (task, found) in problems {
+            if let Err(error) = record(&tasks, &task, &found, now, out) {
+                out.errors.push(format!("{task}: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes or renews the task's lease. Taking it from another holder is
+    /// recorded with that holder, so reconciliation runs for this holder
+    /// exactly once, even if it fails midway and a later tick retries it.
     pub(super) fn take(&self, tasks: &TaskStore<'_>, id: &str, now: u64) -> Result<(), TaskError> {
         let previous: Option<String> = tasks
             .conn
@@ -122,21 +206,33 @@ impl<P: Policy> Coordinator<P> {
             .optional()?;
         self.lease(tasks, id, now)?;
         if let Some(previous) = previous.filter(|holder| *holder != self.holder) {
-            let event = NewEvent {
-                id: takeover_event(id, &self.holder),
-                task_id: id.into(),
-                assignment_id: None,
-                attempt_id: None,
-                kind: "task.lease_taken_over".into(),
-                payload: json!({"previous": previous, "holder": self.holder}),
-            };
+            let payload = json!({"previous": previous, "holder": self.holder});
+            let event = marker(
+                takeover_event(id, &self.holder),
+                id,
+                "task.lease_taken_over",
+                payload,
+            );
             tasks.append_event(&event, now)?;
         }
         Ok(())
     }
 
-    /// Reconciles a task this holder took over and has not reconciled yet;
-    /// otherwise does nothing.
+    /// The holder this one took the task over from, if it did.
+    fn previous_holder(
+        &self,
+        tasks: &TaskStore<'_>,
+        id: &str,
+    ) -> Result<Option<String>, TaskError> {
+        Ok(
+            super::worker::payload_of(tasks.conn, &takeover_event(id, &self.holder))?
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                .and_then(|p| p["previous"].as_str().map(str::to_owned)),
+        )
+    }
+
+    /// Reconciles a task this holder took over (all of it, Git included,
+    /// under the store: the ticker's path).
     pub(super) fn reconcile_restart(
         &self,
         store: &Store,
@@ -144,50 +240,71 @@ impl<P: Policy> Coordinator<P> {
         now: u64,
         out: &mut Startup,
     ) -> Result<(), TaskError> {
+        if let Some(workspaces) = self.reconcile_store(store, id, now, out)? {
+            let found = workspace_check::check(&workspaces);
+            record(&store.tasks()?, id, &found, now, out)?;
+        }
+        Ok(())
+    }
+
+    /// The store part of reconciling a task this holder took over and has
+    /// not reconciled yet; returns the workspaces still to check.
+    fn reconcile_store(
+        &self,
+        store: &Store,
+        id: &str,
+        now: u64,
+        out: &mut Startup,
+    ) -> Result<Option<Vec<Workspace>>, TaskError> {
         let tasks = store.tasks()?;
-        let pending = exists(&tasks, &takeover_event(id, &self.holder))?
-            && !exists(&tasks, &restarted_event(id, &self.holder))?;
-        let Some(task) = tasks.task(id)?.filter(|_| pending) else {
-            return Ok(());
+        let Some(previous) = self.previous_holder(&tasks, id)? else {
+            return Ok(None);
         };
+        if super::worker::payload_of(tasks.conn, &restarted_event(id, &self.holder))?.is_some() {
+            return Ok(None);
+        }
+        let task = task_or_missing(&tasks, id)?;
         let finished = matches!(
             task.lifecycle,
             TaskLifecycle::Cancelled | TaskLifecycle::Completed
         );
+        let mut workspaces = None;
         if !finished {
-            self.interrupt_running(&tasks, &task, now, out)?;
-            let problems = verify_workspaces(&tasks, &task)?;
-            if !problems.is_empty() {
-                out.missing
-                    .extend(problems.iter().map(|(w, _)| w.id.clone()));
-                recovery_condition(&tasks, &task, &problems, now)?;
-            }
+            let dead = (self.liveness)(&previous) == Liveness::Dead;
+            self.interrupt_running(&tasks, &task, dead, now, out)?;
+            workspaces = Some(workspace_check::to_check(&tasks, id)?);
             out.restored.extend(restore_decisions(&tasks, id, now)?);
             sync_waiting(&tasks, id, now)?;
         }
-        let done = NewEvent {
-            id: restarted_event(id, &self.holder),
-            task_id: id.into(),
-            assignment_id: None,
-            attempt_id: None,
-            kind: "task.restart_reconciled".into(),
-            payload: json!({"holder": self.holder}),
-        };
+        let payload = json!({"holder": self.holder, "previous": previous});
+        let done = marker(
+            restarted_event(id, &self.holder),
+            id,
+            "task.restart_reconciled",
+            payload,
+        );
         tasks.append_event(&done, now)?;
         out.reconciled.push(id.into());
-        Ok(())
+        Ok(workspaces)
     }
 
-    /// Moves every attempt whose worker died with the old holder to
-    /// Interrupted, continuing or holding it per the task's policy.
+    /// Moves every attempt whose worker ran under the previous holder to
+    /// Interrupted: continued or held per the policy when that holder is
+    /// dead, held otherwise (its process may still run them).
     fn interrupt_running(
         &self,
         tasks: &TaskStore<'_>,
         task: &Task,
+        dead: bool,
         now: u64,
         out: &mut Startup,
     ) -> Result<(), TaskError> {
-        let continues = self.policy.restart_continuation(task);
+        let continues = dead && self.policy.restart_continuation(task);
+        let (category, reason) = if dead {
+            (RESTART, RESTART_REASON)
+        } else {
+            (TAKEOVER, TAKEOVER_REASON)
+        };
         let state = if continues { SCHEDULED } else { HELD };
         let tx = tasks.begin()?;
         let inside = TaskStore { conn: &tx };
@@ -196,139 +313,96 @@ impl<P: Policy> Coordinator<P> {
             let Some(attempt) = inside.attempts(&task.id, &assignment.id)?.pop() else {
                 continue;
             };
-            if !was_running(&inside, &attempt)? {
+            if !may_be_running(&attempt) || inside.claim(&attempt.id)?.is_some() {
                 continue;
             }
-            park(&tx, &attempt, RESTART, RESTART_REASON, state, false, now)?;
+            park(&tx, &attempt, category, reason, state, false, now)?;
             out.interrupted.push(attempt.id.clone());
             if !continues {
                 held.push(attempt.id);
             }
         }
         if !held.is_empty() {
-            let reason = "The app restarted while workers ran, and this task's policy does not continue work after a restart. Resume the task to continue it.";
-            wait_for(&tx, &task.id, RESTART, reason, now)?;
-            notify(&tx, &task.id, None, "task.restart_held", reason, now)?;
+            let (kind, why) = if dead {
+                ("task.restart_held", "The app restarted while workers ran, and this task's policy does not continue work after a restart. Resume the task to continue it.")
+            } else {
+                ("task.takeover_held", "Another app or process that may still be running this task's workers held it; they are held, and nothing is relaunched until that process is gone or the task is resumed.")
+            };
+            wait_for(&tx, &task.id, category, why, now)?;
+            notify(&tx, &task.id, None, kind, why, now)?;
         }
         tx.commit()?;
         out.held.extend(held);
         Ok(())
     }
-}
 
-/// Why a recorded workspace can no longer be used as recorded, if it cannot:
-/// the directory is gone, it is no longer a worktree of its repository, its
-/// branch changed, or its HEAD no longer descends from the recorded base.
-fn workspace_problem(workspace: &Workspace) -> Option<String> {
-    let path = Path::new(&workspace.path);
-    if !path.is_dir() {
-        return Some(format!("{} no longer exists", workspace.path));
-    }
-    if workspace.mode == WorkspaceMode::Checkout {
-        return None;
-    }
-    let same = |other: &str| {
-        let canonical = |p: &str| std::fs::canonicalize(p).ok();
-        canonical(other).is_some() && canonical(other) == canonical(&workspace.path)
-    };
-    let trees = match crate::git::worktrees(Path::new(&workspace.repository)) {
-        Ok(trees) => trees,
-        Err(error) => return Some(format!("its repository cannot be read ({error})")),
-    };
-    let Some(tree) = trees.iter().find(|t| same(&t.path)) else {
-        return Some(format!(
-            "{} is no longer a worktree of {}",
-            workspace.path, workspace.repository
-        ));
-    };
-    if let Some(branch) = &workspace.branch {
-        if tree.branch.as_deref() != Some(branch.as_str()) {
-            return Some(format!(
-                "{} is on {} instead of its branch {branch}",
-                workspace.path,
-                tree.branch.as_deref().unwrap_or("a detached HEAD")
-            ));
+    /// A task held because its previous holder might still run its workers
+    /// continues once that holder's process is gone (and the policy
+    /// continues after a restart).
+    pub(super) fn release_takeover(
+        &self,
+        store: &Store,
+        id: &str,
+        now: u64,
+    ) -> Result<(), TaskError> {
+        let tasks = store.tasks()?;
+        if waiting_cause(tasks.conn, id)?.as_deref() != Some(TAKEOVER) {
+            return Ok(());
         }
-    }
-    if let Some(base) = &workspace.base_commit {
-        let descends =
-            crate::git::git(path, &["merge-base", "--is-ancestor", base, "HEAD"]).is_ok();
-        if !descends {
-            return Some(format!(
-                "{}'s HEAD no longer descends from its base {base}",
-                workspace.path
-            ));
-        }
-    }
-    None
-}
-
-/// Workspaces of the task's unfinished assignments that are missing or
-/// moved, with why.
-pub(super) fn verify_workspaces(
-    tasks: &TaskStore<'_>,
-    task: &Task,
-) -> Result<Vec<(Workspace, String)>, TaskError> {
-    let live: Vec<String> = tasks
-        .assignments(&task.id)?
-        .into_iter()
-        .filter(|a| a.status != super::AssignmentState::Cancelled)
-        .map(|a| a.id)
-        .collect();
-    Ok(tasks
-        .workspaces(&task.id)?
-        .into_iter()
-        .filter(|w| w.assignment_id.as_ref().is_none_or(|a| live.contains(a)))
-        .filter_map(|w| workspace_problem(&w).map(|why| (w, why)))
-        .collect())
-}
-
-/// The explicit recovery condition for missing or moved workspaces: one
-/// event per workspace, the task Blocked with the reason (a paused task keeps
-/// its pause; resuming checks again), and one Mono notice.
-pub(super) fn recovery_condition(
-    tasks: &TaskStore<'_>,
-    task: &Task,
-    problems: &[(Workspace, String)],
-    now: u64,
-) -> Result<String, TaskError> {
-    let lines: Vec<String> = problems
-        .iter()
-        .map(|(w, why)| {
-            format!(
-                "assignment {}: {why}",
-                w.assignment_id.as_deref().unwrap_or("?")
-            )
-        })
-        .collect();
-    let reason = format!(
-        "A recorded workspace is missing or moved ({}). Work is never restarted in a fresh workspace on its own: restore the worktree, or decide with Mono how to continue.",
-        lines.join("; ")
-    );
-    let tx = tasks.begin()?;
-    for (workspace, why) in problems {
-        let event = NewEvent {
-            id: format!("workspace_missing:{}@{}", workspace.id, task.revision),
-            task_id: task.id.clone(),
-            assignment_id: workspace.assignment_id.clone(),
-            attempt_id: None,
-            kind: "recovery.workspace_missing".into(),
-            payload: json!({"workspaceId": workspace.id, "path": workspace.path,
-                "branch": workspace.branch, "baseCommit": workspace.base_commit, "reason": why}),
+        let Some(previous) = self.previous_holder(&tasks, id)? else {
+            return Ok(());
         };
-        append(&tx, &event, now)?;
+        let task = task_or_missing(&tasks, id)?;
+        if (self.liveness)(&previous) != Liveness::Dead || !self.policy.restart_continuation(&task)
+        {
+            return Ok(());
+        }
+        let tx = tasks.begin()?;
+        tx.execute(
+            "UPDATE native_task_recoveries SET state=?2,due_at=?3,revision=revision+1,updated_at=?3
+             WHERE task_id=?1 AND category=?4 AND state=?5",
+            rusqlite::params![id, SCHEDULED, super::store::ms(now), TAKEOVER, HELD],
+        )?;
+        activate(&tx, id, now)?;
+        tx.commit()?;
+        Ok(())
     }
-    recovery::block(&tx, &task.id, &reason, now)?;
-    notify(
-        &tx,
-        &task.id,
-        None,
-        "recovery.workspace_missing",
-        &reason,
-        now,
-    )?;
+}
+
+/// Runs the Git checks for what [`Coordinator::startup_prepare`] returned;
+/// needs no store.
+pub fn check_pending(pending: &Pending) -> Vec<(String, Vec<Problem>)> {
+    pending
+        .iter()
+        .map(|(task, workspaces)| (task.clone(), workspace_check::check(workspaces)))
+        .filter(|(_, found)| !found.is_empty())
+        .collect()
+}
+
+/// Records the recovery condition for `found`, unless the task finished
+/// meanwhile.
+fn record(
+    tasks: &TaskStore<'_>,
+    task: &str,
+    found: &[Problem],
+    now: u64,
+    out: &mut Startup,
+) -> Result<(), TaskError> {
+    if found.is_empty() {
+        return Ok(());
+    }
+    let current = task_or_missing(tasks, task)?;
+    if matches!(
+        current.lifecycle,
+        TaskLifecycle::Cancelled | TaskLifecycle::Completed
+    ) {
+        return Ok(());
+    }
+    let tx = tasks.begin()?;
+    workspace_check::record_condition(&tx, task, found, now)?;
     tx.commit()?;
-    Ok(reason)
+    out.missing.extend(found.iter().map(|(w, _)| w.id.clone()));
+    Ok(())
 }
 
 /// Puts every open decision of the task that its Mono still has to answer

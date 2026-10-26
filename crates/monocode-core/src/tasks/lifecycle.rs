@@ -12,27 +12,26 @@
 //! possible, otherwise a replacement starts from a durable hand-off).
 //! Cancelling keeps every change and piece of evidence but ends retries and
 //! recovery for good. While a stop is unconfirmed the task shows Pausing or
-//! Cancelling.
+//! Cancelling, and nothing new starts in its workspaces (`guard`).
 use super::events::{append, NewEvent};
+use super::guard::{may_be_running, request_stop, task_or_missing, task_stopping};
 use super::park::{move_rows, park, WAITING_ROWS};
-use super::recovery::{stop_delivery, HELD, SCHEDULED, SUPERSEDED, WORKER_STOP};
-use super::review::MONO_REVIEW;
+use super::recovery::{stop_delivery, HELD, SCHEDULED, SUPERSEDED};
 use super::states::apply;
-use super::worker::{event, settle};
+use super::waiting::{waiting_cause, RESTART, TAKEOVER};
+use super::worker::settle;
 use super::{
     AssignmentState, Attempt, AttemptState, Requester, State, Subject, Task, TaskError,
     TaskLifecycle, TaskStore,
 };
 use crate::store::Store;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// The recovery category of an attempt a pause interrupted.
 pub const PAUSED: &str = "paused";
 const PAUSE_REASON: &str = "The task was paused while this worker ran.";
-/// The waiting cause of a task-wide open question.
-const DECISION: &str = "decision";
 
 /// What the task shows: its lifecycle, with Pausing and Cancelling while a
 /// worker it stopped has not confirmed it stopped.
@@ -74,6 +73,9 @@ pub struct ControlRow {
     pub display: Display,
     /// Why it waits or is blocked.
     pub reason: Option<String>,
+    /// Whether `tasks.resume` applies: paused, or held after a restart or a
+    /// takeover (not a wait on a question, not a block).
+    pub resumable: bool,
 }
 
 /// What a pause, resume or cancel did.
@@ -98,26 +100,11 @@ fn only_user_or_mono(requester: Requester) -> Result<(), TaskError> {
     ))
 }
 
-fn task(tasks: &TaskStore<'_>, id: &str) -> Result<Task, TaskError> {
-    tasks
-        .task(id)?
-        .ok_or_else(|| TaskError::NotFound(format!("task:{id}")))
-}
-
-/// Whether the attempt's worker may still be running: a session that was
-/// handed out, or a live state. An attempt without a session never ran.
-fn running(attempt: &Attempt) -> bool {
-    match attempt.status {
-        AttemptState::Running | AttemptState::Waiting => true,
-        AttemptState::Starting => attempt.session_id.is_some(),
-        _ => false,
-    }
-}
-
-/// The record of who asked for a control and what it stopped.
-fn control_event(task: &str, kind: &str, revision: u64, payload: serde_json::Value) -> NewEvent {
+/// The record of who asked for a control and what it did; `key` makes it
+/// unique per request.
+fn control_event(task: &str, kind: &str, key: &str, payload: serde_json::Value) -> NewEvent {
     NewEvent {
-        id: format!("{kind}:{task}@{revision}"),
+        id: format!("{kind}:{task}@{key}"),
         task_id: task.into(),
         assignment_id: None,
         attempt_id: None,
@@ -147,17 +134,14 @@ pub fn pause(
         let Some(attempt) = inside.attempts(id, &assignment.id)?.pop() else {
             continue;
         };
-        if running(&attempt) && inside.claim(&attempt.id)?.is_none() {
+        if may_be_running(&attempt) && inside.claim(&attempt.id)?.is_none() {
             park(&tx, &attempt, PAUSED, PAUSE_REASON, SCHEDULED, true, now)?;
             stopping.push(attempt.id);
         }
     }
     let payload = json!({"requester": requester, "stopping": stopping});
-    append(
-        &tx,
-        &control_event(id, "task.pause_requested", revision, payload),
-        now,
-    )?;
+    let event = control_event(id, "task.pause_requested", &revision.to_string(), payload);
+    append(&tx, &event, now)?;
     tx.commit()?;
     controlled(&tasks, id, stopping, None)
 }
@@ -198,17 +182,14 @@ pub fn cancel(
         }
     }
     let payload = json!({"requester": requester, "stopping": stopping});
-    append(
-        &tx,
-        &control_event(id, "task.cancel_requested", revision, payload),
-        now,
-    )?;
+    let event = control_event(id, "task.cancel_requested", &revision.to_string(), payload);
+    append(&tx, &event, now)?;
     tx.commit()?;
     controlled(&tasks, id, stopping, None)
 }
 
-/// Cancels a live attempt and asks the app to stop its session. Returns
-/// whether a stop was requested.
+/// Cancels a live attempt and asks the app to stop its session when it may
+/// be running. Returns whether a stop was requested.
 pub(super) fn cancel_attempt(
     conn: &Connection,
     attempt: &Attempt,
@@ -225,44 +206,36 @@ pub(super) fn cancel_attempt(
         return Ok(false);
     }
     let cancelled = State::Attempt(AttemptState::Cancelled);
-    settle(
-        conn,
-        Subject::Attempt(&attempt.id),
-        cancelled,
-        Requester::Coordinator,
-        now,
-    )?;
-    let Some(session) = attempt.session_id.as_ref().filter(|_| running(attempt)) else {
+    let subject = Subject::Attempt(&attempt.id);
+    settle(conn, subject, cancelled, Requester::Coordinator, now)?;
+    if !may_be_running(attempt) {
         return Ok(false);
-    };
-    let payload = json!({"sessionId": session});
-    let stored = append(
-        conn,
-        &event(
-            attempt,
-            format!("cancelled:{}", attempt.id),
-            "attempt.stop_requested",
-            payload,
-        ),
-        now,
-    )?;
-    TaskStore { conn }.enqueue_delivery(
-        &stop_delivery(&attempt.id),
-        &stored.id,
-        WORKER_STOP,
-        &format!("session:{session}"),
-        now,
-    )?;
-    Ok(true)
+    }
+    let id = format!("cancelled:{}", attempt.id);
+    request_stop(conn, attempt, id, &stop_delivery(&attempt.id), now)
 }
 
-/// Resumes a paused task (or one held after a restart): the task is Active
-/// again, recorded workspaces are checked first (a missing or moved one
-/// blocks it with the recovery condition instead), held workers are carried
-/// on, and the coordinator then resumes only eligible work: replacements for
-/// the workers the pause stopped, and launches the scheduler allows. With
-/// `assignments`, an Active task's workers the user stopped by hand are
-/// carried on instead.
+/// Whether resuming applies to the task as it is: paused, or waiting
+/// because a restart or a takeover held its workers.
+fn reopens(conn: &Connection, task: &Task) -> Result<bool, TaskError> {
+    Ok(match task.lifecycle {
+        TaskLifecycle::Paused => true,
+        TaskLifecycle::Waiting => matches!(
+            waiting_cause(conn, &task.id)?.as_deref(),
+            Some(RESTART | TAKEOVER)
+        ),
+        _ => false,
+    })
+}
+
+/// Resumes a paused task (or one held after a restart or a takeover): the
+/// recorded workspaces are checked first, then in one transaction the task
+/// is Active again, held workers are carried on, every interrupted worker's
+/// session is stopped again (the user may have typed into it since; nothing
+/// launches until that stop is confirmed), and a missing or moved
+/// workspace blocks the task with the recovery condition instead. The
+/// coordinator then resumes only eligible work. With `assignments`, an
+/// Active task's workers the user stopped by hand are carried on instead.
 pub fn resume(
     store: &Store,
     id: &str,
@@ -273,7 +246,7 @@ pub fn resume(
 ) -> Result<Controlled, TaskError> {
     only_user_or_mono(requester)?;
     let tasks = store.tasks()?;
-    let current = task(&tasks, id)?;
+    let current = task_or_missing(&tasks, id)?;
     if current.revision != revision {
         return Err(TaskError::Stale {
             subject: format!("task:{id}"),
@@ -281,17 +254,21 @@ pub fn resume(
             actual: current.revision,
         });
     }
-    let held_after_restart = current.lifecycle == TaskLifecycle::Waiting
-        && waiting_cause(tasks.conn, id)?.as_deref() == Some(super::restart::RESTART);
-    let reopen = current.lifecycle == TaskLifecycle::Paused || held_after_restart;
+    let reopen = reopens(tasks.conn, &current)?;
     if !reopen && current.lifecycle != TaskLifecycle::Active {
         return Err(TaskError::InvalidState {
             subject: format!("task:{id}"),
             state: current.lifecycle.as_str().into(),
         });
     }
-    // Reconcile the workspaces before anything runs in them again.
-    let problems = super::restart::verify_workspaces(&tasks, &current)?;
+    for assignment in assignments {
+        if tasks.assignment(id, assignment)?.is_none() {
+            return Err(TaskError::NotFound(format!("assignment:{assignment}")));
+        }
+    }
+    // Git runs before the write lock is taken; the result is applied in
+    // the same transaction as the resume.
+    let problems = super::workspace_check::verify(&tasks, &current)?;
     let tx = tasks.begin()?;
     if reopen {
         let active = State::Lifecycle(TaskLifecycle::Active);
@@ -301,15 +278,11 @@ pub fn resume(
             [id],
         )?;
     }
-    let inside = TaskStore { conn: &tx };
     let mut released = Vec::new();
     if assignments.is_empty() {
         released.extend(move_rows(&tx, id, None, &[HELD], SCHEDULED, now)?);
     }
     for assignment in assignments {
-        if inside.assignment(id, assignment)?.is_none() {
-            return Err(TaskError::NotFound(format!("assignment:{assignment}")));
-        }
         released.extend(move_rows(
             &tx,
             id,
@@ -324,23 +297,47 @@ pub fn resume(
             "The task is not paused and has no held worker to resume.".into(),
         ));
     }
-    let revision = inside.revision(Subject::Task(id))?;
-    let payload = json!({"requester": requester, "released": released});
-    append(
-        &tx,
-        &control_event(id, "task.resume_requested", revision, payload),
-        now,
-    )?;
-    tx.commit()?;
+    let key = crate::mono::new_id();
+    restop_interrupted(&tx, id, assignments, &key, now)?;
     let blocked = if problems.is_empty() {
         None
     } else {
-        let now_task = task(&tasks, id)?;
-        Some(super::restart::recovery_condition(
-            &tasks, &now_task, &problems, now,
+        Some(super::workspace_check::record_condition(
+            &tx, id, &problems, now,
         )?)
     };
+    let payload = json!({"requester": requester, "released": released, "blocked": blocked});
+    let event = control_event(id, "task.resume_requested", &key, payload);
+    append(&tx, &event, now)?;
+    tx.commit()?;
     controlled(&tasks, id, released, blocked)
+}
+
+/// Asks the app to stop, again, the session of every interrupted latest
+/// worker (of `assignments` only, when given), so a session the user kept
+/// driving cannot share the workspace with what resumes.
+fn restop_interrupted(
+    conn: &Connection,
+    task: &str,
+    assignments: &[String],
+    key: &str,
+    now: u64,
+) -> Result<(), TaskError> {
+    let inside = TaskStore { conn };
+    for assignment in inside.assignments(task)? {
+        if !assignments.is_empty() && !assignments.contains(&assignment.id) {
+            continue;
+        }
+        let Some(attempt) = inside.attempts(task, &assignment.id)?.pop() else {
+            continue;
+        };
+        if attempt.status == AttemptState::Interrupted {
+            let id = format!("resume-stop:{}:{key}", attempt.id);
+            let delivery = format!("stop-resume:{}:{key}", attempt.id);
+            request_stop(conn, &attempt, id, &delivery, now)?;
+        }
+    }
+    Ok(())
 }
 
 fn controlled(
@@ -349,7 +346,7 @@ fn controlled(
     attempts: Vec<String>,
     blocked: Option<String>,
 ) -> Result<Controlled, TaskError> {
-    let task = task(tasks, id)?;
+    let task = task_or_missing(tasks, id)?;
     Ok(Controlled {
         task_id: task.id.clone(),
         revision: task.revision,
@@ -359,19 +356,6 @@ fn controlled(
     })
 }
 
-/// Whether a stop the task asked for is still unconfirmed, or a worker of
-/// it may still run.
-fn stopping(tasks: &TaskStore<'_>, task: &str) -> Result<bool, TaskError> {
-    Ok(tasks.conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM native_task_deliveries d JOIN native_task_events e ON e.id=d.event_id
-           WHERE e.task_id=?1 AND d.destination=?2 AND d.state<>'acknowledged')
-         OR EXISTS(SELECT 1 FROM native_task_attempts WHERE task_id=?1
-           AND (status IN ('running','waiting') OR (status='starting' AND session_id IS NOT NULL)))",
-        rusqlite::params![task, WORKER_STOP],
-        |row| row.get(0),
-    )?)
-}
-
 /// What the task shows now (see [`Display`]).
 pub fn display(tasks: &TaskStore<'_>, task: &Task) -> Result<Display, TaskError> {
     Ok(match task.lifecycle {
@@ -379,9 +363,9 @@ pub fn display(tasks: &TaskStore<'_>, task: &Task) -> Result<Display, TaskError>
         TaskLifecycle::Waiting => Display::Waiting,
         TaskLifecycle::Blocked => Display::Blocked,
         TaskLifecycle::Completed => Display::Completed,
-        TaskLifecycle::Paused if stopping(tasks, &task.id)? => Display::Pausing,
+        TaskLifecycle::Paused if task_stopping(tasks, &task.id)? => Display::Pausing,
         TaskLifecycle::Paused => Display::Paused,
-        TaskLifecycle::Cancelled if stopping(tasks, &task.id)? => Display::Cancelling,
+        TaskLifecycle::Cancelled if task_stopping(tasks, &task.id)? => Display::Cancelling,
         TaskLifecycle::Cancelled => Display::Cancelled,
     })
 }
@@ -403,7 +387,7 @@ pub fn controls(store: &Store, mono: &str) -> Result<Vec<ControlRow>, TaskError>
         .collect::<Result<Vec<_>, _>>()?;
     let mut rows = Vec::new();
     for id in ids {
-        let task = task(&tasks, &id)?;
+        let task = task_or_missing(&tasks, &id)?;
         let display = display(&tasks, &task)?;
         if display == Display::Cancelled {
             continue;
@@ -413,6 +397,7 @@ pub fn controls(store: &Store, mono: &str) -> Result<Vec<ControlRow>, TaskError>
             _ => None,
         };
         rows.push(ControlRow {
+            resumable: reopens(tasks.conn, &task)?,
             task_id: task.id,
             title: task.title,
             revision: task.revision,
@@ -433,9 +418,9 @@ pub fn detached(store: &Store, session: i64) -> Result<Option<String>, TaskError
     let Some(tasks) = store.existing_tasks()? else {
         return Ok(None);
     };
-    let bound = store
-        .persisted_session_id(session)
-        .map_err(TaskError::Storage)?;
+    let Ok(bound) = store.persisted_session_id(session) else {
+        return Ok(None);
+    };
     let Some(attempt) = tasks.attempt_for_session(&bound)? else {
         return Ok(None);
     };
@@ -447,171 +432,10 @@ pub fn detached(store: &Store, session: i64) -> Result<Option<String>, TaskError
         _ if !latest => "was replaced by a newer worker",
         _ => return Ok(None),
     };
-    let title = task(&tasks, &attempt.task_id)?.title;
+    let title = task_or_missing(&tasks, &attempt.task_id)?.title;
     Ok(Some(format!(
         "Detached from task \"{title}\": this worker {how}, so nothing done here reports to the task or changes it."
     )))
-}
-
-/// Queues a notice for the task's Mono, once per kind and task revision.
-pub(super) fn notify(
-    conn: &Connection,
-    task: &str,
-    assignment: Option<&str>,
-    kind: &str,
-    reason: &str,
-    now: u64,
-) -> Result<(), TaskError> {
-    let tasks = TaskStore { conn };
-    let revision = tasks.revision(Subject::Task(task))?;
-    let id = format!("{kind}:{task}@{revision}");
-    let notice = NewEvent {
-        id: id.clone(),
-        task_id: task.into(),
-        assignment_id: assignment.map(str::to_owned),
-        attempt_id: None,
-        kind: kind.into(),
-        payload: json!({"reason": reason}),
-    };
-    append(conn, &notice, now)?;
-    let reference = format!("task:{task}");
-    tasks.enqueue_delivery(&format!("mono-{id}"), &id, MONO_REVIEW, &reference, now)?;
-    Ok(())
-}
-
-/// Moves an Active task to Waiting for `cause`, with the reason shown.
-/// Returns whether it moved.
-pub(super) fn wait_for(
-    conn: &Connection,
-    task: &str,
-    cause: &str,
-    reason: &str,
-    now: u64,
-) -> Result<bool, TaskError> {
-    let tasks = TaskStore { conn };
-    let subject = Subject::Task(task);
-    let waiting = State::Lifecycle(TaskLifecycle::Waiting);
-    if tasks.state(subject, waiting)? != State::Lifecycle(TaskLifecycle::Active) {
-        return Ok(false);
-    }
-    let revision = tasks.revision(subject)?;
-    let revision = apply(
-        conn,
-        subject,
-        waiting,
-        Requester::Coordinator,
-        revision,
-        now,
-    )?;
-    conn.execute(
-        "UPDATE native_tasks SET blocked_reason=?2 WHERE id=?1",
-        [task, reason],
-    )?;
-    let payload = json!({"cause": cause, "reason": reason});
-    append(
-        conn,
-        &control_event(task, "task.waiting_cause", revision, payload),
-        now,
-    )?;
-    Ok(true)
-}
-
-/// Why the task waits, when this module made it wait and nothing moved its
-/// lifecycle since: the latest lifecycle event is the cause it recorded.
-pub(super) fn waiting_cause(conn: &Connection, task: &str) -> Result<Option<String>, TaskError> {
-    let latest: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT kind,json_extract(payload,'$.cause') FROM native_task_events
-             WHERE task_id=?1 AND kind IN ('task.waiting_cause','task.waiting','task.active',
-               'task.resumed','task.paused','task.blocked','task.cancelled','task.completed')
-             ORDER BY seq DESC LIMIT 1",
-            [task],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    Ok(latest
-        .filter(|(kind, _)| kind == "task.waiting_cause")
-        .and_then(|(_, cause)| cause))
-}
-
-/// The open task-wide question that holds the whole task, if one does.
-fn task_wide_question(conn: &Connection, task: &str) -> Result<Option<String>, TaskError> {
-    Ok(conn
-        .query_row(
-            "SELECT d.id FROM native_task_decisions d WHERE d.task_id=?1 AND d.scope='task'
-               AND d.state='open'
-               AND NOT EXISTS(SELECT 1 FROM native_task_assignments a
-                 WHERE a.task_id=d.task_id AND a.id=d.assignment_id
-                   AND a.status IN ('cancelled','failed'))
-             ORDER BY d.rowid LIMIT 1",
-            [task],
-            |row| row.get(0),
-        )
-        .optional()?)
-}
-
-/// A task-wide open question makes an Active task Waiting; once no such
-/// question is open (it was answered), the task is Active again. Running
-/// workers are untouched either way, and launches the question holds stay
-/// held until its answer reaches the worker (`launch_blocked`).
-pub(super) fn sync_waiting(tasks: &TaskStore<'_>, id: &str, now: u64) -> Result<(), TaskError> {
-    let current = task(tasks, id)?;
-    let open = task_wide_question(tasks.conn, id)?;
-    match (current.lifecycle, open) {
-        (TaskLifecycle::Active, Some(decision)) => {
-            let reason = format!("Waiting for decision {decision}, which holds the whole task.");
-            let tx = tasks.begin()?;
-            wait_for(&tx, id, DECISION, &reason, now)?;
-            tx.commit()?;
-        }
-        (TaskLifecycle::Waiting, None)
-            if waiting_cause(tasks.conn, id)?.as_deref() == Some(DECISION) =>
-        {
-            let tx = tasks.begin()?;
-            let active = State::Lifecycle(TaskLifecycle::Active);
-            apply(
-                &tx,
-                Subject::Task(id),
-                active,
-                Requester::Coordinator,
-                current.revision,
-                now,
-            )?;
-            tx.execute(
-                "UPDATE native_tasks SET blocked_reason=NULL WHERE id=?1",
-                [id],
-            )?;
-            tx.commit()?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// How Mono's inbox describes a lifecycle notice: what happened and how to
-/// act on it. None for other events.
-pub(super) fn describe(kind: &str, task: &str, assignment: Option<&str>) -> Option<String> {
-    let a = assignment.unwrap_or("...");
-    let (what, how) = match kind {
-        "recovery.stopped_by_user" => (
-            "The user stopped a worker by hand; it is held, not failed",
-            format!("Continue it with tasks.resume {{\"taskId\":\"{task}\",\"revision\":<task revision>,\"assignmentIds\":[\"{a}\"]}}, change it with tasks.steer, or end the task with tasks.cancel."),
-        ),
-        "recovery.workspace_missing" => (
-            "A recorded workspace is missing or moved, so the task is blocked",
-            "Nothing restarts in a fresh workspace on its own. Ask the user to restore the worktree, or steer the affected assignments with tasks.steer.".into(),
-        ),
-        "task.restart_held" => (
-            "The app restarted; this task waits because its policy does not continue after a restart",
-            format!("Continue it with tasks.resume {{\"taskId\":\"{task}\",\"revision\":<task revision>}}, or end it with tasks.cancel."),
-        ),
-        "task.steer_assess" => (
-            "The requirements changed and the affected assignments are not known",
-            format!("Decide which assignments the new requirements affect and call tasks.steer {{\"taskId\":\"{task}\",\"revision\":<task revision>,\"requirements\":\"...\",\"assignmentIds\":[...]}} (or pass the revised plan). Nothing was stopped."),
-        ),
-        _ => return None,
-    };
-    Some(format!("{what}.\n{how}"))
 }
 
 #[cfg(test)]

@@ -61,6 +61,10 @@ impl<P: Policy> Coordinator<P> {
         now: u64,
     ) -> Result<Option<Attempt>, TaskError> {
         let tasks = store.tasks()?;
+        // Nothing starts beside a worker whose stop is unconfirmed.
+        if super::guard::pending_stop(tasks.conn, &task.id, &assignment.id)?.is_some() {
+            return Ok(None);
+        }
         let prepared = match workspaces::prepare(&tasks, task, assignment, now) {
             Ok(prepared) => prepared,
             Err(PrepareError::Workspace(reason)) => {

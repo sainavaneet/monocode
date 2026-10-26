@@ -102,6 +102,9 @@ pub struct Tick {
 pub struct Coordinator<P: Policy = ExplicitStart> {
     pub(super) holder: String,
     pub(super) policy: P,
+    /// Whether a previous lease holder's process is gone (its workers died
+    /// with it); see `restart`.
+    pub(super) liveness: fn(&str) -> super::restart::Liveness,
 }
 
 impl<P: Policy> Coordinator<P> {
@@ -110,7 +113,15 @@ impl<P: Policy> Coordinator<P> {
         Self {
             holder: holder.into(),
             policy,
+            liveness: super::restart::native_liveness,
         }
+    }
+
+    /// Replaces how a previous holder's liveness is judged (tests stand in
+    /// for processes that quit or still run).
+    pub fn with_liveness(mut self, liveness: fn(&str) -> super::restart::Liveness) -> Self {
+        self.liveness = liveness;
+        self
     }
 
     pub fn holder(&self) -> &str {
@@ -138,7 +149,10 @@ impl<P: Policy> Coordinator<P> {
                     // A task taken over from a holder that is gone is
                     // reconciled first (its workers died with it).
                     let mut restart = super::restart::Startup::default();
-                    if let Err(error) = self.reconcile_restart(store, &id, now, &mut restart) {
+                    let reconciled = self
+                        .reconcile_restart(store, &id, now, &mut restart)
+                        .and_then(|()| self.release_takeover(store, &id, now));
+                    if let Err(error) = reconciled {
                         tick.errors.push(format!("{id}: {error}"));
                         continue;
                     }
@@ -173,7 +187,7 @@ impl<P: Policy> Coordinator<P> {
         let tasks = store.tasks()?;
         // A task-wide open question makes the task wait, and its answer
         // makes it active again.
-        super::lifecycle::sync_waiting(&tasks, id, now)?;
+        super::waiting::sync_waiting(&tasks, id, now)?;
         let Some(mut task) = tasks.task(id)? else {
             return Ok(());
         };
@@ -249,6 +263,13 @@ impl<P: Policy> Coordinator<P> {
             })
             .map(|a| a.files.as_slice())
             .collect();
+        // A worker whose stop is unconfirmed still occupies its file scope.
+        let mut occupied: Vec<&[String]> = active.clone();
+        for assignment in &assignments {
+            if super::guard::pending_stop(tasks.conn, &task.id, &assignment.id)?.is_some() {
+                occupied.push(assignment.files.as_slice());
+            }
+        }
         let limit = self.policy.worker_limit(task);
         for assignment in assignments
             .iter()
@@ -257,6 +278,10 @@ impl<P: Policy> Coordinator<P> {
             if active.len() >= limit {
                 break;
             }
+            // Two agents never work one workspace.
+            if self.held_by_stop(&tasks, &task.id, &assignment.id, now, tick)? {
+                continue;
+            }
             // A question holds what its scope covers; the rest continues.
             if tasks
                 .launch_blocked(&task.id, assignment, &assignments)?
@@ -264,7 +289,7 @@ impl<P: Policy> Coordinator<P> {
             {
                 continue;
             }
-            if active
+            if occupied
                 .iter()
                 .any(|files| crate::orchestration::overlaps(files, &assignment.files))
             {
@@ -275,6 +300,7 @@ impl<P: Policy> Coordinator<P> {
             };
             self.dispatch(store, task, &attempt, launcher, now, tick)?;
             active.push(&assignment.files);
+            occupied.push(&assignment.files);
         }
         Ok(())
     }

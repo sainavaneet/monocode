@@ -10,14 +10,24 @@ use crate::tasks::recovery::tests::{
 use crate::tasks::review::tests::{git, open, repo, scoped, NOW};
 use crate::tasks::store::tests::plan;
 use crate::tasks::{
-    policy, recovery, AssignmentState, DecisionState, NewTask, Requester, State, Subject, TaskStage,
+    policy, recovery, AssignmentState, AttemptState, DecisionState, NewTask, Requester, State,
+    Subject, TaskStage,
 };
 
 /// When the next process starts: the quit process's lease has expired.
 const LATER: u64 = NOW + LEASE_TTL_MS + 1_000;
 
+/// The next process; the one before it (`gpui-1`) quit.
 fn restarted() -> Coordinator {
-    Coordinator::new("gpui-2", ExplicitStart)
+    Coordinator::new("gpui-2", ExplicitStart).with_liveness(|_| Liveness::Dead)
+}
+
+/// The id of a process that has exited.
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
 }
 
 fn current(store: &Store) -> Task {
@@ -180,6 +190,7 @@ fn paused_tasks_stay_paused_across_restart() {
     );
     // Resuming after the restart continues the paused work.
     resume(&store, "t", task.revision, Requester::User, &[], LATER + 10).unwrap();
+    stop_all(&store, LATER + 10);
     restarted().tick(&store, &launcher, LATER + 11).unwrap();
     assert_eq!(launcher.count(), 2);
 }
@@ -190,7 +201,7 @@ fn without_restart_continuation_the_task_waits_with_a_reason() {
     let store = open(&repo);
     let launcher = Recorded::default();
     launched(&store, &repo, &launcher);
-    let next = Coordinator::new("gpui-2", NoRestart);
+    let next = Coordinator::new("gpui-2", NoRestart).with_liveness(|_| Liveness::Dead);
     let startup = next.startup(&store, LATER).unwrap();
     assert_eq!(startup.held.len(), 1);
     let task = current(&store);
@@ -201,6 +212,7 @@ fn without_restart_continuation_the_task_waits_with_a_reason() {
     assert_eq!(launcher.count(), 1);
     let revision = current(&store).revision;
     resume(&store, "t", revision, Requester::User, &[], LATER + 2).unwrap();
+    stop_all(&store, LATER + 2);
     assert_eq!(current(&store).lifecycle, TaskLifecycle::Active);
     next.tick(&store, &launcher, LATER + 3).unwrap();
     assert_eq!(launcher.count(), 2);
@@ -266,8 +278,95 @@ fn a_lease_another_app_holds_keeps_startup_passive_until_it_expires() {
     assert!(startup.reconciled.is_empty());
     assert_eq!(attempts(&store)[0].status, AttemptState::Running);
     // Once that lease lapses, the next tick takes the task over.
+    // Once that lease lapses, the next tick takes the task over; the
+    // desktop app cannot be checked, so its worker is held, not replaced.
     let after = LATER + LEASE_TTL_MS + 2;
-    restarted().tick(&store, &launcher, after).unwrap();
+    let ours = Coordinator::new("gpui-2", ExplicitStart);
+    ours.tick(&store, &launcher, after).unwrap();
     assert_eq!(attempts(&store)[0].status, AttemptState::Interrupted);
     assert_eq!(kinds(&store, "task.restart_reconciled").len(), 1);
+    assert_eq!(kinds(&store, "task.takeover_held").len(), 1);
+    ours.tick(&store, &launcher, after + 1).unwrap();
+    assert_eq!(launcher.count(), 1);
+    assert_eq!(attempts(&store).len(), 1);
+}
+
+#[test]
+fn a_holder_whose_process_exited_is_taken_over_as_a_restart() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    launched(&store, &repo, &launcher);
+    // The process that held the lease last has exited.
+    let quit = format!("monocode-native:{}:old", dead_pid());
+    let tasks = store.tasks().unwrap();
+    tasks
+        .acquire_lease(&lease_resource("t"), &quit, 1, NOW + LEASE_TTL_MS + 1)
+        .unwrap();
+    let ours = Coordinator::new("monocode-native:0:new", ExplicitStart);
+    let startup = ours.startup(&store, LATER).unwrap();
+    assert_eq!(startup.interrupted.len(), 1);
+    assert!(startup.held.is_empty());
+    ours.tick(&store, &launcher, LATER + 1).unwrap();
+    assert_eq!(launcher.count(), 2, "the dead holder's worker is continued");
+}
+
+#[test]
+fn a_live_holder_taken_over_keeps_its_workers_held_until_it_is_gone() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    launched(&store, &repo, &launcher);
+    // A live process (this one) stalled past its lease.
+    let alive = format!("monocode-native:{}:stalled", std::process::id());
+    let tasks = store.tasks().unwrap();
+    tasks
+        .acquire_lease(&lease_resource("t"), &alive, 1, NOW + LEASE_TTL_MS + 1)
+        .unwrap();
+    let ours = Coordinator::new("monocode-native:0:new", ExplicitStart);
+    let startup = ours.startup(&store, LATER).unwrap();
+    assert_eq!(startup.held.len(), 1);
+    let task = current(&store);
+    assert_eq!(task.lifecycle, TaskLifecycle::Waiting);
+    assert_eq!(kinds(&store, "task.takeover_held").len(), 1);
+    for later in 1..=3 {
+        ours.tick(&store, &launcher, LATER + later).unwrap();
+    }
+    assert_eq!(launcher.count(), 1, "nothing relaunched over a live worker");
+    // Proof that the holder is gone lets it continue on its own.
+    let gone =
+        Coordinator::new("monocode-native:0:new", ExplicitStart).with_liveness(|_| Liveness::Dead);
+    gone.tick(&store, &launcher, LATER + 10).unwrap();
+    assert_eq!(current(&store).lifecycle, TaskLifecycle::Active);
+    gone.tick(&store, &launcher, LATER + 11).unwrap();
+    assert_eq!(launcher.count(), 2);
+}
+
+#[test]
+fn an_accepted_assignments_worktree_may_be_gone() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    let session = launched(&store, &repo, &launcher);
+    crate::app_access::worker_action(
+        &store,
+        session,
+        "done",
+        "tasks.worker.result",
+        &serde_json::json!({"outcome": "succeeded", "summary": "Done"}),
+        NOW + 1,
+    )
+    .unwrap();
+    let tasks = store.tasks().unwrap();
+    let a = Subject::Assignment { task: "t", id: "a" };
+    let revision = tasks.revision(a).unwrap();
+    let accepted = State::Assignment(AssignmentState::Accepted);
+    tasks
+        .transition(a, accepted, Requester::Mono, revision, NOW + 2)
+        .unwrap();
+    let workspace = tasks.workspaces("t").unwrap().remove(0);
+    std::fs::remove_dir_all(&workspace.path).unwrap();
+    let startup = restarted().startup(&store, LATER).unwrap();
+    assert!(startup.missing.is_empty(), "{startup:?}");
+    assert_ne!(current(&store).lifecycle, TaskLifecycle::Blocked);
 }

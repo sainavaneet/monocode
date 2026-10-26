@@ -12,11 +12,13 @@ pub mod events;
 pub mod findings;
 #[doc(hidden)]
 pub mod fixtures;
+mod guard;
 pub mod handoff;
 pub mod inbox;
 mod launch;
 pub mod lifecycle;
 pub mod model;
+mod notices;
 mod park;
 pub mod policy;
 pub mod recovery;
@@ -27,7 +29,9 @@ pub mod states;
 pub mod steer;
 pub mod store;
 pub mod verify;
+pub mod waiting;
 pub mod worker;
+pub mod workspace_check;
 pub mod workspaces;
 
 pub use completion::{complete, final_report, live_verifications, FinalReport};

@@ -445,7 +445,7 @@ fn question(tasks: &TaskStore<'_>, decision: &DecisionRequest) -> Result<String,
 
 fn review(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskError> {
     let notice =
-        super::lifecycle::describe(&event.kind, &event.task_id, event.assignment_id.as_deref());
+        super::notices::describe(&event.kind, &event.task_id, event.assignment_id.as_deref());
     if let Some(notice) = notice {
         let mut text = format!(
             "{notice} ({}).\n{}",

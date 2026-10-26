@@ -4,7 +4,9 @@ use super::*;
 use crate::app_access::worker_action;
 use crate::tasks::coordinator::{Coordinator, Policy};
 use crate::tasks::decisions::tests::{independent, task_with};
+use crate::tasks::lifecycle::{pause, resume};
 use crate::tasks::recovery::tests::{kinds, stop_all};
+use crate::tasks::recovery::{turn_ended, TurnEnd};
 use crate::tasks::review::tests::{open, repo, FakeLauncher, NOW};
 use crate::tasks::{confirm_started, Attempt, AttemptState};
 use serde_json::json;
@@ -108,8 +110,11 @@ fn steering_stops_only_affected_workers() {
     assert_eq!(status(&store, "b"), AssignmentState::NeedsReview);
     assert_eq!(b.status, AttemptState::Running);
 
+    // Nothing starts in a's workspace while its old worker may still run.
+    coordinator().tick(&store, &launcher, NOW + 13).unwrap();
+    assert_eq!(launcher.started.borrow().len(), 2);
     // Once stopped, a starts again under the new requirements.
-    stop_all(&store, NOW + 13);
+    stop_all(&store, NOW + 14);
     coordinator().tick(&store, &launcher, NOW + 20).unwrap();
     assert_eq!(launcher.started.borrow().len(), 3);
     let second_a = latest(&store, "a");
@@ -246,4 +251,150 @@ fn steering_without_known_affected_work_asks_mono_and_stops_nothing() {
         "{}",
         batch.message
     );
+}
+
+#[test]
+fn a_pending_stop_still_occupies_its_file_scope() {
+    let repo = repo();
+    let store = open(&repo);
+    let project = repo.root.to_string_lossy().into_owned();
+    let launcher = FakeLauncher::default();
+    let mut c = independent("c");
+    c.files = vec!["src/a/c".into()];
+    task_with(
+        &store,
+        &project,
+        vec![independent("a"), independent("b"), c],
+    );
+    coordinator().tick(&store, &launcher, NOW).unwrap();
+    assert_eq!(launcher.started.borrow().len(), 2, "c waits for a's scope");
+    for session in launcher.started.borrow().iter() {
+        confirm_started(&store, session.id, NOW + 1).unwrap();
+    }
+    let request = Steer {
+        requirements: "Redo a".into(),
+        assignments: vec!["a".into()],
+        plan: None,
+    };
+    steer(
+        &store,
+        "t",
+        revision(&store),
+        Requester::User,
+        &request,
+        NOW + 2,
+    )
+    .unwrap();
+    // a's old worker may still run in src/a: c (inside it) does not start.
+    for later in 3..6 {
+        coordinator().tick(&store, &launcher, NOW + later).unwrap();
+    }
+    assert_eq!(launcher.started.borrow().len(), 2);
+    assert_eq!(status(&store, "c"), AssignmentState::Ready);
+    stop_all(&store, NOW + 6);
+    coordinator().tick(&store, &launcher, NOW + 7).unwrap();
+    assert_eq!(launcher.started.borrow().len(), 3);
+}
+
+#[test]
+fn pause_steer_and_resume_launch_nothing_until_the_stops_are_confirmed() {
+    let repo = repo();
+    let store = open(&repo);
+    let project = repo.root.to_string_lossy().into_owned();
+    let launcher = FakeLauncher::default();
+    two_running(&store, &project, &launcher);
+    pause(&store, "t", revision(&store), Requester::User, NOW + 2).unwrap();
+    let request = Steer {
+        requirements: "Redo a".into(),
+        assignments: vec!["a".into()],
+        plan: None,
+    };
+    steer(
+        &store,
+        "t",
+        revision(&store),
+        Requester::User,
+        &request,
+        NOW + 3,
+    )
+    .unwrap();
+    resume(&store, "t", revision(&store), Requester::User, &[], NOW + 4).unwrap();
+    for later in 5..8 {
+        coordinator().tick(&store, &launcher, NOW + later).unwrap();
+    }
+    assert_eq!(launcher.started.borrow().len(), 2);
+    stop_all(&store, NOW + 8);
+    coordinator().tick(&store, &launcher, NOW + 9).unwrap();
+    assert_eq!(launcher.started.borrow().len(), 4);
+}
+
+#[test]
+fn every_resume_of_held_workers_is_recorded() {
+    let repo = repo();
+    let store = open(&repo);
+    let project = repo.root.to_string_lossy().into_owned();
+    let launcher = FakeLauncher::default();
+    let started = two_running(&store, &project, &launcher);
+    let stopped = TurnEnd {
+        stopped: true,
+        ..TurnEnd::default()
+    };
+    for session in &started {
+        turn_ended(&store, *session, &stopped, NOW + 2).unwrap();
+    }
+    stop_all(&store, NOW + 3);
+    let at = revision(&store);
+    resume(&store, "t", at, Requester::Mono, &["a".into()], NOW + 4).unwrap();
+    assert_eq!(revision(&store), at);
+    resume(&store, "t", at, Requester::Mono, &["b".into()], NOW + 5).unwrap();
+    let resumes = kinds(&store, "task.resume_requested");
+    assert_eq!(resumes.len(), 2);
+    assert_eq!(resumes[1].payload["released"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_named_assignment_that_cannot_move_is_reported_as_skipped() {
+    let repo = repo();
+    let store = open(&repo);
+    let project = repo.root.to_string_lossy().into_owned();
+    let launcher = FakeLauncher::default();
+    two_running(&store, &project, &launcher);
+    let drop_b = Steer {
+        requirements: "Drop b".into(),
+        plan: Some(crate::orchestration::Plan {
+            title: "Plan".into(),
+            summary: String::new(),
+            tasks: vec![independent("a")],
+        }),
+        ..Steer::default()
+    };
+    steer(
+        &store,
+        "t",
+        revision(&store),
+        Requester::Mono,
+        &drop_b,
+        NOW + 2,
+    )
+    .unwrap();
+    assert_eq!(status(&store, "b"), AssignmentState::Cancelled);
+    let named = Steer {
+        requirements: "Also b".into(),
+        assignments: vec!["b".into()],
+        plan: None,
+    };
+    let steered = steer(
+        &store,
+        "t",
+        revision(&store),
+        Requester::Mono,
+        &named,
+        NOW + 3,
+    )
+    .unwrap();
+    assert!(steered.affected.is_empty());
+    assert_eq!(steered.skipped.len(), 1);
+    assert_eq!(steered.skipped[0].id, "b");
+    assert!(steered.skipped[0].reason.contains("cancelled"));
+    assert_eq!(status(&store, "b"), AssignmentState::Cancelled);
 }

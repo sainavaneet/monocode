@@ -7,11 +7,15 @@
 //! are touched: a live worker of an affected assignment is Cancelled (its
 //! worktree, commits and claim stay as evidence) and asked to stop, and the
 //! assignment is queued again, so the next worker starts from the new
-//! requirements; a dropped one is Cancelled. Every other worker continues.
-//! When nothing says which assignments are affected, nothing is stopped and
-//! Mono is asked to decide.
+//! requirements once that stop is confirmed (`guard`); a dropped one is
+//! Cancelled. An assignment the table cannot move (a cancelled one) is
+//! reported as skipped, with why. Every other worker continues. When
+//! nothing says which assignments are affected, nothing is stopped and Mono
+//! is asked to decide.
 use super::events::{append, NewEvent};
-use super::lifecycle::{cancel_attempt, notify};
+use super::guard::task_or_missing;
+use super::lifecycle::cancel_attempt;
+use super::notices::notify;
 use super::park::{move_rows, WAITING_ROWS};
 use super::recovery::SUPERSEDED;
 use super::states::apply;
@@ -41,6 +45,13 @@ pub struct Steer {
     pub plan: Option<Plan>,
 }
 
+/// An assignment the steer named or changed but could not move.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Skipped {
+    pub id: String,
+    pub reason: String,
+}
+
 /// What a steer did.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +63,8 @@ pub struct Steered {
     pub affected: Vec<String>,
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    /// Named or changed, but not movable.
+    pub skipped: Vec<Skipped>,
     /// Attempts asked to stop.
     pub stopping: Vec<String>,
     /// Nothing said which assignments are affected; Mono was asked.
@@ -59,10 +72,20 @@ pub struct Steered {
 }
 
 /// What a revised plan changes against the current assignments.
+#[derive(Default)]
 struct Diff {
     changed: Vec<Assignment>,
     added: Vec<(usize, Assignment)>,
     removed: Vec<String>,
+}
+
+/// What the steer touches, before anything is written.
+struct Assessment {
+    diff: Diff,
+    /// Named or changed (and not removed).
+    candidates: Vec<String>,
+    /// Nothing says what is affected.
+    unknown: bool,
 }
 
 fn changed(old: &Assignment, new: &Assignment) -> bool {
@@ -75,11 +98,7 @@ fn changed(old: &Assignment, new: &Assignment) -> bool {
 }
 
 fn diff(current: &[Assignment], plan: &Plan) -> Diff {
-    let mut out = Diff {
-        changed: Vec::new(),
-        added: Vec::new(),
-        removed: Vec::new(),
-    };
+    let mut out = Diff::default();
     for (position, new) in plan.tasks.iter().enumerate() {
         match current.iter().find(|a| a.id == new.id) {
             Some(old) if changed(old, new) => out.changed.push(Assignment {
@@ -99,10 +118,76 @@ fn diff(current: &[Assignment], plan: &Plan) -> Diff {
     out
 }
 
-fn task(tasks: &TaskStore<'_>, id: &str) -> Result<Task, TaskError> {
-    tasks
-        .task(id)?
-        .ok_or_else(|| TaskError::NotFound(format!("task:{id}")))
+/// Checks who asks, the requirements and the task's state.
+fn check(task: &Task, requester: Requester, requirements: &str) -> Result<(), TaskError> {
+    if !matches!(requester, Requester::User | Requester::Mono) {
+        return Err(TaskError::Invalid(
+            "Only the user or Mono steers a task.".into(),
+        ));
+    }
+    if requirements.is_empty() || requirements.len() > MAX_REQUIREMENTS {
+        return Err(TaskError::Invalid(format!(
+            "Give the new requirements (1 to {MAX_REQUIREMENTS} bytes)."
+        )));
+    }
+    if matches!(
+        task.lifecycle,
+        TaskLifecycle::Cancelled | TaskLifecycle::Completed
+    ) {
+        return Err(TaskError::InvalidState {
+            subject: format!("task:{}", task.id),
+            state: task.lifecycle.as_str().into(),
+        });
+    }
+    Ok(())
+}
+
+/// Which assignments the steer touches.
+fn assess(
+    task: &Task,
+    assignments: &[Assignment],
+    steer: &Steer,
+    requester: Requester,
+) -> Result<Assessment, TaskError> {
+    for named in &steer.assignments {
+        if !assignments.iter().any(|a| &a.id == named) {
+            return Err(TaskError::NotFound(format!("assignment:{named}")));
+        }
+    }
+    let diff = match &steer.plan {
+        Some(plan) => {
+            crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
+            diff(assignments, plan)
+        }
+        None => Diff::default(),
+    };
+    let mut candidates = steer.assignments.clone();
+    for a in &diff.changed {
+        if !candidates.contains(&a.id) {
+            candidates.push(a.id.clone());
+        }
+    }
+    candidates.retain(|a| !diff.removed.contains(a));
+    let unknown = candidates.is_empty() && diff.added.is_empty() && diff.removed.is_empty();
+    if unknown && requester == Requester::Mono {
+        return Err(TaskError::Invalid(
+            "Name the affected assignments (assignmentIds) or pass the revised plan.".into(),
+        ));
+    }
+    // Reopening accepted work needs an Active task (the table's rule).
+    let reopens_accepted = assignments
+        .iter()
+        .any(|a| candidates.contains(&a.id) && a.status == AssignmentState::Accepted);
+    if reopens_accepted && task.lifecycle != TaskLifecycle::Active {
+        return Err(TaskError::Invalid(
+            "Accepted work is reopened only while the task is active; resume it first.".into(),
+        ));
+    }
+    Ok(Assessment {
+        diff,
+        candidates,
+        unknown,
+    })
 }
 
 /// Records the steer as a new plan revision and applies it (see the module
@@ -115,112 +200,95 @@ pub fn steer(
     steer: &Steer,
     now: u64,
 ) -> Result<Steered, TaskError> {
-    if !matches!(requester, Requester::User | Requester::Mono) {
-        return Err(TaskError::Invalid(
-            "Only the user or Mono steers a task.".into(),
-        ));
-    }
     let requirements = steer.requirements.trim();
-    if requirements.is_empty() || requirements.len() > MAX_REQUIREMENTS {
-        return Err(TaskError::Invalid(format!(
-            "Give the new requirements (1 to {MAX_REQUIREMENTS} bytes)."
-        )));
-    }
     let tasks = store.tasks()?;
-    let current = task(&tasks, id)?;
-    if matches!(
-        current.lifecycle,
-        TaskLifecycle::Cancelled | TaskLifecycle::Completed
-    ) {
-        return Err(TaskError::InvalidState {
-            subject: format!("task:{id}"),
-            state: current.lifecycle.as_str().into(),
-        });
-    }
-    let assignments = tasks.assignments(id)?;
-    for named in &steer.assignments {
-        if !assignments.iter().any(|a| &a.id == named) {
-            return Err(TaskError::NotFound(format!("assignment:{named}")));
-        }
-    }
-    let diff = match &steer.plan {
-        Some(plan) => {
-            crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
-            diff(&assignments, plan)
-        }
-        None => Diff {
-            changed: Vec::new(),
-            added: Vec::new(),
-            removed: Vec::new(),
-        },
-    };
-    let mut affected: Vec<String> = steer.assignments.clone();
-    for a in &diff.changed {
-        if !affected.contains(&a.id) {
-            affected.push(a.id.clone());
-        }
-    }
-    affected.retain(|a| !diff.removed.contains(a));
-    let unknown = affected.is_empty() && diff.added.is_empty() && diff.removed.is_empty();
-    if unknown && requester == Requester::Mono {
-        return Err(TaskError::Invalid(
-            "Name the affected assignments (assignmentIds) or pass the revised plan.".into(),
-        ));
-    }
-    // Reopening accepted work needs an Active task (the table's rule).
-    let reopens_accepted = assignments
-        .iter()
-        .any(|a| affected.contains(&a.id) && a.status == AssignmentState::Accepted);
-    if reopens_accepted && current.lifecycle != TaskLifecycle::Active {
-        return Err(TaskError::Invalid(
-            "Accepted work is reopened only while the task is active; resume it first.".into(),
-        ));
-    }
+    let current = task_or_missing(&tasks, id)?;
+    check(&current, requester, requirements)?;
+    let assessment = assess(&current, &tasks.assignments(id)?, steer, requester)?;
     let tx = tasks.begin()?;
     let key = Subject::Task(id).key();
     let revision = key.bump(&tx, revision, "plan_revision=plan_revision+1", vec![], now)?;
-    let plan_revision = TaskStore { conn: &tx }
-        .task(id)?
-        .map_or(0, |t| t.plan_revision);
-    let mut stopping = Vec::new();
-    if !unknown {
-        apply_plan(&tx, id, &diff, now)?;
-        for assignment in &diff.removed {
-            stopping.extend(stop(&tx, id, assignment, AssignmentState::Cancelled, now)?);
-        }
-        for assignment in &affected {
-            stopping.extend(stop(&tx, id, assignment, AssignmentState::Queued, now)?);
+    let plan_revision = task_or_missing(&TaskStore { conn: &tx }, id)?.plan_revision;
+    let mut steered = Steered {
+        task_id: id.into(),
+        revision,
+        plan_revision,
+        affected: Vec::new(),
+        added: assessment
+            .diff
+            .added
+            .iter()
+            .map(|(_, a)| a.id.clone())
+            .collect(),
+        removed: assessment.diff.removed.clone(),
+        skipped: Vec::new(),
+        stopping: Vec::new(),
+        assessing: assessment.unknown,
+    };
+    if !assessment.unknown {
+        apply_changes(&tx, id, &assessment, &mut steered, now)?;
+    }
+    record(&tx, requirements, requester, &steered, now)?;
+    tx.commit()?;
+    Ok(steered)
+}
+
+/// Writes the revised plan, then stops dropped and affected work.
+fn apply_changes(
+    conn: &Connection,
+    task: &str,
+    assessment: &Assessment,
+    steered: &mut Steered,
+    now: u64,
+) -> Result<(), TaskError> {
+    apply_plan(conn, task, &assessment.diff, now)?;
+    for assignment in &assessment.diff.removed {
+        let moved = stop(conn, task, assignment, AssignmentState::Cancelled, now)?;
+        steered.stopping.extend(moved.stopping);
+    }
+    for assignment in &assessment.candidates {
+        let moved = stop(conn, task, assignment, AssignmentState::Queued, now)?;
+        steered.stopping.extend(moved.stopping);
+        match moved.skipped {
+            Some(reason) => steered.skipped.push(Skipped {
+                id: assignment.clone(),
+                reason,
+            }),
+            None => steered.affected.push(assignment.clone()),
         }
     }
-    let added: Vec<String> = diff.added.iter().map(|(_, a)| a.id.clone()).collect();
+    Ok(())
+}
+
+/// The steer's history entry, and Mono's question when nothing says what
+/// it affects.
+fn record(
+    conn: &Connection,
+    requirements: &str,
+    requester: Requester,
+    steered: &Steered,
+    now: u64,
+) -> Result<(), TaskError> {
+    let task = &steered.task_id;
     let payload = json!({
-        "requirements": requirements, "requester": requester, "planRevision": plan_revision,
-        "affected": affected, "added": added, "removed": diff.removed, "stopping": stopping,
-        "assessing": unknown,
+        "requirements": requirements, "requester": requester,
+        "planRevision": steered.plan_revision, "affected": steered.affected,
+        "added": steered.added, "removed": steered.removed, "skipped": steered.skipped,
+        "stopping": steered.stopping, "assessing": steered.assessing,
     });
     let event = NewEvent {
-        id: format!("steer:{id}@{plan_revision}"),
-        task_id: id.into(),
+        id: format!("steer:{task}@{}", steered.plan_revision),
+        task_id: task.clone(),
         assignment_id: None,
         attempt_id: None,
         kind: STEERED.into(),
         payload,
     };
-    append(&tx, &event, now)?;
-    if unknown {
-        notify(&tx, id, None, "task.steer_assess", requirements, now)?;
+    append(conn, &event, now)?;
+    if steered.assessing {
+        notify(conn, task, None, "task.steer_assess", requirements, now)?;
     }
-    tx.commit()?;
-    Ok(Steered {
-        task_id: id.into(),
-        revision,
-        plan_revision,
-        affected,
-        added,
-        removed: diff.removed,
-        stopping,
-        assessing: unknown,
-    })
+    Ok(())
 }
 
 /// Writes the revised plan's changed assignments and inserts its new ones
@@ -248,18 +316,45 @@ fn apply_plan(conn: &Connection, task: &str, diff: &Diff, now: u64) -> Result<()
     Ok(())
 }
 
-/// Stops the assignment's live worker (Cancelled, stop requested), drops a
-/// pending recovery of it, and moves the assignment to `to` (Queued again,
-/// or Cancelled when the plan dropped it). Returns the attempts asked to
-/// stop.
+/// What stopping one assignment did.
+struct Moved {
+    stopping: Vec<String>,
+    /// Why the assignment could not be moved, if it could not.
+    skipped: Option<String>,
+}
+
+/// Moves the assignment to `to` (Queued again, or Cancelled when the plan
+/// dropped it) and then stops its live worker (Cancelled, stop requested)
+/// and drops a pending recovery of it. An assignment the table cannot move
+/// (other than one already there) is left alone and reported.
 fn stop(
     conn: &Connection,
     task: &str,
     assignment: &str,
     to: AssignmentState,
     now: u64,
-) -> Result<Vec<String>, TaskError> {
+) -> Result<Moved, TaskError> {
     let tasks = TaskStore { conn };
+    let subject = Subject::Assignment {
+        task,
+        id: assignment,
+    };
+    let target = State::Assignment(to);
+    let from = tasks.state(subject, target)?;
+    if from != target {
+        if super::authorize(from, target, Requester::Coordinator).is_err() {
+            return Ok(Moved {
+                stopping: Vec::new(),
+                skipped: Some(format!(
+                    "it is {} and cannot become {}",
+                    from.as_str(),
+                    to.as_str()
+                )),
+            });
+        }
+        let revision = tasks.revision(subject)?;
+        apply(conn, subject, target, Requester::Coordinator, revision, now)?;
+    }
     let mut stopping = Vec::new();
     if let Some(attempt) = tasks.attempts(task, assignment)?.pop() {
         if cancel_attempt(conn, &attempt, now)? {
@@ -267,19 +362,10 @@ fn stop(
         }
     }
     move_rows(conn, task, Some(assignment), &WAITING_ROWS, SUPERSEDED, now)?;
-    let subject = Subject::Assignment {
-        task,
-        id: assignment,
-    };
-    let to = State::Assignment(to);
-    let from = tasks.state(subject, to)?;
-    // Accepted work a dropped assignment had stays accepted (the table
-    // never cancels it); everything else follows the table.
-    if from != to && super::authorize(from, to, Requester::Coordinator).is_ok() {
-        let revision = tasks.revision(subject)?;
-        apply(conn, subject, to, Requester::Coordinator, revision, now)?;
-    }
-    Ok(stopping)
+    Ok(Moved {
+        stopping,
+        skipped: None,
+    })
 }
 
 /// The requirement revisions a new worker's brief carries, oldest first, or

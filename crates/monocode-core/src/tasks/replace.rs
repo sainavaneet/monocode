@@ -6,14 +6,11 @@ use super::handoff::{self, Inputs};
 use super::launch::fail_assignment;
 use super::policy::Candidates;
 use super::recovery::{
-    self, block, block_reason, notify_mono, stop_delivery, Recovery, BLOCKED, BLOCK_PENDING,
-    EXHAUSTED, REPLACED, RETRY_BUDGET, SCHEDULED, STOP_STALL_MS,
+    self, block, block_reason, notify_mono, Recovery, BLOCKED, BLOCK_PENDING, EXHAUSTED, REPLACED,
+    RETRY_BUDGET, SCHEDULED,
 };
 use super::store::{ms, Key};
-use super::{
-    policy, Assignment, Attempt, DeliveryState, NewAttempt, Task, TaskError, TaskLifecycle,
-    TaskStore,
-};
+use super::{policy, Assignment, Attempt, NewAttempt, Task, TaskError, TaskLifecycle, TaskStore};
 use crate::accounts::eligibility::{self, AccountPlan, AllowedAccount};
 use crate::store::Store;
 use crate::usage::Failure;
@@ -147,26 +144,10 @@ impl<P: Policy> Coordinator<P> {
             return Ok(());
         }
         // Two agents never write one workspace: nothing replaces a worker
-        // whose stop the app has not confirmed. A stop that stays pending
-        // past STOP_STALL_MS is reported once (event and Mono notice).
-        if let Some(stop) = tasks.delivery(&stop_delivery(&attempt.id))? {
-            if stop.state != DeliveryState::Acknowledged {
-                if now >= stop.created_at.saturating_add(STOP_STALL_MS) {
-                    let reason = "The failed worker's session has not confirmed it stopped, so no replacement is started in its workspace. Check that its window is open and its turn ended.";
-                    let first = super::worker::payload_of(
-                        tasks.conn,
-                        &format!("recovery.stop_stalled:{}@1", attempt.id),
-                    )?
-                    .is_none();
-                    let tx = tasks.begin()?;
-                    notify_mono(&tx, attempt, "recovery.stop_stalled", reason, 1, now)?;
-                    tx.commit()?;
-                    if first {
-                        tick.stalled.push(attempt.id.clone());
-                    }
-                }
-                return Ok(());
-            }
+        // (or starts beside one sharing its workspace) whose stop the app
+        // has not confirmed; a stall is reported once (`guard`).
+        if self.held_by_stop(&tasks, &task.id, &assignment.id, now, tick)? {
+            return Ok(());
         }
         let due = row.state == BLOCKED || (row.state == SCHEDULED && now >= row.due_at);
         if !due {

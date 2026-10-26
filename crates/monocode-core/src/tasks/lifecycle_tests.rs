@@ -70,7 +70,12 @@ fn pausing_interrupts_workers_before_stopping_them_and_shows_pausing_until_confi
     let resumed = resume(&store, "t", revision, Requester::User, &[], NOW + 100).unwrap();
     assert_eq!(resumed.display, Display::Active);
     assert!(resumed.blocked.is_none());
+    // The paused worker's session is stopped again (the user may have typed
+    // into it): nothing launches until that is confirmed.
     coordinator().tick(&store, &launcher, NOW + 101).unwrap();
+    assert_eq!(launcher.count(), 1);
+    assert_eq!(stop_all(&store, NOW + 102), 1);
+    coordinator().tick(&store, &launcher, NOW + 103).unwrap();
     assert_eq!(launcher.count(), 2);
     let all = attempts(&store);
     assert_eq!(all.len(), 2);
@@ -182,7 +187,16 @@ fn a_user_stop_holds_the_worker_and_tells_mono_instead_of_failing_it() {
     )
     .unwrap();
     assert_eq!(resumed.attempts, vec![first.id]);
-    coordinator().tick(&store, &launcher, NOW + 91).unwrap();
+    // The user still drives the stopped session: resuming stops it first,
+    // and nothing launches until its turn has ended.
+    for later in 1..=3 {
+        coordinator()
+            .tick(&store, &launcher, NOW + 90 + later)
+            .unwrap();
+    }
+    assert_eq!(launcher.count(), 1);
+    assert_eq!(stop_all(&store, NOW + 95), 1);
+    coordinator().tick(&store, &launcher, NOW + 96).unwrap();
     assert_eq!(launcher.count(), 2);
 }
 
@@ -212,7 +226,7 @@ fn a_task_wide_question_makes_the_task_wait_until_it_is_answered() {
 }
 
 #[test]
-fn task_workers_are_not_subject_to_habit_timeouts() {
+fn the_coordinator_never_times_out_a_task_worker_past_habit_timeouts() {
     let repo = repo();
     let store = open(&repo);
     let launcher = Recorded::default();
