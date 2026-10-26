@@ -160,10 +160,20 @@ pub(in crate::tasks) fn claimed_with(
     .unwrap();
     let tick = coordinator.tick(store, &launcher, NOW + 3).unwrap();
     assert_eq!(tick.reviews.len(), 1, "{tick:?}");
+    // The app stops the worker that reported; review waits for that.
+    ack_stops(store);
     Claimed {
         coordinator,
         launcher,
         tree,
+    }
+}
+
+/// Confirms every requested worker stop, as the app does once each
+/// stopped session's turn has ended.
+pub(in crate::tasks) fn ack_stops(store: &Store) {
+    for stop in crate::tasks::recovery::pending_stops(store).unwrap() {
+        crate::tasks::recovery::stopped(store, &stop.delivery, NOW).unwrap();
     }
 }
 

@@ -90,6 +90,7 @@ fn finish(store: &Store, launcher: &FakeLauncher, task: &str, assignment: &str, 
         now + 1,
     )
     .unwrap();
+    crate::tasks::review::tests::ack_stops(store);
 }
 
 #[test]

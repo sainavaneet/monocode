@@ -5,6 +5,7 @@
 //! transaction with the transitions it asks for, checked against the table.
 use super::decisions::queue_for_mono;
 use super::events::{append, NewEvent};
+use super::guard::request_stop;
 use super::model::{Attempt, DecisionRequest, DecisionScope, DecisionState, NewDecision};
 use super::states::{
     apply, is_latest_attempt, state_enum, AssignmentState, AttemptState, Requester, State, Subject,
@@ -62,6 +63,11 @@ pub struct WorkerQuestion {
 /// most one and a replayed result finds it.
 pub(super) fn claim_event(attempt: &str) -> String {
     format!("claim:{attempt}")
+}
+
+/// The stop requested when an attempt reports its result.
+pub(super) fn claim_stop_delivery(attempt: &str) -> String {
+    format!("stop-claim:{attempt}")
 }
 
 pub(super) fn event(
@@ -313,6 +319,11 @@ impl TaskStore<'_> {
         let payload = serde_json::to_value(claim)?;
         let claimed = event(&attempt, claim_event(attempt_id), "attempt.claim", payload);
         append(&tx, &claimed, now)?;
+        // Its turn may still run after it reported: it is stopped, and
+        // nothing relaunches in its workspace (nor is its work reviewed)
+        // until the app confirms the turn ended.
+        let stop = format!("claim-stop:{attempt_id}");
+        request_stop(&tx, &attempt, stop, &claim_stop_delivery(attempt_id), now)?;
         if claim.outcome == ClaimOutcome::Succeeded {
             let succeeded = State::Attempt(AttemptState::Succeeded);
             let subject = Subject::Attempt(attempt_id);
@@ -366,3 +377,7 @@ impl TaskStore<'_> {
             .ok_or_else(|| TaskError::NotFound(format!("attempt:{attempt_id}")))
     }
 }
+
+#[cfg(test)]
+#[path = "claim_stop_tests.rs"]
+mod claim_stop_tests;

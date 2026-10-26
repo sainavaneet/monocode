@@ -166,6 +166,7 @@ impl Run {
             now + 1,
         )
         .unwrap();
+        crate::tasks::review::tests::ack_stops(&self.store);
         self.tick(now + 2);
         self.coordinator.review(&self.store, now + 3).unwrap()
     }

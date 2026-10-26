@@ -372,6 +372,13 @@ impl<P: Policy> Coordinator<P> {
             ) {
                 continue;
             }
+            // The worker that reported is stopped first, so nothing it
+            // still writes lands after the reviewed snapshot. A stop that
+            // stalls is reported to Mono once.
+            let mut ignored = super::coordinator::Tick::default();
+            if self.held_by_stop(&tasks, &task.id, &assignment.id, now, &mut ignored)? {
+                continue;
+            }
             let claim = tasks.claim(&attempt.id)?;
             let workspace = tasks
                 .workspaces(&task.id)?

@@ -410,6 +410,13 @@ fn failed_check_produces_a_correction(
     app.worker(worker, "done-1", "tasks.worker.result", claim);
     let tick = app.tick();
     assert_eq!(tick.reviews.len(), 1, "{tick:?}");
+    // The worker that reported is stopped; review waits for its turn to end.
+    assert!(app
+        .coordinator
+        .review(&app.store, app.now)
+        .unwrap()
+        .is_empty());
+    assert_eq!(stop_all(&app.store, app.now), 1);
     app.now += 1;
     let reviews = app.coordinator.review(&app.store, app.now).unwrap();
     assert_eq!(reviews[0].outcome, ReviewOutcome::Accepted, "{reviews:?}");
@@ -501,6 +508,13 @@ fn correction_verified_and_reported(app: &mut App, id: &str, tree: &std::path::P
     app.worker(worker, "done-2", "tasks.worker.result", claim);
     let tick = app.tick();
     assert_eq!(tick.reviews.len(), 1, "{tick:?}");
+    // The worker that reported is stopped; review waits for its turn to end.
+    assert!(app
+        .coordinator
+        .review(&app.store, app.now)
+        .unwrap()
+        .is_empty());
+    assert_eq!(stop_all(&app.store, app.now), 1);
     app.now += 1;
     let reviews = app.coordinator.review(&app.store, app.now).unwrap();
     assert_eq!(reviews[0].outcome, ReviewOutcome::Accepted, "{reviews:?}");

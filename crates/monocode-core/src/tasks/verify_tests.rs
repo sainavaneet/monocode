@@ -26,6 +26,7 @@ fn report(store: &Store, session: i64, request: &str, now: u64) {
         now,
     )
     .unwrap();
+    crate::tasks::review::tests::ack_stops(store);
 }
 
 #[test]

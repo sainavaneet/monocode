@@ -643,6 +643,7 @@ fn a_commit_made_after_commit_authority_was_revoked_is_sent_back_at_review() {
             NOW + 1,
         )
         .unwrap();
+        crate::tasks::review::tests::ack_stops(&store);
         let tick = coordinator.tick(&store, &launcher, NOW + 2).unwrap();
         assert_eq!(tick.reviews.len(), 1, "{tick:?}");
         let reviews = coordinator.review(&store, NOW + 3).unwrap();
