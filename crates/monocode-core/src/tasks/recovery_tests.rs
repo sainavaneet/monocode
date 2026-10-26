@@ -80,9 +80,14 @@ pub(in crate::tasks) fn launched(store: &Store, repo: &Repo, launcher: &Recorded
 
 /// As [`launched`], but the app never confirms the start.
 pub(in crate::tasks) fn launched_unconfirmed(store: &Store, repo: &Repo, launcher: &Recorded) {
+    launched_for(store, repo, launcher, "mono-1");
+}
+
+/// As [`launched_unconfirmed`], for a task that `mono` owns.
+pub(in crate::tasks) fn launched_for(store: &Store, repo: &Repo, launcher: &Recorded, mono: &str) {
     let new = NewTask {
         id: "t".into(),
-        mono_id: Some("mono-1".into()),
+        mono_id: Some(mono.into()),
         project: repo.root.to_string_lossy().into_owned(),
         title: "Ship it".into(),
         request: "Implement the feature".into(),

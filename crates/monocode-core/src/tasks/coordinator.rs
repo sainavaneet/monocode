@@ -70,13 +70,6 @@ pub trait Policy {
     fn worker_provider(&self, _task: &Task) -> String {
         "codex".into()
     }
-    /// Whether work interrupted by an app restart continues on its own once
-    /// the app is back (task-9's policy fills this in). A task reaches a
-    /// worker only once Mono or the user started it explicitly, so the
-    /// default continues; otherwise the task waits for a resume.
-    fn restart_continuation(&self, _task: &Task) -> bool {
-        true
-    }
 }
 
 /// The app's policy: each Mono's policy as the app published it

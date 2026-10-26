@@ -270,7 +270,16 @@ impl<P: Policy> Coordinator<P> {
 
     /// The effective policy for `task` (see [`effective`]).
     pub fn autonomy(&self, store: &Store, task: &Task) -> Result<Autonomy, TaskError> {
-        let snapshot = policy::of(&store.tasks()?, &task.id)?;
+        self.autonomy_in(&store.tasks()?, task)
+    }
+
+    /// As [`Self::autonomy`], reading the snapshot through `tasks`.
+    pub(super) fn autonomy_in(
+        &self,
+        tasks: &TaskStore<'_>,
+        task: &Task,
+    ) -> Result<Autonomy, TaskError> {
+        let snapshot = policy::of(tasks, &task.id)?;
         Ok(effective(snapshot.as_ref(), &self.policy.autonomy(task)))
     }
 
@@ -296,7 +305,17 @@ impl<P: Policy> Coordinator<P> {
 
     /// Whether `task`'s work interrupted by a restart continues on its own.
     pub fn restart_continues(&self, store: &Store, task: &Task) -> Result<bool, TaskError> {
-        Ok(self.autonomy(store, task)?.restart_continuation)
+        self.restart_continues_in(&store.tasks()?, task)
+    }
+
+    /// As [`Self::restart_continues`], reading the snapshot through `tasks`
+    /// (restart reconciliation runs on a task store it already holds).
+    pub(super) fn restart_continues_in(
+        &self,
+        tasks: &TaskStore<'_>,
+        task: &Task,
+    ) -> Result<bool, TaskError> {
+        Ok(self.autonomy_in(tasks, task)?.restart_continuation)
     }
 }
 

@@ -1,11 +1,13 @@
 //! Restart reconciliation against temporary Git repositories: a second
 //! coordinator (a new process) takes over after the old lease expired.
 use super::*;
+use crate::tasks::autonomy::{self, Autonomy, MonoAutonomy};
 use crate::tasks::coordinator::{ExplicitStart, LEASE_TTL_MS};
 use crate::tasks::decisions::tests::ask;
 use crate::tasks::lifecycle::{display, pause, resume, Display, Resume};
 use crate::tasks::recovery::tests::{
-    attempts, coordinator, fail, kinds, launched, launched_unconfirmed, stop_all, Recorded,
+    attempts, coordinator, fail, kinds, launched, launched_for, launched_unconfirmed, stop_all,
+    Recorded,
 };
 use crate::tasks::review::tests::{git, open, repo, scoped, NOW};
 use crate::tasks::store::tests::plan;
@@ -40,8 +42,11 @@ fn brief(store: &Store, session: i64) -> String {
 
 struct NoRestart;
 impl Policy for NoRestart {
-    fn restart_continuation(&self, _task: &Task) -> bool {
-        false
+    fn autonomy(&self, _task: &Task) -> Autonomy {
+        Autonomy {
+            restart_continuation: false,
+            ..Autonomy::default()
+        }
     }
 }
 
@@ -232,6 +237,45 @@ fn without_restart_continuation_the_task_waits_with_a_reason() {
     assert_eq!(current(&store).lifecycle, TaskLifecycle::Active);
     next.tick(&store, &launcher, LATER + 3).unwrap();
     assert_eq!(launcher.count(), 2);
+}
+
+#[test]
+fn a_mono_policy_without_restart_continuation_holds_the_task_after_a_restart() {
+    const MONO: &str = "mono-restart-policy-off";
+    let _published = autonomy::tests_lock();
+    let off = MonoAutonomy {
+        policy: Autonomy {
+            restart_continuation: false,
+            ..Autonomy::default()
+        },
+        ..MonoAutonomy::default()
+    };
+    autonomy::publish([(MONO.to_owned(), off)].into_iter().collect());
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    launched_for(&store, &repo, &launcher, MONO);
+    let session = launcher.last().0.id;
+    assert!(crate::tasks::confirm_started(&store, session, NOW).unwrap());
+    let task = current(&store);
+    assert!(!restarted().restart_continues(&store, &task).unwrap());
+
+    // The app's own policy (the published registry), not a test policy.
+    let startup = restarted().startup(&store, LATER).unwrap();
+    assert_eq!(startup.held.len(), 1);
+    let task = current(&store);
+    assert_eq!(task.lifecycle, TaskLifecycle::Waiting);
+    let reason = task.blocked_reason.unwrap();
+    assert!(
+        reason.contains("does not continue work after a restart"),
+        "{reason}"
+    );
+    assert_eq!(kinds(&store, "task.restart_held").len(), 1);
+    for later in 1..=3 {
+        restarted().tick(&store, &launcher, LATER + later).unwrap();
+    }
+    assert_eq!(launcher.count(), 1, "nothing relaunches");
+    assert_eq!(current(&store).lifecycle, TaskLifecycle::Waiting);
 }
 
 #[test]

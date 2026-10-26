@@ -124,7 +124,7 @@ impl<P: Policy> Coordinator<P> {
             return Ok(());
         }
         let task = task_or_missing(&tasks, id)?;
-        if !self.policy.restart_continuation(&task) {
+        if !self.restart_continues(store, &task)? {
             return Ok(());
         }
         let gone: Vec<Held> = workers

@@ -361,7 +361,8 @@ impl<P: Policy> Coordinator<P> {
         out: &mut Startup,
     ) -> Result<(), TaskError> {
         let dead = (self.liveness)(previous) == Liveness::Dead;
-        let continues = dead && self.policy.restart_continuation(task);
+        // The effective policy: the task's snapshot restricted by the live one.
+        let continues = dead && self.restart_continues_in(tasks, task)?;
         let (category, reason) = if dead {
             (RESTART, RESTART_REASON)
         } else {

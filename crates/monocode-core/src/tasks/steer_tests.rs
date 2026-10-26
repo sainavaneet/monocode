@@ -132,6 +132,10 @@ fn steering_stops_only_affected_workers() {
     let session = launcher.started.borrow()[2].id;
     let brief = store.follow_ups(session).unwrap().draft.unwrap().text;
     assert!(brief.contains("Support Windows paths too"), "{brief}");
+    // The production launch (dispatch -> reserve_with) carries the whole
+    // steering note, not only the requirement text.
+    let note = brief_note(&store.tasks().unwrap(), "t").unwrap().unwrap();
+    assert!(brief.contains(&note), "{brief}");
     let events = kinds(&store, "task.steered");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].payload["planRevision"], 2);
