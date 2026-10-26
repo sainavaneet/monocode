@@ -171,7 +171,7 @@ impl Monos {
             .child(work)
             .child(heading(
                 "Authority",
-                Some("Steps that change history beyond the task's worktree or ship it. Revoking one refuses it from then on, even for running tasks."),
+                Some("Steps that change history beyond the task's worktree or ship it. Revoking one reaches running tasks too: new steps are refused, and commits made after commit is revoked are sent back at review."),
             ))
             .child(authority)
             .child(heading("Recovery and billing", None))
@@ -381,7 +381,9 @@ impl Monos {
                     .child(description),
             )
             .children(rows)
-            .child(div().flex().flex_wrap().gap_1().children(adds))
+            .when(self.autonomy.loaded, |d| {
+                d.child(div().flex().flex_wrap().gap_1().children(adds))
+            })
     }
 
     /// The Mono's unfinished tasks, with Apply and Unblock.

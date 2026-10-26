@@ -69,6 +69,15 @@ fn saved(s: &Setup, visual: &mut VisualTestContext) -> autonomy::MonoAutonomy {
         .unwrap()
 }
 
+/// Leaves the process-wide published policy empty when a test ends, even
+/// when it fails.
+struct Unpublish;
+impl Drop for Unpublish {
+    fn drop(&mut self) {
+        autonomy::publish(Default::default());
+    }
+}
+
 fn lifecycle(s: &Setup) -> TaskLifecycle {
     let db = locked(&s.store).unwrap();
     db.tasks().unwrap().task("t").unwrap().unwrap().lifecycle
@@ -77,6 +86,7 @@ fn lifecycle(s: &Setup) -> TaskLifecycle {
 #[gpui::test]
 fn the_autonomy_section_edits_the_policy_applies_it_and_unblocks_a_task(cx: &mut TestAppContext) {
     let before = monocode_core::provider::test_guard::refused();
+    let _unpublish = Unpublish;
     let s = setup(cx);
     task(&s);
     let visual = &mut open_autonomy(&s, cx);
@@ -171,7 +181,54 @@ fn the_autonomy_section_edits_the_policy_applies_it_and_unblocks_a_task(cx: &mut
     assert_eq!(shown["revision"], 1);
     assert_eq!(shown["effective"]["push"], true);
 
-    // Leave the process-wide policy as other tests expect it.
-    autonomy::publish(Default::default());
     assert_eq!(monocode_core::provider::test_guard::refused(), before);
+}
+
+#[gpui::test]
+fn the_account_list_cannot_be_edited_until_a_new_scope_has_loaded(cx: &mut TestAppContext) {
+    let _unpublish = Unpublish;
+    let s = setup(cx);
+    let visual = &mut open_autonomy(&s, cx);
+    click(visual, "mono-autonomy-add-codex-default");
+    let saved = |scope: Scope<'_>| {
+        let db = locked(&s.store).unwrap();
+        eligibility::allowlist(&db, scope).unwrap()
+    };
+    assert!(saved(Scope::Mono(&s.id)).is_some());
+    // Switching scope and editing before the new scope's list has loaded
+    // changes nothing, rather than saving a list built from the old one.
+    let project = s.project.clone();
+    s.manager.update(visual, |m, cx| {
+        m.set_autonomy_scope(Some(project.clone()), cx);
+        let account = monocode_core::accounts::eligibility::AllowedAccount::new("codex", "default");
+        m.edit_allowlist(move |list| list.push(account), cx);
+    });
+    visual.run_until_parked();
+    assert_eq!(saved(Scope::MonoProject(&s.id, &s.project)), None);
+    // Once loaded, the project's list is editable.
+    click(visual, "mono-autonomy-add-codex-default");
+    assert!(saved(Scope::MonoProject(&s.id, &s.project)).is_some());
+}
+
+#[test]
+fn every_saved_count_shows_as_a_selected_option() {
+    use super::autonomy::{Control, fields};
+    for field in fields() {
+        let Control::Choice { options, get, .. } = field.control else {
+            continue;
+        };
+        for n in 0..=20u32 {
+            let policy = Autonomy {
+                worker_limit: n,
+                retry_limit: n,
+                ..Autonomy::default()
+            };
+            let value = get(&policy);
+            assert!(
+                options.iter().any(|(option, _)| *option == value),
+                "{} shows {value} with no option",
+                field.id
+            );
+        }
+    }
 }

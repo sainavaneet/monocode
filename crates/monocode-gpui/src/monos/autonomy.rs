@@ -47,8 +47,31 @@ pub(crate) struct Field {
 /// Why spending is not capped, shown beside the policy.
 pub(crate) const SPENDING_NOTE: &str = "Spending limits are not enforced. Providers report usage as plan windows (how much of a limit is used), not as cost, and API key billing is invoiced by the provider, so Monocode cannot see or cap what a task spends. Worker concurrency and the retry limit bound how much work a task starts; an account that runs out rests until its reported reset.";
 
-const WORKERS: &[(&str, &str)] = &[("1", "1"), ("2", "2"), ("3", "3"), ("4", "4"), ("8", "8")];
-const RETRIES: &[(&str, &str)] = &[("0", "0"), ("1", "1"), ("3", "3"), ("5", "5"), ("10", "10")];
+/// Every count the policy accepts (`Autonomy::normalized`), so a saved
+/// value always shows as selected.
+const WORKERS: &[(&str, &str)] = &[
+    ("1", "1"),
+    ("2", "2"),
+    ("3", "3"),
+    ("4", "4"),
+    ("5", "5"),
+    ("6", "6"),
+    ("7", "7"),
+    ("8", "8"),
+];
+const RETRIES: &[(&str, &str)] = &[
+    ("0", "0"),
+    ("1", "1"),
+    ("2", "2"),
+    ("3", "3"),
+    ("4", "4"),
+    ("5", "5"),
+    ("6", "6"),
+    ("7", "7"),
+    ("8", "8"),
+    ("9", "9"),
+    ("10", "10"),
+];
 const WORKSPACES: &[(&str, &str)] = &[
     ("automatic", "Automatic"),
     ("worktree", "Own worktree"),
@@ -79,7 +102,7 @@ pub(crate) fn fields() -> [Field; 12] {
             description: "How many workers one task runs at the same time. Lowering it starts no new worker until fewer are running; none is stopped.",
             control: Control::Choice {
                 options: WORKERS,
-                get: |p| p.worker_limit.to_string(),
+                get: |p| p.clone().normalized().worker_limit.to_string(),
                 set: |p, v| p.worker_limit = v.parse().unwrap_or(1),
             },
         },
@@ -179,7 +202,7 @@ pub(crate) fn fields() -> [Field; 12] {
             description: "How often recovery retries a failed worker, across account changes, before handing it to the Mono.",
             control: Control::Choice {
                 options: RETRIES,
-                get: |p| p.retry_limit.to_string(),
+                get: |p| p.clone().normalized().retry_limit.to_string(),
                 set: |p, v| p.retry_limit = v.parse().unwrap_or(0),
             },
         },
@@ -229,6 +252,11 @@ pub(super) struct PanelState {
     /// Accounts the app knows, with their labels.
     pub(super) known: Vec<(AllowedAccount, String)>,
     pub(super) error: Option<String>,
+    /// The scope's account list has loaded; until then it cannot be edited
+    /// (an edit would replace the saved list with one built from nothing).
+    pub(super) loaded: bool,
+    /// Bumped when the scope changes, so a load for the old scope is dropped.
+    generation: u64,
 }
 
 fn allowlist_scope<'a>(mono: &'a str, scope: Option<&'a str>) -> Scope<'a> {
@@ -295,6 +323,7 @@ impl Monos {
             return;
         };
         let scope = self.autonomy.scope.clone();
+        let generation = self.autonomy.generation;
         let store = self.store.clone();
         let work = cx
             .background_executor()
@@ -302,6 +331,9 @@ impl Monos {
         cx.spawn(async move |this, cx| {
             let loaded = work.await;
             let _ = this.update(cx, |this, cx| {
+                if this.autonomy.generation != generation {
+                    return;
+                }
                 match loaded {
                     Ok(Loaded {
                         tasks,
@@ -311,6 +343,7 @@ impl Monos {
                         this.autonomy.tasks = tasks;
                         this.autonomy.allowlist = allowlist;
                         this.autonomy.known = known;
+                        this.autonomy.loaded = true;
                     }
                     Err(error) => this.autonomy.error = Some(error),
                 }
@@ -323,7 +356,10 @@ impl Monos {
     /// Edits the Mono's policy, or the scope project's override of it.
     pub(super) fn set_autonomy_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
         self.autonomy.scope = scope;
+        self.autonomy.generation += 1;
+        self.autonomy.loaded = false;
         self.autonomy.allowlist = None;
+        self.autonomy.known.clear();
         self.refresh_autonomy(cx);
         cx.notify();
     }
@@ -378,6 +414,9 @@ impl Monos {
         let Some(mono) = self.active.clone() else {
             return;
         };
+        if !self.autonomy.loaded {
+            return;
+        }
         let scope = self.autonomy.scope.clone();
         let mut list = self.autonomy.allowlist.clone().unwrap_or_default();
         change(&mut list.accounts);
@@ -428,7 +467,9 @@ impl Monos {
         let revision = standing.task.revision;
         self.autonomy_work(
             move |store| {
-                app::unblock(store, &task, revision, Requester::User, now_ms())
+                store
+                    .tasks()
+                    .and_then(|tasks| tasks.unblock(&task, revision, Requester::User, now_ms()))
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             },
