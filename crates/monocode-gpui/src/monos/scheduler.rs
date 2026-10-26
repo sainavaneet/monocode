@@ -1212,6 +1212,7 @@ impl Monos {
     }
     pub(super) fn tick(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.check_habits(cx);
+        self.pump_tasks(cx);
         cx.notify();
     }
     fn check_habits(&mut self, cx: &mut Context<Self>) {

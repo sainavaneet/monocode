@@ -4,6 +4,7 @@ pub(crate) mod avatar;
 pub(crate) mod cards;
 mod changes;
 mod color_picker;
+mod decision_card;
 mod files;
 mod filters;
 mod floating;
@@ -18,6 +19,9 @@ mod scheduler;
 mod search;
 #[cfg(all(target_os = "macos", not(test)))]
 mod status;
+#[cfg(test)]
+mod task_tests;
+mod tasks;
 #[cfg(test)]
 mod tests;
 mod work;
@@ -149,6 +153,10 @@ pub(crate) struct Monos {
     session_filter_anchor: AnchorSlot,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
     app_pending: HashSet<(i64, String)>,
+    /// A task inbox pass is running in the background.
+    pumping_tasks: bool,
+    /// Answers handed to workers (`decision@revision`), never sent twice.
+    task_sent: HashSet<String>,
 }
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
@@ -372,6 +380,8 @@ impl Monos {
             session_filter_anchor: AnchorSlot::default(),
             app_results: HashMap::new(),
             app_pending: HashSet::new(),
+            pumping_tasks: false,
+            task_sent: HashSet::new(),
         };
         if let Some(rx) = rx {
             this._bridge_task = Some(cx.spawn(async move |this, cx| {
@@ -726,6 +736,7 @@ impl Monos {
                 this.observations.push(cx.subscribe(
                     &view,
                     move |this, _, event: &MonoSubmitted, cx| {
+                        this.user_reply(&source, &event.text, cx);
                         this.enqueue(
                             &source,
                             event.text.clone(),

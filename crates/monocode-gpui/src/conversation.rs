@@ -19,6 +19,7 @@ pub(crate) mod remote_plans;
 mod response_menu;
 #[cfg(test)]
 mod submission_tests;
+mod task_questions;
 mod title;
 use crate::{
     composer_motion::ComposerMotion,
@@ -197,6 +198,8 @@ pub(crate) struct Conversation {
     questions:
         std::collections::VecDeque<(Entity<crate::questions::QuestionCard>, Vec<Subscription>)>,
     question_overlay: crate::questions::Overlay,
+    /// Provider questions routed to Mono: (decision id, question id).
+    task_questions: Vec<(String, String)>,
     controls: Option<std::sync::mpsc::Sender<Control>>,
     branch: Option<String>,
     git: Option<monocode_core::git::Snapshot>,
@@ -635,6 +638,7 @@ impl Conversation {
             approval_ui: Default::default(),
             questions: Default::default(),
             question_overlay: Default::default(),
+            task_questions: Vec::new(),
             controls: None,
             branch: git.as_ref().and_then(|s| s.current.clone()),
             git,
@@ -1301,8 +1305,14 @@ impl Conversation {
                         }
                         for id in update.questions_resolved {
                             this.questions.retain(|(card, _)| card.read(cx).id() != id);
+                            this.forget_task_question(&id);
                         }
-                        for request in update.questions.into_iter().filter(|_| !stopping) {
+                        let questions = if stopping {
+                            Vec::new()
+                        } else {
+                            this.route_task_questions(update.questions)
+                        };
+                        for request in questions {
                             let card =
                                 cx.new(|cx| crate::questions::QuestionCard::new(request, cx));
                             let events = cx.subscribe(

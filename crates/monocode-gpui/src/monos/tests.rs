@@ -3,14 +3,14 @@ use gpui::{TestAppContext, WindowHandle};
 use monocode_core::store::Store;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, mpsc};
-struct Setup {
-    window: WindowHandle<Shell>,
-    manager: Entity<Monos>,
-    id: String,
-    project: String,
-    session: i64,
+pub(super) struct Setup {
+    pub(super) window: WindowHandle<Shell>,
+    pub(super) manager: Entity<Monos>,
+    pub(super) id: String,
+    pub(super) project: String,
+    pub(super) session: i64,
     root: PathBuf,
-    store: Database,
+    pub(super) store: Database,
 }
 
 #[gpui::test]
@@ -307,7 +307,7 @@ fn detail_pages_slide_over_the_overview_and_back_without_recreating_content(
         );
     }
 }
-fn setup(cx: &mut TestAppContext) -> Setup {
+pub(super) fn setup(cx: &mut TestAppContext) -> Setup {
     let dir = std::env::temp_dir().join(format!("native-monos-{}", mono::new_id()));
     std::fs::create_dir_all(&dir).unwrap();
     let project = dir.to_string_lossy().to_string();
@@ -350,7 +350,7 @@ fn setup(cx: &mut TestAppContext) -> Setup {
         store,
     }
 }
-fn call(
+pub(super) fn call(
     s: &Setup,
     request: &str,
     action: &str,

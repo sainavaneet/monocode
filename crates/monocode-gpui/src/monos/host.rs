@@ -4,7 +4,7 @@ use monocode_core::mono::{Document, Launch, bridge::Call, files, memory};
 use monocode_core::{app_access as app, session_groups::Groups, time::now_ms};
 use serde_json::{Value, json};
 use std::path::Path;
-enum Effect {
+pub(super) enum Effect {
     Card(Value),
     None,
     Start(
@@ -89,7 +89,7 @@ impl Monos {
             let _ = call.reply.send(reply.and(result));
         }));
     }
-    fn call_work(
+    pub(super) fn call_work(
         &mut self,
         call: Call,
         mono_id: String,
@@ -275,6 +275,10 @@ impl Monos {
             .or_else(|| self.running.get(&call.session).map(|r| &r.view))
             .cloned();
         let result = match action.as_str() {
+            task if app::MONO_TASK_ACTIONS.contains(&task) => {
+                self.task_call(call, mono, cx);
+                return;
+            }
             "models.list" => {
                 let profiles = Kind::ALL
                     .into_iter()

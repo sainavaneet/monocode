@@ -154,6 +154,7 @@ pub(crate) fn render(
     let kind = value["type"].as_str().unwrap_or_default();
     match kind {
         "document" => return artifact(value, cx),
+        "decision" => return super::decision_card::render(value, cx),
         "session" => {
             let id = value["sessionId"].as_i64().unwrap_or_default();
             let view = value["state"]
@@ -464,6 +465,15 @@ impl Monos {
             }
         }
         match value["type"].as_str().unwrap_or_default() {
+            "decision-answer" => {
+                if let (Some(decision), Some(revision), Some(text)) = (
+                    value["decisionId"].as_str(),
+                    value["revision"].as_u64(),
+                    value["text"].as_str(),
+                ) {
+                    self.answer_user_decision(mono, decision, revision, text, cx);
+                }
+            }
             "choice" => {
                 if let Some(text) = value["text"].as_str() {
                     self.enqueue(mono, text.into(), Vec::new(), false, cx);
