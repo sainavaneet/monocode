@@ -1363,9 +1363,11 @@ pub(super) fn respond(
     decision: Decision,
 ) -> Result<(), String> {
     let preference = match &decision {
+        // The request stays pending until a later decision answers it.
+        Decision::KeepOpen => return Ok(()),
         Decision::Allow => ["allow_once", "allow_always"],
         Decision::Session => ["allow_always", "allow_once"],
-        Decision::Deny | Decision::KeepOpen | Decision::Answer(_) | Decision::Steer(_) => {
+        Decision::Deny | Decision::Answer(_) | Decision::Steer(_) => {
             ["reject_once", "reject_always"]
         }
     };
@@ -1505,6 +1507,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last(&mut out)["result"]["outcome"]["outcome"], "cancelled");
+    }
+    #[test]
+    fn keep_open_leaves_the_permission_request_pending() {
+        let params = json!({"options":[{"optionId":"deny","kind":"reject_once"},{"optionId":"allow","kind":"allow_once"}]});
+        let mut out = Vec::new();
+        respond(&mut out, json!("permission"), &params, Decision::KeepOpen).unwrap();
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
     }
     #[test]
     fn tool_updates_preserve_identity_input_and_partial_results() {
