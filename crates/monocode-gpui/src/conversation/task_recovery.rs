@@ -4,6 +4,7 @@
 //! Recovery ignores every session that is not the live attempt of a task
 //! worker, and does nothing while the task coordinator is off.
 use super::*;
+use monocode_core::tasks::lifecycle;
 use monocode_core::tasks::recovery::{self, TurnEnd};
 
 /// How a finished turn ended, from the status the runtime reported and the
@@ -48,25 +49,46 @@ impl Conversation {
     }
 
     /// Called when a turn finishes; Mono chats and remote sessions are never
-    /// task workers.
-    pub(super) fn report_task_turn(&mut self, stopped: bool, cx: &mut Context<Self>) {
+    /// task workers. A worker session its task no longer owns (stopped,
+    /// cancelled, failed or replaced) says so in its status, so whatever the
+    /// user types there is visibly detached from the task.
+    pub(crate) fn report_task_turn(&mut self, stopped: bool, cx: &mut Context<Self>) {
         if self.settings.mono.is_some() || self.is_remote() {
             return;
         }
         let end = turn_end(&self.status, stopped, self.settings.usage_limit.as_ref());
         let store = self.store.clone();
         let session = self.summary.id;
-        cx.background_executor()
-            .spawn(async move {
-                let now = monocode_core::time::now_ms();
-                let result = locked(&store).map_err(|e| e.to_string()).and_then(|store| {
-                    recovery::turn_ended(&store, session, &end, now).map_err(|e| e.to_string())
-                });
-                if let Err(error) = result {
-                    eprintln!("Task recovery for session {session}: {error}");
-                }
-            })
-            .detach();
+        let work = cx.background_executor().spawn(async move {
+            let now = monocode_core::time::now_ms();
+            let store = locked(&store)?;
+            if let Err(error) = recovery::turn_ended(&store, session, &end, now) {
+                eprintln!("Task recovery for session {session}: {error}");
+            }
+            lifecycle::detached(&store, session).map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| match work.await {
+            Ok(Some(notice)) => {
+                let _ = this.update(cx, |this, cx| this.show_detached(notice, cx));
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("Task recovery for session {session}: {error}"),
+        })
+        .detach();
+    }
+
+    /// Shows that this worker session no longer belongs to its task.
+    pub(crate) fn show_detached(&mut self, notice: String, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.status = notice;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status_for_test(&self) -> &str {
+        &self.status
     }
 }
 

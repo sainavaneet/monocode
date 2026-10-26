@@ -2,6 +2,7 @@
 //! overlapping file scopes gate dispatch; approvals stay in each worker's chat.
 use super::*;
 use crate::conversation::orchestration_card::TaskProgress;
+use crate::conversation::task_controls::TaskControl;
 use monocode_core::{
     agent::Settings,
     orchestration::{self, Plan, Task},
@@ -29,6 +30,39 @@ pub(super) struct Run {
     tasks: Vec<Assignment>,
     stopped: bool,
 }
+/// Carries out a pause, resume, cancel or steer the user chose on a plan
+/// card's task row, as the user, through the same core path as Mono's
+/// `tasks.*` commands (the transition table, revisions, interrupt before
+/// stop). The store is used off the main thread; the card shows the result.
+pub(crate) fn apply_task_control(
+    store: Database,
+    control: TaskControl,
+    view: gpui::WeakEntity<Conversation>,
+    cx: &mut App,
+) {
+    let request = control.clone();
+    let work = cx.background_executor().spawn(async move {
+        let mut input = serde_json::json!({"revision": request.revision});
+        if let Some(requirements) = &request.requirements {
+            input["requirements"] = serde_json::json!(requirements);
+        }
+        let store = locked(&store)?;
+        monocode_core::app_access::task_control(
+            &store,
+            &request.task_id,
+            request.action,
+            &input,
+            monocode_core::tasks::Requester::User,
+            monocode_core::time::now_ms(),
+        )
+    });
+    cx.spawn(async move |cx| {
+        let result = work.await;
+        let _ = view.update(cx, |view, cx| view.task_control_done(&control, result, cx));
+    })
+    .detach();
+}
+
 impl Shell {
     pub(super) fn observe_orchestration(
         &mut self,
@@ -49,6 +83,12 @@ impl Shell {
         self.observations.push(
             cx.subscribe(view, move |this, _, _: &StopOrchestration, cx| {
                 this.stop_orchestration(id, cx)
+            }),
+        );
+        let store = self.store.clone();
+        self.observations.push(
+            cx.subscribe(view, move |_, view, control: &TaskControl, cx| {
+                apply_task_control(store.clone(), control.clone(), view.downgrade(), cx)
             }),
         );
         self.observations.push(cx.subscribe(

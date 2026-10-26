@@ -112,6 +112,7 @@ impl Conversation {
         if self.orchestration_plan.is_none()
             && self.orchestration_error.is_none()
             && self.orchestration_progress.is_none()
+            && self.task_controls.is_empty()
         {
             return None;
         }
@@ -141,6 +142,7 @@ impl Conversation {
                 })
                 .child(self.orchestration_tasks(plan, progress, cx))
             })
+            .children(self.task_control_rows(cx))
             .when_some(self.orchestration_error.clone(), |card, error| {
                 card.child(self.orchestration_error_row(error, cx))
             })

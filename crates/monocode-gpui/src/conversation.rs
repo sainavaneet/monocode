@@ -20,6 +20,7 @@ pub(crate) mod remote_plans;
 mod response_menu;
 #[cfg(test)]
 mod submission_tests;
+pub(crate) mod task_controls;
 mod task_questions;
 pub(crate) mod task_recovery;
 mod title;
@@ -165,8 +166,10 @@ pub(crate) struct Conversation {
     pub(crate) app_read_only: bool,
     planning_orchestration: bool,
     pub(crate) orchestration_plan: Option<monocode_core::orchestration::Plan>,
-    orchestration_error: Option<String>,
+    pub(crate) orchestration_error: Option<String>,
     pub(crate) orchestration_progress: Option<Vec<orchestration_card::TaskProgress>>,
+    /// The Mono's durable tasks with their pause, resume, cancel and steer.
+    pub(crate) task_controls: Vec<monocode_core::tasks::lifecycle::ControlRow>,
     /// Plan assignments whose full instructions are unfolded in the card.
     orchestration_open: std::collections::HashSet<String>,
     status: String,
@@ -606,6 +609,7 @@ impl Conversation {
             orchestration_plan: None,
             orchestration_error: None,
             orchestration_progress: None,
+            task_controls: Vec::new(),
             orchestration_open: Default::default(),
             status: "Loading conversation…".into(),
             loaded: false,

@@ -25,7 +25,7 @@ use super::{
 };
 use crate::store::Store;
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// The recovery category of an attempt a pause interrupted.
@@ -36,7 +36,7 @@ const DECISION: &str = "decision";
 
 /// What the task shows: its lifecycle, with Pausing and Cancelling while a
 /// worker it stopped has not confirmed it stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Display {
     Active,

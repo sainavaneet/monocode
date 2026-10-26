@@ -11,6 +11,7 @@ use monocode_core::store::Session;
 use monocode_core::tasks;
 use monocode_core::tasks::coordinator::{Coordinator, ExplicitStart, Launcher, TICK_INTERVAL_MS};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Where coordinator launches are installed (the latest Shell to start its
@@ -224,6 +225,51 @@ fn holder() -> String {
     )
 }
 
+/// The process's one coordinator: startup reconciliation and the ticker
+/// share its lease holder, so a task this process reconciled is never taken
+/// over by itself.
+fn coordinator() -> &'static Coordinator<ExplicitStart> {
+    static COORDINATOR: OnceLock<Coordinator<ExplicitStart>> = OnceLock::new();
+    COORDINATOR.get_or_init(|| Coordinator::new(holder(), ExplicitStart))
+}
+
+/// The restart sequence, run once at launch off the main thread and only
+/// when `native-task-coordinator` is enabled (`Coordinator::startup`): take
+/// each unfinished task's lease (staying passive where another app holds
+/// it; the ticker retries), mark workers that died with the last run as
+/// Interrupted, check recorded worktrees, restore waiting decisions, and
+/// leave paused tasks paused. The ticker then resumes what the policy allows.
+pub(crate) fn reconcile_startup(store: Database) -> Option<std::thread::JoinHandle<()>> {
+    let spawned = std::thread::Builder::new()
+        .name("task-startup".into())
+        .spawn(move || {
+            let now = monocode_core::time::now_ms();
+            let startup = locked(&store).and_then(|store| {
+                coordinator()
+                    .startup(&store, now)
+                    .map_err(|e| e.to_string())
+            });
+            match startup {
+                Ok(startup) if startup.enabled => {
+                    if !startup.errors.is_empty() {
+                        eprintln!("Task startup: {}", startup.errors.join("; "));
+                    }
+                    if !startup.missing.is_empty() {
+                        eprintln!(
+                            "Task startup: missing or moved workspaces block their tasks: {}",
+                            startup.missing.join(", ")
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("Task startup: {error}"),
+            }
+        });
+    spawned
+        .map_err(|error| eprintln!("Task startup could not start: {error}"))
+        .ok()
+}
+
 /// Registers the coordinator once per process; later calls only retarget the
 /// Shell that installs launched workers.
 pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
@@ -328,7 +374,7 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
     let executor = cx.background_executor().clone();
     cx.background_executor()
         .spawn(async move {
-            let coordinator = Coordinator::new(holder(), ExplicitStart);
+            let coordinator = coordinator();
             let launcher = ShellLauncher(launches);
             loop {
                 executor
@@ -354,10 +400,10 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                     Err(error) => eprintln!("Task coordinator: {error}"),
                     Ok(_) => {}
                 }
-                if let Err(error) = review_claims(&coordinator, &store) {
+                if let Err(error) = review_claims(coordinator, &store) {
                     eprintln!("Task coordinator review: {error}");
                 }
-                if let Err(error) = verify_tasks(&coordinator, &store) {
+                if let Err(error) = verify_tasks(coordinator, &store) {
                     eprintln!("Task coordinator verification: {error}");
                 }
                 let _ = pumps.try_send(());

@@ -397,6 +397,9 @@ fn main() {
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
     let db = Arc::new(Mutex::new(db));
+    // Tasks that ran when the app last quit are reconciled before the
+    // coordinator resumes any of them (only with native-task-coordinator on).
+    let _startup = runtime::coordinator::reconcile_startup(db.clone());
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
     gpui::Application::with_platform(platform)

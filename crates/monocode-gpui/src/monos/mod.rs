@@ -753,6 +753,20 @@ impl Monos {
                         )
                     },
                 ));
+                this.observations.push(cx.subscribe(
+                    &view,
+                    move |this,
+                          view,
+                          control: &crate::conversation::task_controls::TaskControl,
+                          cx| {
+                        crate::shell::orchestration::apply_task_control(
+                            this.store.clone(),
+                            control.clone(),
+                            view.downgrade(),
+                            cx,
+                        )
+                    },
+                ));
                 let source = id.clone();
                 this.observations.push(cx.subscribe(
                     &view,

@@ -16,7 +16,7 @@ mod live_agents;
 mod mobile_host;
 pub(crate) mod monos;
 mod notifications;
-mod orchestration;
+pub(crate) mod orchestration;
 mod picker_preferences;
 mod project_rail;
 mod project_removal;
@@ -37,6 +37,8 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+#[cfg(test)]
+mod task_lifecycle_tests;
 mod task_recovery;
 mod terminal_dock;
 mod title_tabs;

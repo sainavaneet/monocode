@@ -7,12 +7,16 @@ use super::*;
 use monocode_core::app_access as app;
 use monocode_core::mono::bridge::Call;
 use monocode_core::tasks::decisions::{self, Handoff, ReplyMatch};
-use monocode_core::tasks::{Requester, coordinator, inbox};
+use monocode_core::tasks::{Requester, coordinator, inbox, lifecycle};
 use monocode_core::time::now_ms;
 
-/// What one pass found: per Mono the batch to deliver, and answers owed to
-/// workers with their session handles.
-type Pass = (Vec<(String, inbox::Batch)>, Vec<(i64, Handoff)>);
+/// What one pass found: per Mono the batch to deliver, answers owed to
+/// workers with their session handles, and per Mono its tasks' controls.
+type Pass = (
+    Vec<(String, inbox::Batch)>,
+    Vec<(i64, Handoff)>,
+    Vec<(String, Vec<lifecycle::ControlRow>)>,
+);
 
 impl Monos {
     /// `tasks.decisions.*`, `tasks.review.*` and `tasks.criteria.verify` from
@@ -77,7 +81,10 @@ impl Monos {
             }
             let now = now_ms();
             let mut batches = Vec::new();
+            let mut controls = Vec::new();
             for (mono, session) in monos {
+                let rows = lifecycle::controls(&db, &mono).map_err(|e| e.to_string())?;
+                controls.push((mono.clone(), rows));
                 if let Some(session) = session {
                     inbox::acknowledge_delivered(&db, &mono, session, now)
                         .map_err(|e| e.to_string())?;
@@ -99,14 +106,19 @@ impl Monos {
                     handoffs.push((handle, handoff));
                 }
             }
-            Ok(Some((batches, handoffs)))
+            Ok(Some((batches, handoffs, controls)))
         });
         cx.spawn(async move |this, cx| {
             let pass = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.pumping_tasks = false;
                 match pass {
-                    Ok(Some((batches, handoffs))) => {
+                    Ok(Some((batches, handoffs, controls))) => {
+                        for (mono, rows) in controls {
+                            if let Some(chat) = this.chats.get(&mono) {
+                                chat.update(cx, |chat, cx| chat.set_task_controls(rows, cx));
+                            }
+                        }
                         for (mono, batch) in batches {
                             this.deliver_batch(&mono, batch, cx);
                         }

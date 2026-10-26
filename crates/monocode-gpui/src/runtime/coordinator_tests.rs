@@ -402,3 +402,36 @@ fn a_worker_that_hits_its_usage_limit_continues_on_the_next_allowed_account() {
     assert!(brief.contains("Hand-off from attempt"), "{brief}");
     assert!(brief.contains("Write src/feature.rs"));
 }
+
+/// The app's startup sequence (run from `main`): a worker that was running
+/// when the last run quit is Interrupted, with a recovery row that
+/// continues it, before the ticker resumes anything.
+#[test]
+fn startup_interrupts_workers_that_died_with_the_last_run() {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    store.save_setting(FLAG, "enabled").unwrap();
+    monocode_core::tasks::fixtures::running_worker(&store, "mono-1", "/work/monocode").unwrap();
+    // The run that quit held the task's lease; it has long expired.
+    store
+        .tasks()
+        .unwrap()
+        .acquire_lease("task:t", "monocode-native:quit", 1, 0)
+        .unwrap();
+    let store: Database = std::sync::Arc::new(std::sync::Mutex::new(store));
+    super::coordinator::reconcile_startup(store.clone())
+        .unwrap()
+        .join()
+        .unwrap();
+    let store = locked(&store).unwrap();
+    let tasks = store.tasks().unwrap();
+    let attempt = tasks.attempt("x").unwrap().unwrap();
+    assert_eq!(
+        attempt.status,
+        monocode_core::tasks::AttemptState::Interrupted
+    );
+    let row = monocode_core::tasks::recovery::recovery(&tasks, "x")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.failure, monocode_core::tasks::restart::RESTART);
+    assert_eq!(row.state, "scheduled");
+}
