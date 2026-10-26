@@ -28,7 +28,8 @@ use super::guard::{may_be_running, task_or_missing};
 use super::notices::notify;
 use super::park::park;
 use super::recovery::{HELD, SCHEDULED};
-use super::waiting::{activate, sync_waiting, wait_for, waiting_cause, TAKEOVER};
+use super::takeover;
+use super::waiting::{sync_waiting, wait_for, TAKEOVER};
 use super::workspace_check::{self, Problem};
 use super::{NewEvent, Task, TaskError, TaskLifecycle, TaskStore, Workspace};
 use crate::store::Store;
@@ -124,6 +125,23 @@ fn unfinished(tasks: &TaskStore<'_>) -> Result<Vec<String>, TaskError> {
     Ok(ids.collect::<Result<_, _>>()?)
 }
 
+/// Unfinished tasks the coordinator schedules (Ready or Implementing) or
+/// with a worker that may still run or is held.
+fn working(tasks: &TaskStore<'_>) -> Result<Vec<String>, TaskError> {
+    let mut statement = tasks.conn.prepare(
+        "SELECT t.id FROM native_tasks t WHERE t.lifecycle NOT IN ('cancelled','completed')
+           AND (t.stage IN ('ready','implementing')
+             OR EXISTS(SELECT 1 FROM native_task_attempts a WHERE a.task_id=t.id
+               AND (a.status IN ('running','waiting')
+                 OR (a.status='starting' AND a.session_id IS NOT NULL)))
+             OR EXISTS(SELECT 1 FROM native_task_recoveries r WHERE r.task_id=t.id
+               AND r.state='held'))
+         ORDER BY t.rowid",
+    )?;
+    let ids = statement.query_map([], |row| row.get(0))?;
+    Ok(ids.collect::<Result<_, _>>()?)
+}
+
 fn marker(id: String, task: &str, kind: &str, payload: serde_json::Value) -> NewEvent {
     NewEvent {
         id,
@@ -153,6 +171,26 @@ impl<P: Policy> Coordinator<P> {
         store: &Store,
         now: u64,
     ) -> Result<(Startup, Pending), TaskError> {
+        self.prepare(store, now, true)
+    }
+
+    /// The same store part for a running app, each tick: only tasks that
+    /// have work to schedule or a worker that may run or is held, so a
+    /// paused or still-planning task stays free for another app to pick up.
+    pub fn takeover_prepare(
+        &self,
+        store: &Store,
+        now: u64,
+    ) -> Result<(Startup, Pending), TaskError> {
+        self.prepare(store, now, false)
+    }
+
+    fn prepare(
+        &self,
+        store: &Store,
+        now: u64,
+        every: bool,
+    ) -> Result<(Startup, Pending), TaskError> {
         let mut out = Startup::default();
         let mut pending = Vec::new();
         if !enabled(store) {
@@ -160,7 +198,12 @@ impl<P: Policy> Coordinator<P> {
         }
         out.enabled = true;
         let tasks = store.tasks()?;
-        for id in unfinished(&tasks)? {
+        let ids = if every {
+            unfinished(&tasks)?
+        } else {
+            working(&tasks)?
+        };
+        for id in ids {
             match self.take(&tasks, &id, now) {
                 Err(TaskError::LeaseHeld { .. }) => out.leased_elsewhere.push(id),
                 Err(error) => out.errors.push(format!("{id}: {error}")),
@@ -275,8 +318,7 @@ impl<P: Policy> Coordinator<P> {
         if finished {
             return Ok(Some(Vec::new()));
         }
-        let dead = (self.liveness)(&previous) == Liveness::Dead;
-        self.interrupt_running(&tasks, &task, dead, now, out)?;
+        self.interrupt_running(&tasks, &task, &previous, now, out)?;
         out.restored.extend(restore_decisions(&tasks, id, now)?);
         sync_waiting(&tasks, id, now)?;
         Ok(Some(workspace_check::to_check(&tasks, id)?))
@@ -314,10 +356,11 @@ impl<P: Policy> Coordinator<P> {
         &self,
         tasks: &TaskStore<'_>,
         task: &Task,
-        dead: bool,
+        previous: &str,
         now: u64,
         out: &mut Startup,
     ) -> Result<(), TaskError> {
+        let dead = (self.liveness)(previous) == Liveness::Dead;
         let continues = dead && self.policy.restart_continuation(task);
         let (category, reason) = if dead {
             (RESTART, RESTART_REASON)
@@ -336,6 +379,11 @@ impl<P: Policy> Coordinator<P> {
                 continue;
             }
             park(&tx, &attempt, category, reason, state, false, now)?;
+            if !dead {
+                // Judged against the holder that ran it, however many
+                // takeovers follow.
+                takeover::record_owner(&tx, &attempt, previous, now)?;
+            }
             out.interrupted.push(attempt.id.clone());
             if !continues {
                 held.push(attempt.id);
@@ -354,85 +402,6 @@ impl<P: Policy> Coordinator<P> {
         out.held.extend(held);
         Ok(())
     }
-
-    /// Workers held because the previous holder might still run them
-    /// continue once that holder's process is gone (and the policy continues
-    /// after a restart), whatever the task's lifecycle; a task waiting only
-    /// for them is Active again.
-    pub(super) fn release_takeover(
-        &self,
-        store: &Store,
-        id: &str,
-        now: u64,
-    ) -> Result<(), TaskError> {
-        let tasks = store.tasks()?;
-        if !takeover_held(tasks.conn, id)? {
-            return Ok(());
-        }
-        let Some(previous) = self.previous_holder(&tasks, id)? else {
-            return Ok(());
-        };
-        let task = task_or_missing(&tasks, id)?;
-        if (self.liveness)(&previous) != Liveness::Dead || !self.policy.restart_continuation(&task)
-        {
-            return Ok(());
-        }
-        let tx = tasks.begin()?;
-        release_takeover_rows(&tx, id, now)?;
-        if waiting_cause(&tx, id)?.as_deref() == Some(TAKEOVER) {
-            activate(&tx, id, now)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-}
-
-/// Whether workers of the task are held because a previous holder might
-/// still run them (independent of the task's lifecycle).
-pub(super) fn takeover_held(conn: &rusqlite::Connection, task: &str) -> Result<bool, TaskError> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM native_task_recoveries WHERE task_id=?1 AND category=?2 AND state=?3)",
-        rusqlite::params![task, TAKEOVER, HELD],
-        |row| row.get(0),
-    )?)
-}
-
-/// Schedules the task's takeover-held workers now.
-pub(super) fn release_takeover_rows(
-    conn: &rusqlite::Connection,
-    task: &str,
-    now: u64,
-) -> Result<Vec<String>, TaskError> {
-    let held: Vec<String> = {
-        let mut statement = conn.prepare(
-            "SELECT attempt_id FROM native_task_recoveries WHERE task_id=?1 AND category=?2 AND state=?3",
-        )?;
-        let rows =
-            statement.query_map(rusqlite::params![task, TAKEOVER, HELD], |row| row.get(0))?;
-        rows.collect::<Result<_, _>>()?
-    };
-    conn.execute(
-        "UPDATE native_task_recoveries SET state=?2,due_at=?3,revision=revision+1,updated_at=?3
-         WHERE task_id=?1 AND category=?4 AND state=?5",
-        rusqlite::params![task, SCHEDULED, super::store::ms(now), TAKEOVER, HELD],
-    )?;
-    Ok(held)
-}
-
-/// The holder the task was last taken over from, by any holder.
-pub(super) fn last_previous_holder(
-    conn: &rusqlite::Connection,
-    task: &str,
-) -> Result<Option<String>, TaskError> {
-    Ok(conn
-        .query_row(
-            "SELECT json_extract(payload,'$.previous') FROM native_task_events
-             WHERE task_id=?1 AND kind='task.lease_taken_over' ORDER BY seq DESC LIMIT 1",
-            [task],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten())
 }
 
 /// Runs the Git checks for what [`Coordinator::startup_prepare`] returned;

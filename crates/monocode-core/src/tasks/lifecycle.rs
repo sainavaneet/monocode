@@ -17,10 +17,8 @@ use super::events::{append, NewEvent};
 use super::guard::{may_be_running, request_stop, task_or_missing, task_stopping};
 use super::park::{move_rows, park, WAITING_ROWS};
 use super::recovery::{stop_delivery, HELD, SCHEDULED, SUPERSEDED};
-use super::restart::{
-    last_previous_holder, native_liveness, release_takeover_rows, takeover_held, Liveness,
-};
 use super::states::apply;
+use super::takeover;
 use super::waiting::{waiting_cause, RESTART, TAKEOVER};
 use super::worker::settle;
 use super::{
@@ -73,6 +71,8 @@ pub struct ControlRow {
     pub task_id: String,
     pub title: String,
     pub revision: u64,
+    /// What a steer is checked against.
+    pub plan_revision: u64,
     pub display: Display,
     /// Why it waits or is blocked.
     pub reason: Option<String>,
@@ -232,13 +232,6 @@ pub struct Resume {
     pub confirmed_stopped: bool,
 }
 
-/// Whether resuming takeover-held workers needs the caller's confirmation:
-/// the holder they were taken from is not provably gone.
-fn needs_confirmation(conn: &Connection, task: &str) -> Result<bool, TaskError> {
-    let previous = last_previous_holder(conn, task)?.unwrap_or_default();
-    Ok(native_liveness(&previous) != Liveness::Dead)
-}
-
 /// Whether resuming applies to the task as it is: paused, or waiting
 /// because a restart or a takeover held its workers.
 fn reopens(conn: &Connection, task: &Task) -> Result<bool, TaskError> {
@@ -280,8 +273,13 @@ pub fn resume(
         });
     }
     let reopen = reopens(tasks.conn, &current)?;
-    let takeover = takeover_held(tasks.conn, id)?;
-    if takeover && !request.confirmed_stopped && needs_confirmation(tasks.conn, id)? {
+    // Takeover-held workers of the assignments asked for (all when none).
+    let held = takeover::held(tasks.conn, id, assignments)?;
+    let takeover = !held.is_empty();
+    if takeover
+        && !request.confirmed_stopped
+        && takeover::needs_confirmation(tasks.conn, id, assignments)?
+    {
         return Err(TaskError::Invalid(
             "Another app or process held this task and may still be running its workers. Make sure they are stopped, then resume with confirmedStopped: true.".into(),
         ));
@@ -311,7 +309,7 @@ pub fn resume(
     }
     let mut released = Vec::new();
     if takeover {
-        released.extend(release_takeover_rows(&tx, id, now)?);
+        released.extend(takeover::release(&tx, &held, now)?);
     }
     if assignments.is_empty() {
         released.extend(move_rows(&tx, id, None, &[HELD], SCHEDULED, now)?);
@@ -430,13 +428,14 @@ pub fn controls(store: &Store, mono: &str) -> Result<Vec<ControlRow>, TaskError>
             Display::Blocked | Display::Waiting => task.blocked_reason.clone(),
             _ => None,
         };
-        let takeover = takeover_held(tasks.conn, &task.id)?;
+        let takeover = takeover::any_held(tasks.conn, &task.id)?;
         rows.push(ControlRow {
             resumable: takeover || reopens(tasks.conn, &task)?,
-            confirm_stopped: takeover && needs_confirmation(tasks.conn, &task.id)?,
+            confirm_stopped: takeover && takeover::needs_confirmation(tasks.conn, &task.id, &[])?,
             task_id: task.id,
             title: task.title,
             revision: task.revision,
+            plan_revision: task.plan_revision,
             display,
             reason,
         });

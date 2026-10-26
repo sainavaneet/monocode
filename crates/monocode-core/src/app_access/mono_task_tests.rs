@@ -126,7 +126,14 @@ fn mono_pauses_resumes_steers_and_cancels_only_its_own_tasks() {
     )
     .unwrap();
     assert_eq!(resumed["display"], "active");
-    let steer = json!({"taskId": "t", "revision": revision(), "requirements": "Also log errors",
+    let plan = store
+        .tasks()
+        .unwrap()
+        .task("t")
+        .unwrap()
+        .unwrap()
+        .plan_revision;
+    let steer = json!({"taskId": "t", "revision": plan, "requirements": "Also log errors",
         "assignmentIds": ["a"]});
     assert!(call("mono-2", "tasks.steer", steer.clone()).is_err());
     let steered = call("mono-1", "tasks.steer", steer).unwrap();
@@ -148,24 +155,27 @@ fn mono_pauses_resumes_steers_and_cancels_only_its_own_tasks() {
 }
 
 #[test]
-fn a_steer_against_an_older_revision_says_the_plan_changed() {
+fn a_steer_against_an_older_plan_revision_says_the_plan_changed() {
     let (store, _) = fixture();
-    let read = store.tasks().unwrap().task("t").unwrap().unwrap().revision;
-    // Something else changes the task after it was read.
-    mono_task_action(
-        &store,
-        "mono-1",
-        "tasks.pause",
-        &json!({"taskId": "t", "revision": read}),
-        NOW + 1,
-    )
-    .unwrap();
-    let steer = json!({"taskId": "t", "revision": read, "requirements": "Also log errors",
-        "assignmentIds": ["a"]});
-    let refused = mono_task_action(&store, "mono-1", "tasks.steer", &steer, NOW + 2).unwrap_err();
+    let read = store
+        .tasks()
+        .unwrap()
+        .task("t")
+        .unwrap()
+        .unwrap()
+        .plan_revision;
+    let steer = |text: &str, now: u64| {
+        let input = json!({"taskId": "t", "revision": read, "requirements": text,
+            "assignmentIds": ["a"]});
+        mono_task_action(&store, "mono-1", "tasks.steer", &input, now)
+    };
+    // Another steer changes the plan after it was read.
+    steer("Also log errors", NOW + 1).unwrap();
+    let refused = steer("And retry", NOW + 2).unwrap_err();
     assert!(refused.contains("plan changed"), "{refused}");
     let events = store.tasks().unwrap().events_after(0, 1_000).unwrap();
-    assert!(events.iter().all(|e| e.kind != "task.steered"));
+    let steered = events.iter().filter(|e| e.kind == "task.steered").count();
+    assert_eq!(steered, 1);
 }
 
 #[test]

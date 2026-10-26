@@ -37,6 +37,16 @@ fn latest(store: &Store, id: &str) -> Attempt {
         .unwrap()
 }
 
+fn plan_revision(store: &Store) -> u64 {
+    store
+        .tasks()
+        .unwrap()
+        .task("t")
+        .unwrap()
+        .unwrap()
+        .plan_revision
+}
+
 fn revision(store: &Store) -> u64 {
     store.tasks().unwrap().task("t").unwrap().unwrap().revision
 }
@@ -71,7 +81,7 @@ fn steering_stops_only_affected_workers() {
     let steered = steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::User,
         &request,
         NOW + 10,
@@ -150,7 +160,7 @@ fn a_revised_plan_requeues_changed_work_drops_removed_work_and_keeps_every_revis
     let steered = steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::Mono,
         &request,
         NOW + 10,
@@ -177,7 +187,7 @@ fn a_revised_plan_requeues_changed_work_drops_removed_work_and_keeps_every_revis
     let second = steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::User,
         &again,
         NOW + 20,
@@ -192,7 +202,7 @@ fn a_revised_plan_requeues_changed_work_drops_removed_work_and_keeps_every_revis
         steer(
             &store,
             "t",
-            steered.revision,
+            steered.plan_revision,
             Requester::User,
             &again,
             NOW + 30
@@ -216,7 +226,7 @@ fn steering_without_known_affected_work_asks_mono_and_stops_nothing() {
     assert!(steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::Mono,
         &request,
         NOW + 5
@@ -225,7 +235,7 @@ fn steering_without_known_affected_work_asks_mono_and_stops_nothing() {
     let steered = steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::User,
         &request,
         NOW + 10,
@@ -279,7 +289,7 @@ fn a_pending_stop_still_occupies_its_file_scope() {
     steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::User,
         &request,
         NOW + 2,
@@ -312,7 +322,7 @@ fn pause_steer_and_resume_launch_nothing_until_the_stops_are_confirmed() {
     steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::User,
         &request,
         NOW + 3,
@@ -401,7 +411,7 @@ fn a_named_assignment_that_cannot_move_is_reported_as_skipped() {
     steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::Mono,
         &drop_b,
         NOW + 2,
@@ -416,7 +426,7 @@ fn a_named_assignment_that_cannot_move_is_reported_as_skipped() {
     let steered = steer(
         &store,
         "t",
-        revision(&store),
+        plan_revision(&store),
         Requester::Mono,
         &named,
         NOW + 3,
@@ -427,4 +437,39 @@ fn a_named_assignment_that_cannot_move_is_reported_as_skipped() {
     assert_eq!(steered.skipped[0].id, "b");
     assert!(steered.skipped[0].reason.contains("cancelled"));
     assert_eq!(status(&store, "b"), AssignmentState::Cancelled);
+}
+
+#[test]
+fn routine_task_changes_do_not_refuse_a_steer_but_a_newer_plan_does() {
+    let repo = repo();
+    let store = open(&repo);
+    let project = repo.root.to_string_lossy().into_owned();
+    let launcher = FakeLauncher::default();
+    two_running(&store, &project, &launcher);
+    let read = plan_revision(&store);
+    // The task changes (paused, resumed) but its plan does not.
+    pause(&store, "t", revision(&store), Requester::User, NOW + 2).unwrap();
+    resume(
+        &store,
+        "t",
+        revision(&store),
+        Requester::User,
+        &Resume::default(),
+        NOW + 3,
+    )
+    .unwrap();
+    let first = Steer {
+        requirements: "Redo a".into(),
+        assignments: vec!["a".into()],
+        plan: None,
+    };
+    steer(&store, "t", read, Requester::User, &first, NOW + 4).unwrap();
+    // A second steer written against the same (now older) plan is stale.
+    let second = Steer {
+        requirements: "Redo b".into(),
+        assignments: vec!["b".into()],
+        plan: None,
+    };
+    let stale = steer(&store, "t", read, Requester::User, &second, NOW + 5);
+    assert!(matches!(stale, Err(TaskError::Stale { .. })), "{stale:?}");
 }

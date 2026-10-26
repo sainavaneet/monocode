@@ -142,6 +142,18 @@ fn check(task: &Task, requester: Requester, requirements: &str) -> Result<(), Ta
     Ok(())
 }
 
+/// Refuses requirements written against an older plan revision.
+fn fresh(task: &Task, plan_revision: u64) -> Result<(), TaskError> {
+    if task.plan_revision == plan_revision {
+        return Ok(());
+    }
+    Err(TaskError::Stale {
+        subject: format!("plan of task:{}", task.id),
+        expected: plan_revision,
+        actual: task.plan_revision,
+    })
+}
+
 /// Which assignments the steer touches.
 fn assess(
     task: &Task,
@@ -191,11 +203,13 @@ fn assess(
 }
 
 /// Records the steer as a new plan revision and applies it (see the module
-/// docs). `revision` is the task revision the caller read.
+/// docs). `plan_revision` is the plan revision the caller read: requirements
+/// written against an older plan are refused as stale, while routine
+/// changes to the task (its lifecycle, a waiting cause) do not refuse them.
 pub fn steer(
     store: &Store,
     id: &str,
-    revision: u64,
+    plan_revision: u64,
     requester: Requester,
     steer: &Steer,
     now: u64,
@@ -204,10 +218,20 @@ pub fn steer(
     let tasks = store.tasks()?;
     let current = task_or_missing(&tasks, id)?;
     check(&current, requester, requirements)?;
+    fresh(&current, plan_revision)?;
     let assessment = assess(&current, &tasks.assignments(id)?, steer, requester)?;
     let tx = tasks.begin()?;
+    // Checked again under the write lock: no other steer slipped in.
+    let locked = task_or_missing(&TaskStore { conn: &tx }, id)?;
+    fresh(&locked, plan_revision)?;
     let key = Subject::Task(id).key();
-    let revision = key.bump(&tx, revision, "plan_revision=plan_revision+1", vec![], now)?;
+    let revision = key.bump(
+        &tx,
+        locked.revision,
+        "plan_revision=plan_revision+1",
+        vec![],
+        now,
+    )?;
     let plan_revision = task_or_missing(&TaskStore { conn: &tx }, id)?.plan_revision;
     let mut steered = Steered {
         task_id: id.into(),

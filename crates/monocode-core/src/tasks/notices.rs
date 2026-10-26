@@ -56,7 +56,7 @@ pub(super) fn describe(kind: &str, task: &str, assignment: Option<&str>) -> Opti
         ),
         "task.steer_assess" => (
             "The requirements changed and the affected assignments are not known",
-            format!("Decide which assignments the new requirements affect and call tasks.steer {{\"taskId\":\"{task}\",\"revision\":<task revision>,\"requirements\":\"...\",\"assignmentIds\":[...]}} (or pass the revised plan). Nothing was stopped."),
+            format!("Decide which assignments the new requirements affect and call tasks.steer {{\"taskId\":\"{task}\",\"revision\":<plan revision>,\"requirements\":\"...\",\"assignmentIds\":[...]}} (or pass the revised plan). Nothing was stopped."),
         ),
         _ => return None,
     };

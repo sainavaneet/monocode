@@ -390,12 +390,13 @@ fn context(
         .task(task_id)?
         .ok_or_else(|| TaskError::NotFound(format!("task:{task_id}")))?;
     let mut text = format!(
-        "Task {} \"{}\" ({}, {}, revision {}). Request: {}",
+        "Task {} \"{}\" ({}, {}, revision {}, plan revision {}). Request: {}",
         task.id,
         task.title,
         task.stage.as_str(),
         task.lifecycle.as_str(),
         task.revision,
+        task.plan_revision,
         task.request
     );
     if let Some(found) = assignment.and_then(|id| tasks.assignment(task_id, id).transpose()) {

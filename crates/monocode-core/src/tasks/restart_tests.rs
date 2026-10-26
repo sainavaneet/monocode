@@ -507,3 +507,92 @@ fn a_startup_that_fails_before_finishing_is_finished_by_the_next_tick() {
     assert_eq!(current(&store).lifecycle, TaskLifecycle::Blocked);
     assert_eq!(launcher.count(), 1);
 }
+
+#[test]
+fn a_worker_held_from_another_app_stays_held_through_a_later_restart() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    launched(&store, &repo, &launcher);
+    // The desktop app held the task while its worker ran, then stalled.
+    let tasks = store.tasks().unwrap();
+    tasks
+        .acquire_lease(
+            &lease_resource("t"),
+            "monocode-desktop",
+            1,
+            NOW + LEASE_TTL_MS + 1,
+        )
+        .unwrap();
+    // This app (run A) takes it over and holds the worker...
+    let a = Coordinator::new(format!("monocode-native:{}:a", dead_pid()), ExplicitStart);
+    assert_eq!(a.startup(&store, LATER).unwrap().held.len(), 1);
+    // ...then quits; run B takes over from A, which is provably gone.
+    let b = Coordinator::new("monocode-native:0:b", ExplicitStart);
+    let later = LATER + LEASE_TTL_MS + 1;
+    b.startup(&store, later).unwrap();
+    for step in 1..=3 {
+        b.tick(&store, &launcher, later + step).unwrap();
+    }
+    assert_eq!(
+        launcher.count(),
+        1,
+        "the desktop app's worker may still run"
+    );
+    let held = attempts(&store)[0].id.clone();
+    assert_eq!(
+        recovery::recovery(&tasks, &held).unwrap().unwrap().state,
+        "held"
+    );
+    let rows = crate::tasks::lifecycle::controls(&store, "mono-1").unwrap();
+    assert!(rows[0].confirm_stopped, "{rows:?}");
+    let revision = current(&store).revision;
+    let refused = resume(
+        &store,
+        "t",
+        revision,
+        Requester::User,
+        &Resume::default(),
+        later + 5,
+    );
+    assert!(refused.is_err());
+    let confirmed = Resume {
+        confirmed_stopped: true,
+        ..Resume::default()
+    };
+    resume(
+        &store,
+        "t",
+        revision,
+        Requester::User,
+        &confirmed,
+        later + 6,
+    )
+    .unwrap();
+    assert_eq!(
+        recovery::recovery(&tasks, &held).unwrap().unwrap().state,
+        "scheduled"
+    );
+}
+
+#[test]
+fn the_per_tick_pass_leaves_idle_tasks_free_for_another_app() {
+    let repo = repo();
+    let store = open(&repo);
+    let launcher = Recorded::default();
+    launched(&store, &repo, &launcher);
+    let tasks = store.tasks().unwrap();
+    let mut planning = crate::tasks::store::tests::new_task("p");
+    planning.project = repo.root.to_string_lossy().into_owned();
+    tasks.create_task(&planning, NOW).unwrap();
+    let ours = Coordinator::new("monocode-native:0:ours", ExplicitStart);
+    ours.takeover_prepare(&store, LATER).unwrap();
+    assert!(tasks.lease(&lease_resource("p")).unwrap().is_none());
+    assert_eq!(
+        tasks.lease(&lease_resource("t")).unwrap().unwrap().holder,
+        "monocode-native:0:ours"
+    );
+    // The launch-time sweep takes every unfinished task.
+    ours.startup_prepare(&store, LATER + 1).unwrap();
+    assert!(tasks.lease(&lease_resource("p")).unwrap().is_some());
+}
