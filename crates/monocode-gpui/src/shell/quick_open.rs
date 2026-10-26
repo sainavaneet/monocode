@@ -1,5 +1,5 @@
 use super::*;
-use crate::quick_open::{Command, Picked, QuickOpen};
+use crate::quick_open::{Command, Mode, Picked, ProjectRow, QuickOpen};
 pub(super) struct Open {
     picker: Entity<QuickOpen>,
     restore: Option<FocusHandle>,
@@ -16,9 +16,21 @@ impl Shell {
         }
         cx.notify();
     }
+    /// Open projects as the rail orders them: pinned, grouped, then the rest.
+    fn quick_open_projects(&self) -> Vec<ProjectRow> {
+        self.rail_ordered_projects()
+            .into_iter()
+            .map(|path| ProjectRow {
+                label: self.project_label(&path),
+                active: path == self.workspace.project,
+                appearance: self.appearance(&path),
+                path,
+            })
+            .collect()
+    }
     pub(super) fn open_quick_open(
         &mut self,
-        palette: bool,
+        mode: Mode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -29,7 +41,9 @@ impl Shell {
             .or_else(|| window.focused(cx));
         self.close_menu(cx);
         self.close_preview(cx);
-        let picker = cx.new(|cx| QuickOpen::new(self.working_copy().to_owned(), palette, cx));
+        let projects = self.quick_open_projects();
+        let picker =
+            cx.new(|cx| QuickOpen::new(self.working_copy().to_owned(), mode, projects, cx));
         let events = cx.subscribe_in(&picker, window, |this, _, event: &Picked, window, cx| {
             this.close_quick_open(window, cx);
             match event {
@@ -47,6 +61,7 @@ impl Shell {
                 Picked::Command(command) => match command {
                     Command::New => window.dispatch_action(Box::new(NewCodex), cx),
                     Command::Project => window.dispatch_action(Box::new(OpenProject), cx),
+                    Command::SwitchProject => window.dispatch_action(Box::new(SwitchProject), cx),
                     Command::Model => window.dispatch_action(Box::new(SwitchModel), cx),
                     Command::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
                     Command::Sidebar => window.dispatch_action(Box::new(ToggleSidebar), cx),
@@ -73,6 +88,7 @@ impl Shell {
                         }
                     }
                 },
+                Picked::Project(path) => this.select_project(path.clone(), window, cx),
                 Picked::Dismiss => (),
             }
         });
@@ -204,22 +220,68 @@ mod tests {
                 assert!(input.focus_handle(cx).is_focused(w));
             })
             .unwrap();
+        cx.simulate_keystrokes(window.into(), &format!("{modifier}-alt-p"));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(quick_open_text(shell, cx), ">")
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "escape");
+        cx.run_until_parked();
         cx.simulate_keystrokes(window.into(), &format!("{modifier}-shift-p"));
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
-                assert_eq!(
-                    shell
-                        .quick_open
-                        .as_ref()
-                        .unwrap()
-                        .picker
-                        .read(cx)
-                        .search
-                        .read(cx)
-                        .content,
-                    ">"
-                )
+                assert_eq!(quick_open_text(shell, cx), "@")
+            })
+            .unwrap();
+    }
+    fn quick_open_text(shell: &Shell, cx: &gpui::App) -> String {
+        shell
+            .quick_open
+            .as_ref()
+            .expect("quick open is open")
+            .picker
+            .read(cx)
+            .search
+            .read(cx)
+            .content
+            .to_string()
+    }
+    #[gpui::test]
+    fn switch_project_shortcut_lists_projects_and_enter_switches(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            super::super::bind_keys(cx);
+            crate::popover::bind(cx);
+        });
+        let (window, _, active) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.workspace.project, "/work/monocode");
+                let input = shell.sessions[&active].read(cx).input.clone();
+                w.focus(&input.focus_handle(cx), cx);
+            })
+            .unwrap();
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(window.into(), &format!("{modifier}-shift-p"));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(quick_open_text(shell, cx), "@")
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.quick_open.is_none());
+                assert_eq!(shell.workspace.project, "/work/another-project");
             })
             .unwrap();
     }

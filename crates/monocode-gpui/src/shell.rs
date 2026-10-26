@@ -120,6 +120,7 @@ actions!(
         OpenSettings,
         GoToFile,
         OpenCommandPalette,
+        SwitchProject,
         OpenInbox,
         OpenNotes,
         CheckForUpdates,
@@ -198,7 +199,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-shift-n"), NewClaude, context),
         KeyBinding::new(&format!("{modifier}-o"), OpenProject, context),
         KeyBinding::new(&format!("{modifier}-p"), GoToFile, context),
-        KeyBinding::new(&format!("{modifier}-shift-p"), OpenCommandPalette, context),
+        KeyBinding::new(&format!("{modifier}-shift-p"), SwitchProject, context),
+        KeyBinding::new(&format!("{modifier}-alt-p"), OpenCommandPalette, context),
         KeyBinding::new(&format!("{modifier}-,"), OpenSettings, context),
         KeyBinding::new(&format!("{modifier}-w"), CloseTab, context),
         KeyBinding::new(&format!("{modifier}-shift-w"), CloseAllTabs, context),
@@ -4808,7 +4810,9 @@ impl Shell {
             .debug_selector(|| "titlebar-file-search".into())
             .flex_shrink_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, window, cx| this.open_quick_open(false, window, cx)))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_quick_open(crate::quick_open::Mode::Files, window, cx)
+            }))
     }
     fn diff_stat_room(&self, cx: &App) -> f32 {
         if self.mono_active(cx) || !self.git.read(cx).available() {
@@ -8025,13 +8029,14 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &GoToFile, window, cx| {
-                    this.open_quick_open(false, window, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &GoToFile, window, cx| {
+                this.open_quick_open(crate::quick_open::Mode::Files, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
-                this.open_quick_open(true, window, cx)
+                this.open_quick_open(crate::quick_open::Mode::Commands, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SwitchProject, window, cx| {
+                this.open_quick_open(crate::quick_open::Mode::Projects, window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(crate::settings::Section::General, window, cx)

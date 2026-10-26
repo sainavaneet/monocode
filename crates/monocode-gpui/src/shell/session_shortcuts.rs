@@ -183,7 +183,7 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.open(active, window, cx);
-                shell.open_quick_open(false, window, cx);
+                shell.open_quick_open(crate::quick_open::Mode::Files, window, cx);
             })
             .unwrap();
         cx.simulate_keystrokes(window.into(), &shortcut());

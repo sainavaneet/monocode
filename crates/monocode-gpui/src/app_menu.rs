@@ -50,6 +50,7 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("Open Project…", OpenProject),
             MenuItem::action("Search…", FocusSearch),
             MenuItem::action("Go to File…", GoToFile),
+            MenuItem::action("Switch Project…", SwitchProject),
             MenuItem::action("Command Palette…", OpenCommandPalette),
             MenuItem::action("Find in Files…", SearchFiles),
             MenuItem::separator(),

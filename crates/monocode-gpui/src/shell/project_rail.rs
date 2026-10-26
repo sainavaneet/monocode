@@ -325,6 +325,36 @@ impl Shell {
             .child(self.project_rail_footer(compact, cx))
             .into_any_element()
     }
+    /// Projects in the order the rail shows them: pinned, then each group's
+    /// members, then the rest.
+    pub(super) fn rail_ordered_projects(&self) -> Vec<String> {
+        let projects = &self.workspace.projects;
+        let pinned = |p: &String| self.workspace.project_rail_pinned.contains(p);
+        let group_of = |p: &String| {
+            self.workspace.project_rail_assignments.get(p).filter(|id| {
+                self.workspace
+                    .project_rail_groups
+                    .iter()
+                    .any(|g| &g.id == *id)
+            })
+        };
+        let mut order: Vec<String> = projects.iter().filter(|p| pinned(p)).cloned().collect();
+        for group in &self.workspace.project_rail_groups {
+            order.extend(
+                projects
+                    .iter()
+                    .filter(|p| !pinned(p) && group_of(p) == Some(&group.id))
+                    .cloned(),
+            );
+        }
+        order.extend(
+            projects
+                .iter()
+                .filter(|p| !pinned(p) && group_of(p).is_none())
+                .cloned(),
+        );
+        order
+    }
     fn prepare_project_rail(&mut self, compact: bool) {
         let mut rows = Vec::new();
         if self.workspace.preferences.monos {

@@ -54,6 +54,7 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
     Some(match binding.action().name() {
         "workspace::GoToFile" => "App: Go to File",
         "workspace::OpenCommandPalette" => "App: Command Palette",
+        "workspace::SwitchProject" => "App: Switch Project",
         "workspace::OpenSettings" => "App: Settings",
         "workspace::FocusSearch" => "App: Search",
         "workspace::OpenProject" => "App: Open Project",
@@ -93,4 +94,18 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::Reload" => "View: Reload",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::{OpenCommandPalette, SwitchProject};
+
+    #[test]
+    fn switch_project_and_the_moved_palette_have_settings_labels() {
+        let switch = KeyBinding::new("cmd-shift-p", SwitchProject, Some("Workspace"));
+        assert_eq!(command(&switch), Some("App: Switch Project"));
+        let palette = KeyBinding::new("cmd-alt-p", OpenCommandPalette, Some("Workspace"));
+        assert_eq!(command(&palette), Some("App: Command Palette"));
+    }
 }

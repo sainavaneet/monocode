@@ -31,8 +31,14 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
-        command: "App: Command Palette",
+        command: "App: Switch Project",
         keys: "⌘⇧P",
+        when: "Always",
+        fixed: false,
+    },
+    Binding {
+        command: "App: Command Palette",
+        keys: "⌘⌥P",
         when: "Always",
         fixed: false,
     },
@@ -661,4 +667,36 @@ fn default_shortcuts(row: &Binding) -> Vec<String> {
         .into_iter()
         .filter_map(|s| gpui::Keystroke::parse(&s).ok().map(|s| s.unparse()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(command: &str) -> &'static Binding {
+        BINDINGS
+            .iter()
+            .find(|r| r.command == command)
+            .unwrap_or_else(|| panic!("{command} is listed"))
+    }
+
+    #[test]
+    fn switch_project_takes_the_palette_chord_and_the_palette_moves() {
+        assert_eq!(row("App: Switch Project").keys, "⌘⇧P");
+        assert_eq!(row("App: Command Palette").keys, "⌘⌥P");
+        let primary = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        let chord = |s: String| gpui::Keystroke::parse(&s).unwrap().unparse();
+        assert_eq!(
+            default_shortcuts(row("App: Switch Project")),
+            [chord(format!("{primary}-shift-p"))]
+        );
+        assert_eq!(
+            default_shortcuts(row("App: Command Palette")),
+            [chord(format!("{primary}-alt-p"))]
+        );
+    }
 }
