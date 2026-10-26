@@ -27,6 +27,7 @@ fn control(view: &Entity<Conversation>, action: &'static str, cx: &mut Context<S
                 revision: row.revision,
                 action,
                 requirements: None,
+                confirmed_stopped: false,
             },
             cx,
         )
@@ -164,4 +165,58 @@ fn a_detached_worker_session_says_so_when_it_is_opened(cx: &mut gpui::TestAppCon
             assert!(status.contains("Detached from task"), "{status}");
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn a_steer_from_the_card_is_refused_when_the_plan_changed_since_it_was_shown(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (window, _, lead) = super::tests::window(cx);
+    let view = window
+        .update(cx, |shell, _, cx| {
+            running_worker(shell);
+            let rows = lifecycle::controls(&locked(&shell.store).unwrap(), "mono-1").unwrap();
+            let view = shell.sessions[&lead].clone();
+            view.update(cx, |view, cx| view.set_task_controls(rows, cx));
+            // Mono changes the task after the card showed it.
+            let revision = task(shell).revision;
+            let store = locked(&shell.store).unwrap();
+            lifecycle::pause(&store, "t", revision, Requester::Mono, 5).unwrap();
+            drop(store);
+            view.update(cx, |view, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text("Also log errors".into(), cx))
+            });
+            control(&view, "tasks.steer", cx);
+            view
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            let error = view
+                .read(cx)
+                .orchestration_error
+                .clone()
+                .unwrap_or_default();
+            assert!(error.contains("plan changed"), "{error}");
+            let store = locked(&shell.store).unwrap();
+            let events = store.tasks().unwrap().events_after(0, 1_000).unwrap();
+            assert!(events.iter().all(|e| e.kind != "task.steered"));
+        })
+        .unwrap();
+}
+
+#[test]
+fn stops_of_deleted_sessions_are_done_after_the_absent_grace() {
+    use crate::runtime::coordinator::{STOP_ABSENT_GRACE_MS, gone_stops};
+    let mut absent = std::collections::HashMap::new();
+    let gone = vec!["stop:x".to_owned()];
+    assert!(gone_stops(&gone, &mut absent, 100).is_empty());
+    assert!(gone_stops(&gone, &mut absent, 100 + STOP_ABSENT_GRACE_MS - 1).is_empty());
+    assert_eq!(
+        gone_stops(&gone, &mut absent, 100 + STOP_ABSENT_GRACE_MS),
+        gone
+    );
+    assert!(absent.is_empty());
 }

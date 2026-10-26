@@ -108,6 +108,25 @@ fn verify_tasks(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> R
 /// stop counts as done (a torn-down window's provider may still be exiting).
 pub(crate) const STOP_ABSENT_GRACE_MS: u64 = 10_000;
 
+/// Stops of sessions that are no longer in the store and cannot be found:
+/// such a session cannot run, so each counts as done once the absent grace
+/// has passed (no window is needed to prove it).
+pub(crate) fn gone_stops(
+    deliveries: &[String],
+    absent: &mut HashMap<String, u64>,
+    now: u64,
+) -> Vec<String> {
+    let mut done = Vec::new();
+    for delivery in deliveries {
+        let since = *absent.entry(delivery.clone()).or_insert(now);
+        if now >= since.saturating_add(STOP_ABSENT_GRACE_MS) {
+            absent.remove(delivery);
+            done.push(delivery.clone());
+        }
+    }
+    done
+}
+
 /// Stops each requested session in every window that has it and returns the
 /// requests that are done: the session's turn has ended everywhere it is
 /// open, or it is open in none of the (at least one) live windows. A session
@@ -167,12 +186,14 @@ async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
                     .map(|stop| {
                         let handle = match store.resolve_session_id(&stop.session_id) {
                             Ok(handle) => Some(handle),
+                            // Deleted: it cannot run anywhere (see below).
+                            Err(_) if stop.gone => None,
                             Err(error) => {
                                 eprintln!("Task recovery: session {}: {error}", stop.session_id);
                                 None
                             }
                         };
-                        (stop.delivery, handle)
+                        (stop.delivery, handle, stop.gone)
                     })
                     .collect::<Vec<_>>(),
             )
@@ -193,7 +214,17 @@ async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
         let shells = service.live_shells();
         let mut absent = std::mem::take(&mut cx.global_mut::<Service>().absent);
         let now = monocode_core::time::now_ms();
-        let done = stop_sessions(&shells, &requests, &mut absent, now, cx);
+        let (gone, open): (Vec<_>, Vec<_>) = requests
+            .iter()
+            .cloned()
+            .partition(|(_, handle, gone)| *gone && handle.is_none());
+        let gone: Vec<String> = gone.into_iter().map(|(delivery, ..)| delivery).collect();
+        let open: Vec<(String, Option<i64>)> = open
+            .into_iter()
+            .map(|(delivery, handle, _)| (delivery, handle))
+            .collect();
+        let mut done = stop_sessions(&shells, &open, &mut absent, now, cx);
+        done.extend(gone_stops(&gone, &mut absent, now));
         cx.global_mut::<Service>().absent = absent;
         done
     });
@@ -245,8 +276,25 @@ pub(crate) fn reconcile_startup(store: Database) -> Option<std::thread::JoinHand
     let spawned = std::thread::Builder::new()
         .name("task-startup".into())
         .spawn(move || {
-            let result = run_startup(&store);
-            STARTING.store(false, Ordering::SeqCst);
+            // Cleared however the thread ends, so a panic cannot stop the
+            // ticker for good.
+            struct Started;
+            impl Drop for Started {
+                fn drop(&mut self) {
+                    STARTING.store(false, Ordering::SeqCst);
+                }
+            }
+            let _started = Started;
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_startup(&store)))
+                    .unwrap_or_else(|panic| {
+                        let what = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_owned())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".into());
+                        Err(format!("startup panicked: {what}"))
+                    });
             match result {
                 Ok(startup) if startup.enabled => {
                     if !startup.errors.is_empty() {
@@ -274,7 +322,7 @@ pub(crate) fn reconcile_startup(store: Database) -> Option<std::thread::JoinHand
 /// The startup sequence with the store locked only to read and write: the
 /// Git checks of recorded workspaces run unlocked, so the first window can
 /// open meanwhile.
-fn run_startup(store: &Database) -> Result<tasks::restart::Startup, String> {
+pub(crate) fn run_startup(store: &Database) -> Result<tasks::restart::Startup, String> {
     let now = monocode_core::time::now_ms;
     let (mut startup, pending) = coordinator()
         .startup_prepare(&*locked(store)?, now())
@@ -402,6 +450,15 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                     .await;
                 if STARTING.load(Ordering::SeqCst) {
                     continue;
+                }
+                // Tasks taken over since startup are reconciled the same way:
+                // the store is locked only to read and write, never for Git.
+                match run_startup(&store) {
+                    Ok(taken) if !taken.errors.is_empty() => {
+                        eprintln!("Task coordinator takeover: {}", taken.errors.join("; "))
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Task coordinator takeover: {error}"),
                 }
                 let tick = locked(&store).map_err(|e| e.to_string()).and_then(|store| {
                     coordinator

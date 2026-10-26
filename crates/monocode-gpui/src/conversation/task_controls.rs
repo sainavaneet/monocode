@@ -17,6 +17,8 @@ pub(crate) struct TaskControl {
     pub(crate) action: &'static str,
     /// The new requirements, for a steer.
     pub(crate) requirements: Option<String>,
+    /// The user confirmed that another app's workers of the task stopped.
+    pub(crate) confirmed_stopped: bool,
 }
 impl EventEmitter<TaskControl> for Conversation {}
 
@@ -33,7 +35,11 @@ pub(crate) fn offered(row: &ControlRow) -> Vec<(&'static str, &'static str)> {
         Display::Pausing | Display::Paused => {}
         Display::Cancelling | Display::Cancelled | Display::Completed => return actions,
     }
-    if row.resumable {
+    if row.resumable && row.confirm_stopped {
+        // Workers held from another app this one cannot check: resuming is
+        // the user's explicit confirmation that they stopped.
+        actions.push(("tasks.resume", "Other app stopped: Resume"));
+    } else if row.resumable {
         actions.push(("tasks.resume", "Resume"));
     }
     actions.push(("tasks.steer", "Steer"));
@@ -116,6 +122,7 @@ impl Conversation {
                     revision: row.revision,
                     action,
                     requirements: None,
+                    confirmed_stopped: action == "tasks.resume" && row.confirm_stopped,
                 };
                 div()
                     .id(SharedString::from(format!("task-{}-{label}", row.task_id)))
@@ -183,6 +190,7 @@ mod tests {
             display,
             reason: None,
             resumable,
+            confirm_stopped: false,
         }
     }
 
@@ -206,6 +214,11 @@ mod tests {
         assert!(!actions(Display::Waiting, false).contains(&"tasks.resume"));
         assert!(actions(Display::Waiting, true).contains(&"tasks.resume"));
         assert!(!actions(Display::Blocked, false).contains(&"tasks.resume"));
+        let held = ControlRow {
+            confirm_stopped: true,
+            ..row(Display::Waiting, true)
+        };
+        assert!(offered(&held).contains(&("tasks.resume", "Other app stopped: Resume")));
         assert!(actions(Display::Cancelling, false).is_empty());
         assert!(actions(Display::Completed, false).is_empty());
     }

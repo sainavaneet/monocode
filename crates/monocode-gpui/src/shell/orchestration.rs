@@ -46,15 +46,22 @@ pub(crate) fn apply_task_control(
         if let Some(requirements) = &request.requirements {
             input["requirements"] = serde_json::json!(requirements);
         }
+        if request.confirmed_stopped {
+            input["confirmedStopped"] = serde_json::json!(true);
+        }
         let store = locked(&store)?;
-        // Act on the task as it is now: routine coordinator updates bump its
-        // revision between the card's refreshes; the table still refuses a
-        // control its current state does not allow.
+        // Pause, resume and cancel act on the task as it is now (routine
+        // coordinator updates bump its revision between the card's
+        // refreshes; the table still refuses a move its state does not
+        // allow). A steer keeps the revision the card showed: new
+        // requirements written against a changed plan are refused.
+        let refresh = request.action != "tasks.steer";
         if let Some(task) = store
             .tasks()
             .map_err(|e| e.to_string())?
             .task(&request.task_id)
             .map_err(|e| e.to_string())?
+            .filter(|_| refresh)
         {
             input["revision"] = serde_json::json!(task.revision);
         }
