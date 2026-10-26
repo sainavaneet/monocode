@@ -104,11 +104,15 @@ fn scopes_are_normalised_and_patterns_go_to_mono() {
         let outside = out_of_scope(&changed, &[scope.to_owned()]).unwrap();
         assert_eq!(outside, vec!["README.md".to_owned()], "{scope}");
     }
-    for whole in [".", "./", ""] {
+    for whole in [".", "./"] {
         assert!(out_of_scope(&changed, &[whole.to_owned()])
             .unwrap()
             .is_empty());
     }
+    // A missing or blank scope is a plan mistake for Mono, not "everything".
+    assert!(out_of_scope(&changed, &[]).is_err());
+    assert!(out_of_scope(&changed, &["  ".to_owned()]).is_err());
+    assert!(out_of_scope(&changed, &["src".to_owned(), String::new()]).is_err());
     assert!(out_of_scope(&changed, &["src/*.rs".to_owned()]).is_err());
     assert!(out_of_scope(&["srcx/a.rs".to_owned()], &["src".to_owned()])
         .unwrap()
@@ -190,4 +194,33 @@ fn a_worktree_without_a_base_commit_is_not_scoped_against_head() {
         .verifications("t")
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn superseded_reviews_are_not_handed_to_the_next_attempt() {
+    let repo = repo();
+    let store = open(&repo);
+    claimed(&store, &repo, scoped(&[CHECK]), feature);
+    let tasks = store.tasks().unwrap();
+    let superseded = Review {
+        attempt_id: "old".into(),
+        assignment_id: "a".into(),
+        outcome: ReviewOutcome::Superseded,
+        checkpoint: None,
+        changed_files: Vec::new(),
+        findings: vec![Finding::Superseded {
+            reason: "A newer attempt replaced this one.".into(),
+        }],
+        verifications: Vec::new(),
+    };
+    let event = crate::tasks::NewEvent {
+        id: "reviewed:old".into(),
+        task_id: "t".into(),
+        assignment_id: Some("a".into()),
+        attempt_id: None,
+        kind: REVIEWED.into(),
+        payload: serde_json::to_value(&superseded).unwrap(),
+    };
+    tasks.append_event(&event, NOW + 5).unwrap();
+    assert_eq!(tasks.latest_correction("t", "a").unwrap(), None);
 }

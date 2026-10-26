@@ -220,11 +220,22 @@ pub(super) fn task_ref(task: &str, parts: &[&str]) -> String {
 }
 
 /// The changed paths outside `files`, or why scope cannot be checked
-/// mechanically (a glob scope: there is no glob matcher here, so Mono judges).
+/// mechanically: a glob scope (there is no glob matcher here), or a plan
+/// mistake (no scope at all, or a blank one). Mono judges those. `.` is the
+/// whole workspace.
 pub(super) fn out_of_scope(paths: &[String], files: &[String]) -> Result<Vec<String>, String> {
+    if files.is_empty() {
+        return Err(
+            "The assignment has no file scope, so its changes cannot be checked against one."
+                .into(),
+        );
+    }
     let mut scopes = Vec::new();
     for scope in files {
         let mut scope = scope.trim();
+        if scope.is_empty() {
+            return Err("The assignment has a blank file scope.".into());
+        }
         while let Some(rest) = scope.strip_prefix("./") {
             scope = rest;
         }

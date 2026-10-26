@@ -8,7 +8,7 @@ use crate::tasks::coordinator::{Coordinator, ExplicitStart};
 use crate::tasks::review::tests::{
     claimed_with, events, feature, git, open, repo, scoped, status, CHECK, NOW,
 };
-use crate::tasks::review::MONO_REVIEW;
+use crate::tasks::review::{MONO_REVIEW, REVIEW_RETRY_LIMIT};
 use crate::tasks::store::tests::{assignment, force, memory, new_task, plan};
 use serde_json::json;
 
@@ -195,4 +195,172 @@ fn several_worktrees_wait_for_integration() {
     // Repeated passes queue it once.
     coordinator.verify(&store, 11).unwrap();
     assert_eq!(tasks.pending_deliveries(MONO_REVIEW).unwrap().len(), 1);
+}
+
+fn verification_rows(store: &Store) -> usize {
+    store.tasks().unwrap().verifications("t").unwrap().len()
+}
+
+fn mono_deliveries(store: &Store) -> usize {
+    let tasks = store.tasks().unwrap();
+    tasks.pending_deliveries(MONO_REVIEW).unwrap().len()
+}
+
+#[test]
+fn correction_limit_during_verification_hands_to_mono_once_and_does_not_rerun() {
+    let repo = repo();
+    let store = open(&repo);
+    let failing = "grep -q fixed src/feature.rs";
+    let run = claimed_with(&store, &repo, scoped(&[CHECK]), &[failing], feature);
+    run.coordinator.review(&store, NOW + 10).unwrap();
+    // The assignment was already sent back the maximum number of times.
+    let tasks = store.tasks().unwrap();
+    for n in 0..MAX_CORRECTIONS {
+        let earlier = Review {
+            attempt_id: format!("earlier-{n}"),
+            assignment_id: "a".into(),
+            outcome: ReviewOutcome::Correction,
+            checkpoint: None,
+            changed_files: Vec::new(),
+            findings: Vec::new(),
+            verifications: Vec::new(),
+        };
+        let event = NewEvent {
+            id: format!("reviewed:earlier-{n}"),
+            task_id: "t".into(),
+            assignment_id: Some("a".into()),
+            attempt_id: None,
+            kind: REVIEWED.into(),
+            payload: serde_json::to_value(&earlier).unwrap(),
+        };
+        tasks.append_event(&event, NOW + 11).unwrap();
+    }
+    let rounds = run.coordinator.verify(&store, NOW + 20).unwrap();
+    assert_eq!(
+        rounds[0].outcome,
+        RoundOutcome::NeedsMonoReview,
+        "{rounds:?}"
+    );
+    assert!(rounds[0]
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::CorrectionLimit { .. })));
+    let rows = verification_rows(&store);
+    for later in 1..=3 {
+        let again = run.coordinator.verify(&store, NOW + 20 + later).unwrap();
+        assert!(again.is_empty(), "pass {later} re-ran: {again:?}");
+    }
+    assert_eq!(mono_deliveries(&store), 1);
+    assert_eq!(verification_rows(&store), rows);
+    assert_eq!(task(&store).stage, TaskStage::Verifying);
+}
+
+#[test]
+fn a_passing_criterion_beside_one_without_checks_waits_for_mono_once() {
+    let repo = repo();
+    let store = open(&repo);
+    let run = claimed_with(&store, &repo, scoped(&[CHECK]), &[CHECK], feature);
+    run.coordinator.review(&store, NOW + 10).unwrap();
+    let tasks = store.tasks().unwrap();
+    let mut criteria = task(&store).criteria;
+    criteria.push(AcceptanceCriterion {
+        id: "c2".into(),
+        description: "Reads well".into(),
+        required: true,
+        checks: Vec::new(),
+    });
+    let revision = task(&store).revision;
+    tasks
+        .update_criteria("t", revision, &criteria, NOW + 11)
+        .unwrap();
+    let rounds = run.coordinator.verify(&store, NOW + 20).unwrap();
+    assert_eq!(
+        rounds[0].outcome,
+        RoundOutcome::NeedsMonoReview,
+        "{rounds:?}"
+    );
+    let rows = verification_rows(&store);
+    for later in 1..=3 {
+        let again = run.coordinator.verify(&store, NOW + 20 + later).unwrap();
+        assert!(again.is_empty(), "pass {later} re-ran: {again:?}");
+    }
+    assert_eq!(mono_deliveries(&store), 1);
+    assert_eq!(verification_rows(&store), rows);
+}
+
+#[test]
+fn a_task_without_required_criteria_goes_to_mono() {
+    let repo = repo();
+    let store = open(&repo);
+    let run = claimed_with(&store, &repo, scoped(&[CHECK]), &[], feature);
+    run.coordinator.review(&store, NOW + 10).unwrap();
+    let tasks = store.tasks().unwrap();
+    let revision = task(&store).revision;
+    tasks.update_criteria("t", revision, &[], NOW + 11).unwrap();
+    let rounds = run.coordinator.verify(&store, NOW + 20).unwrap();
+    assert_eq!(
+        rounds[0].outcome,
+        RoundOutcome::NeedsMonoReview,
+        "{rounds:?}"
+    );
+    assert!(matches!(
+        &rounds[0].findings[0],
+        Finding::NotChecked { reason } if reason.contains("no required acceptance criterion")
+    ));
+    assert!(run.coordinator.verify(&store, NOW + 21).unwrap().is_empty());
+    assert_eq!(mono_deliveries(&store), 1);
+}
+
+#[test]
+fn rounds_that_fail_to_record_go_to_mono_without_rerunning() {
+    let repo = repo();
+    let store = open(&repo);
+    let run = claimed_with(&store, &repo, scoped(&[CHECK]), &[CHECK], feature);
+    run.coordinator.review(&store, NOW + 10).unwrap();
+    for n in 0..REVIEW_RETRY_LIMIT {
+        let (jobs, errors) = run.coordinator.verify_jobs(&store, NOW + 20).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(jobs.len(), 1);
+        let error = format!("database is locked ({n})");
+        run.coordinator
+            .round_failed(&store, &jobs[0], &error, NOW + 20)
+            .unwrap();
+    }
+    let rows = verification_rows(&store);
+    let (jobs, _) = run.coordinator.verify_jobs(&store, NOW + 30).unwrap();
+    assert!(jobs.is_empty());
+    assert_eq!(mono_deliveries(&store), 1);
+    let waiting = events(&store, "task.verification_waiting");
+    assert!(waiting[0]
+        .payload
+        .to_string()
+        .contains("database is locked (2)"));
+    assert!(run.coordinator.verify(&store, NOW + 31).unwrap().is_empty());
+    assert_eq!(verification_rows(&store), rows);
+}
+
+#[test]
+fn one_broken_task_does_not_stop_the_others_from_verifying() {
+    let repo = repo();
+    let store = open(&repo);
+    let run = claimed_with(&store, &repo, scoped(&[CHECK]), &[CHECK], feature);
+    run.coordinator.review(&store, NOW + 10).unwrap();
+    let tasks = store.tasks().unwrap();
+    tasks.create_task(&new_task("u"), NOW).unwrap();
+    force(
+        &store,
+        Subject::Task("u"),
+        State::Stage(TaskStage::Implementing),
+    );
+    store
+        .connection()
+        .execute(
+            "UPDATE native_tasks SET criteria='not json' WHERE id='u'",
+            [],
+        )
+        .unwrap();
+    let (jobs, errors) = run.coordinator.verify_jobs(&store, NOW + 20).unwrap();
+    assert_eq!(jobs.len(), 1, "t still verifies");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].starts_with("u: "), "{errors:?}");
 }

@@ -21,7 +21,7 @@ use super::completion::{complete, evidence, refresh_verifications, FinalReport};
 use super::coordinator::{Coordinator, Policy};
 use super::events::{append, NewEvent};
 use super::findings::{task_ref, Finding, Review, ReviewOutcome};
-use super::review::{MAX_CORRECTIONS, MONO_REVIEW, REVIEWED};
+use super::review::{MAX_CORRECTIONS, MONO_REVIEW, REVIEWED, REVIEW_RETRY_LIMIT};
 use super::states::apply;
 use super::{
     AcceptanceCriterion, Assignment, AssignmentState, Requester, State, Subject, Task, TaskError,
@@ -34,6 +34,8 @@ use serde_json::json;
 
 const NEEDS_INTEGRATION: &str = "task.needs_integration";
 const WAITING: &str = "task.verification_waiting";
+const FAILED: &str = "task.verification_failed";
+const NO_CRITERIA: &str = "The task has no required acceptance criterion, so nothing mechanical can verify it; Mono decides.";
 const NO_RESULT: &str = "No assignment produced a worktree whose result can be checked, so Mono verifies the acceptance criteria.";
 const SEVERAL: &str = "Several worktrees hold the task's work; the acceptance criteria are checked on their integrated result, which integration produces.";
 
@@ -251,61 +253,114 @@ impl<P: Policy> Coordinator<P> {
     }
 
     /// Advances tasks whose work is accepted and returns the verification
-    /// rounds to run. A round that already waited is not repeated until the
-    /// task, its verifications or its decisions change.
-    pub fn verify_jobs(&self, store: &Store, now: u64) -> Result<Vec<VerifyJob>, TaskError> {
+    /// rounds to run, with one error per task that could not be prepared
+    /// (the others still run). A round that already waited is not repeated
+    /// until the task, its verifications or its decisions change; one that
+    /// failed to record [`REVIEW_RETRY_LIMIT`] times goes to Mono instead.
+    pub fn verify_jobs(
+        &self,
+        store: &Store,
+        now: u64,
+    ) -> Result<(Vec<VerifyJob>, Vec<String>), TaskError> {
         let tasks = store.tasks()?;
         let mut jobs = Vec::new();
+        let mut errors = Vec::new();
         for id in in_progress(&tasks)? {
-            match self.lease(&tasks, &id, now) {
-                Err(TaskError::LeaseHeld { .. }) => continue,
-                other => other?,
+            match self.verify_job(store, &tasks, &id, now) {
+                Ok(Some(job)) => jobs.push(job),
+                Ok(None) | Err(TaskError::LeaseHeld { .. }) => {}
+                Err(error) => errors.push(format!("{id}: {error}")),
             }
-            let Some((task, assignment, workspace)) = self.advance(&tasks, &id, now)? else {
-                continue;
-            };
-            refresh_verifications(store, &id, now)?;
-            let round = round_key(&tasks, &task)?;
-            if event_exists(&tasks, &wait_event(&id, &round))? {
-                continue;
-            }
-            let live: Vec<Verification> = tasks
-                .verifications(&id)?
-                .into_iter()
-                .filter(|v| !v.invalidated)
-                .collect();
-            let mut pending = Vec::new();
-            let mut unchecked = Vec::new();
-            for criterion in task.criteria.iter().filter(|c| c.required) {
-                let latest = live
-                    .iter()
-                    .rev()
-                    .find(|v| v.criterion_id.as_deref() == Some(criterion.id.as_str()));
-                if latest.is_some_and(|v| v.passed) {
-                    continue;
-                }
-                if criterion.checks.is_empty() {
-                    unchecked.push(criterion.id.clone());
-                } else {
-                    pending.push(criterion.clone());
-                }
-            }
-            let corrections = tasks
-                .reviews(&id, &assignment.id)?
-                .iter()
-                .filter(|r| r.outcome == ReviewOutcome::Correction)
-                .count();
-            jobs.push(VerifyJob {
-                task,
-                assignment,
-                workspace,
-                pending,
-                unchecked,
-                round,
-                corrections,
-            });
         }
-        Ok(jobs)
+        Ok((jobs, errors))
+    }
+
+    fn verify_job(
+        &self,
+        store: &Store,
+        tasks: &TaskStore<'_>,
+        id: &str,
+        now: u64,
+    ) -> Result<Option<VerifyJob>, TaskError> {
+        self.lease(tasks, id, now)?;
+        let Some((task, assignment, workspace)) = self.advance(tasks, id, now)? else {
+            return Ok(None);
+        };
+        refresh_verifications(store, id, now)?;
+        let round = round_key(tasks, &task)?;
+        let waited = wait_event(id, &round);
+        if event_exists(tasks, &waited)? {
+            return Ok(None);
+        }
+        let failures = failures(tasks, id, &round)?;
+        if failures.len() >= REVIEW_RETRY_LIMIT as usize {
+            let reason = format!(
+                "Verification failed to record {} times: {}",
+                failures.len(),
+                failures.last().map_or("unknown error", String::as_str)
+            );
+            let findings = [Finding::Workspace { reason }];
+            hand_to_mono(tasks, id, &waited, WAITING, &findings, now)?;
+            return Ok(None);
+        }
+        let live: Vec<Verification> = tasks
+            .verifications(id)?
+            .into_iter()
+            .filter(|v| !v.invalidated)
+            .collect();
+        let mut pending = Vec::new();
+        let mut unchecked = Vec::new();
+        for criterion in task.criteria.iter().filter(|c| c.required) {
+            let latest = live
+                .iter()
+                .rev()
+                .find(|v| v.criterion_id.as_deref() == Some(criterion.id.as_str()));
+            if latest.is_some_and(|v| v.passed) {
+                continue;
+            }
+            if criterion.checks.is_empty() {
+                unchecked.push(criterion.id.clone());
+            } else {
+                pending.push(criterion.clone());
+            }
+        }
+        let corrections = tasks
+            .reviews(id, &assignment.id)?
+            .iter()
+            .filter(|r| r.outcome == ReviewOutcome::Correction)
+            .count();
+        Ok(Some(VerifyJob {
+            task,
+            assignment,
+            workspace,
+            pending,
+            unchecked,
+            round,
+            corrections,
+        }))
+    }
+
+    /// Counts a failure to record `job`'s round; after
+    /// [`REVIEW_RETRY_LIMIT`] the round goes to Mono instead of re-running.
+    pub fn round_failed(
+        &self,
+        store: &Store,
+        job: &VerifyJob,
+        error: &str,
+        now: u64,
+    ) -> Result<(), TaskError> {
+        let tasks = store.tasks()?;
+        let n = failures(&tasks, &job.task.id, &job.round)?.len();
+        let event = NewEvent {
+            id: format!("verify_failed:{}@{}#{n}", job.task.id, job.round),
+            task_id: job.task.id.clone(),
+            assignment_id: None,
+            attempt_id: None,
+            kind: FAILED.into(),
+            payload: json!({ "round": job.round, "error": error }),
+        };
+        append(tasks.conn, &event, now)?;
+        Ok(())
     }
 
     /// Records a round's outcome: a correction, a wait for Mono, or the
@@ -345,7 +400,9 @@ impl<P: Policy> Coordinator<P> {
         if findings.iter().any(Finding::needs_mono) {
             let tx = tasks.begin()?;
             record_criteria(&tasks, job, &inspection, now)?;
-            let id = wait_event(&job.task.id, &job.round);
+            // Keyed after recording, so this round's own rows do not make
+            // the next pass look like a new round.
+            let id = wait_event(&job.task.id, &round_key(&tasks, &job.task)?);
             hand_to_mono(&tasks, &job.task.id, &id, WAITING, &findings, now)?;
             tx.commit()?;
             return Ok(Some(round(job, RoundOutcome::NeedsMonoReview, findings)));
@@ -378,7 +435,11 @@ impl<P: Policy> Coordinator<P> {
     /// holding `store` throughout. The app uses the three steps separately.
     pub fn verify(&self, store: &Store, now: u64) -> Result<Vec<Round>, TaskError> {
         let mut rounds = Vec::new();
-        for job in self.verify_jobs(store, now)? {
+        let (jobs, errors) = self.verify_jobs(store, now)?;
+        if let Some(error) = errors.into_iter().next() {
+            return Err(TaskError::Storage(error));
+        }
+        for job in jobs {
             let inspection = job.inspect();
             rounds.extend(self.record_round(store, &job, inspection, now)?);
         }
@@ -395,8 +456,23 @@ fn round(job: &VerifyJob, outcome: RoundOutcome, findings: Vec<Finding>) -> Roun
     }
 }
 
+/// The recorded failures of `round`, oldest first.
+fn failures(tasks: &TaskStore<'_>, task: &str, round: &str) -> Result<Vec<String>, TaskError> {
+    let mut statement = tasks.conn.prepare(
+        "SELECT json_extract(payload,'$.error') FROM native_task_events
+         WHERE task_id=?1 AND kind=?2 AND json_extract(payload,'$.round')=?3 ORDER BY seq",
+    )?;
+    let rows = statement.query_map([task, FAILED, round], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 fn round_findings(job: &VerifyJob, inspection: &RoundInspection) -> Vec<Finding> {
     let mut findings = Vec::new();
+    if !job.task.criteria.iter().any(|c| c.required) {
+        findings.push(Finding::NotChecked {
+            reason: NO_CRITERIA.into(),
+        });
+    }
     if let Some(error) = &inspection.error {
         findings.push(Finding::Workspace {
             reason: error.clone(),

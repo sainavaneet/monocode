@@ -535,9 +535,9 @@ impl TaskStore<'_> {
             .collect()
     }
 
-    /// The assignment's latest review unless it accepted the work: what the
-    /// next attempt must address, whether review sent the work back itself
-    /// or Mono did after judging it.
+    /// The assignment's latest review unless it accepted the work or was
+    /// superseded: what the next attempt must address, whether review sent
+    /// the work back itself or Mono did after judging it.
     pub fn latest_correction(
         &self,
         task_id: &str,
@@ -546,7 +546,12 @@ impl TaskStore<'_> {
         Ok(self
             .reviews(task_id, assignment_id)?
             .pop()
-            .filter(|review| review.outcome != ReviewOutcome::Accepted))
+            .filter(|review| {
+                !matches!(
+                    review.outcome,
+                    ReviewOutcome::Accepted | ReviewOutcome::Superseded
+                )
+            }))
     }
 }
 
