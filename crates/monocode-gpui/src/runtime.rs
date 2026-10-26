@@ -9,6 +9,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+pub(crate) mod coordinator;
+#[cfg(all(test, unix))]
+mod coordinator_tests;
 #[cfg(all(test, unix))]
 mod follow_up_tests;
 mod handoff;

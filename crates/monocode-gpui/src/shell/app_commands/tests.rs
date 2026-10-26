@@ -665,3 +665,136 @@ fn app_launch_submission_uses_the_saved_message_identity(cx: &mut TestAppContext
         })
         .unwrap();
 }
+
+/// Binds `session` to a Running attempt of a started task, as the
+/// coordinator does after a launch.
+fn bind_worker(window: WindowHandle<Shell>, session: i64, cx: &mut TestAppContext) {
+    use monocode_core::tasks::{
+        AssignmentState, AttemptState, NewAttempt, NewTask, Requester, State, Subject, TaskStage,
+    };
+    window
+        .update(cx, |shell, _, _| {
+            let store = locked(&shell.store).unwrap();
+            let tasks = store.tasks().unwrap();
+            tasks
+                .create_task(
+                    &NewTask {
+                        id: "t".into(),
+                        mono_id: None,
+                        project: "/work/another-project".into(),
+                        title: "Ship it".into(),
+                        request: "Implement it".into(),
+                        criteria: Vec::new(),
+                    },
+                    1,
+                )
+                .unwrap();
+            let plan = monocode_core::orchestration::Plan {
+                title: "Plan".into(),
+                summary: "Approach".into(),
+                tasks: vec![monocode_core::tasks::Assignment {
+                    id: "a".into(),
+                    title: "Work".into(),
+                    prompt: "Do it".into(),
+                    files: vec!["src".into()],
+                    ..Default::default()
+                }],
+            };
+            tasks.save_plan("t", 1, &plan, 1).unwrap();
+            let step = |subject: Subject<'_>, state: State| {
+                let revision = tasks.revision(subject).unwrap();
+                tasks
+                    .transition(subject, state, Requester::Coordinator, revision, 1)
+                    .unwrap();
+            };
+            let (t, a, x) = (
+                Subject::Task("t"),
+                Subject::Assignment { task: "t", id: "a" },
+                Subject::Attempt("x"),
+            );
+            let stage = |s| State::Stage(s);
+            tasks
+                .transition(t, stage(TaskStage::Ready), Requester::Mono, 2, 1)
+                .unwrap();
+            step(t, stage(TaskStage::Implementing));
+            step(a, State::Assignment(AssignmentState::Ready));
+            tasks
+                .create_attempt(
+                    &NewAttempt {
+                        id: "x".into(),
+                        task_id: "t".into(),
+                        assignment_id: "a".into(),
+                        operation_id: "op-x".into(),
+                        provider: "codex".into(),
+                        account_id: None,
+                    },
+                    1,
+                )
+                .unwrap();
+            step(x, State::Attempt(AttemptState::Starting));
+            step(a, State::Assignment(AssignmentState::Running));
+            let bound = store.persisted_session_id(session).unwrap();
+            tasks
+                .bind_attempt_session("x", tasks.revision(x).unwrap(), &bound, 1)
+                .unwrap();
+            step(x, State::Attempt(AttemptState::Running));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn task_workers_reach_their_commands_without_operator_access(cx: &mut TestAppContext) {
+    let (window, worker, other) = crate::shell::tests::window(cx);
+    bind_worker(window, worker, cx);
+    // Neither session has Operator access.
+    window
+        .update(cx, |shell, _, cx| {
+            for id in [worker, other] {
+                if let Some(view) = shell.sessions.get(&id) {
+                    assert!(!view.read(cx).settings.operator_enabled);
+                }
+            }
+        })
+        .unwrap();
+    let status = call(window, worker, "s1", "tasks.worker.status", json!({}), cx).unwrap();
+    assert_eq!(status["attempt"]["id"], "x");
+    assert_eq!(status["assignment"]["status"], "running");
+    // A session without an attempt is refused by the binding, not by Operator.
+    let refused = call(window, other, "s2", "tasks.worker.status", json!({}), cx).unwrap_err();
+    assert!(refused.contains("not bound to a task attempt"), "{refused}");
+    // Worker access grants nothing else.
+    let listed = call(window, worker, "s3", "sessions.list", json!({}), cx).unwrap_err();
+    assert!(listed.contains("Operator is not enabled"), "{listed}");
+    assert!(
+        call(
+            window,
+            worker,
+            "bad id!",
+            "tasks.worker.status",
+            json!({}),
+            cx
+        )
+        .is_err()
+    );
+    let result = call(
+        window,
+        worker,
+        "r1",
+        "tasks.worker.result",
+        json!({"outcome": "succeeded", "summary": "Done"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(result["assignment"]["status"], "needs_review");
+    // A retry under the same or a new request id is the same claim.
+    let again = call(
+        window,
+        worker,
+        "r2",
+        "tasks.worker.result",
+        json!({"outcome": "succeeded", "summary": "Done"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(again["duplicate"], true);
+}

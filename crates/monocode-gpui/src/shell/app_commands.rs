@@ -26,6 +26,13 @@ impl Shell {
         match Server::start() {
             Ok((server, calls)) => {
                 self.app_bridge = Some(server);
+                // Task workers report through this bridge, so the coordinator
+                // starts with it.
+                crate::runtime::coordinator::install(
+                    self.store.clone(),
+                    cx.entity().downgrade(),
+                    cx,
+                );
                 cx.spawn(async move |this, cx| {
                     while let Ok(call) = calls.recv().await {
                         if this
@@ -97,15 +104,8 @@ impl Shell {
                         Effect::Start(start) => {
                             let (summary, settings, draft, reveal, placement) = *start;
                             let id = summary.id;
-                            this.draft_sessions.insert(id);
-                            this.sidebar_hidden_sessions.remove(&id);
-                            this.session_worktrees
-                                .insert(id, settings.worktree_cwd.clone());
-                            this.add(summary, cx);
+                            this.install_launch(summary, settings, !draft, cx);
                             this.started_by.insert(id, call.session);
-                            if let Some(view) = this.sessions.get(&id) {
-                                view.update(cx, |v, cx| v.install_app_launch(settings, !draft, cx));
-                            }
                             this.app_place_launch(id, placement, reveal, window, cx);
                         }
                         Effect::Groups(project, groups) => {
@@ -133,17 +133,40 @@ impl Shell {
         })
         .detach();
     }
+    /// Adds a session `sessions.start` reserved and configured, and submits
+    /// its prepared prompt unless it stays a draft.
+    fn install_launch(
+        &mut self,
+        summary: Session,
+        settings: Settings,
+        submit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let id = summary.id;
+        self.draft_sessions.insert(id);
+        self.sidebar_hidden_sessions.remove(&id);
+        self.session_worktrees
+            .insert(id, settings.worktree_cwd.clone());
+        self.add(summary, cx);
+        if let Some(view) = self.sessions.get(&id) {
+            view.update(cx, |v, cx| v.install_app_launch(settings, submit, cx));
+        }
+    }
+    /// Starts a worker the task coordinator launched: submitted, beside the
+    /// user's work rather than in front of it.
+    pub(crate) fn install_task_launch(
+        &mut self,
+        summary: Session,
+        settings: Settings,
+        cx: &mut Context<Self>,
+    ) {
+        self.install_launch(summary, settings, true, cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
     fn authorize_app_call(&self, call: &Call, cx: &App) -> Result<(), String> {
         app::validate_operator(&call.action, &call.input)?;
-        if call.request_id.is_empty()
-            || call.request_id.len() > 128
-            || !call
-                .request_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err("request ID must use letters, digits, underscores or hyphens".into());
-        }
+        valid_request_id(&call.request_id)?;
         let caller = self
             .sessions
             .get(&call.session)
@@ -182,7 +205,36 @@ impl Shell {
         }
         Ok(())
     }
+    /// Task workers are authorized by their session's attempt binding inside
+    /// `worker_action`, not by Operator access, and their actions are
+    /// idempotent by attempt and request, so no receipt is kept here.
+    fn handle_worker_call(&mut self, call: Call, cx: &mut Context<Self>) {
+        if let Err(error) = valid_request_id(&call.request_id) {
+            let _ = call.reply.send(Err(error));
+            return;
+        }
+        let store = self.store.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = locked(&store).and_then(|store| {
+                    app::worker_action(
+                        &store,
+                        call.session,
+                        &call.request_id,
+                        &call.action,
+                        &call.input,
+                        monocode_core::time::now_ms(),
+                    )
+                });
+                let _ = call.reply.send(result);
+            })
+            .detach();
+    }
     fn handle_app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
+        if app::WORKER_ACTIONS.contains(&call.action.as_str()) {
+            self.handle_worker_call(call, cx);
+            return;
+        }
         if let Err(error) = self.authorize_app_call(&call, cx) {
             let _ = call.reply.send(Err(error));
             return;
@@ -606,6 +658,17 @@ impl Shell {
         };
         self.finish_app_call(call, result, cx);
     }
+}
+fn valid_request_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("request ID must use letters, digits, underscores or hyphens".into());
+    }
+    Ok(())
 }
 fn mutating(action: &str) -> bool {
     !matches!(
