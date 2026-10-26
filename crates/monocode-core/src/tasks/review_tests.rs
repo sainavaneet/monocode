@@ -24,7 +24,7 @@ pub(in crate::tasks) const CHECK: &str = "test -f src/feature.rs";
 pub(in crate::tasks) struct Repo {
     _dir: tempfile::TempDir,
     pub(in crate::tasks) root: PathBuf,
-    db: PathBuf,
+    pub(in crate::tasks) db: PathBuf,
 }
 
 pub(in crate::tasks) fn git(cwd: &Path, args: &[&str]) -> String {

@@ -154,3 +154,7 @@ impl From<serde_json::Error> for TaskError {
         Self::Storage(error.to_string())
     }
 }
+
+#[cfg(test)]
+#[path = "acceptance_tests.rs"]
+mod acceptance_tests;
