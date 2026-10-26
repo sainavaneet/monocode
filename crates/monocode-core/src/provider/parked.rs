@@ -264,7 +264,8 @@ pub(super) fn key(request: &Request) -> String {
             .mono
             .as_ref()
             .map(|mono| (&mono.root, &mono.mono.id)),
-        request.settings.disable_claude_hooks
+        request.settings.disable_claude_hooks,
+        request.settings.use_api_key
     ])
     .to_string()
 }
@@ -546,6 +547,22 @@ mod tests {
     }
 
     #[test]
+    fn parked_keys_separate_api_key_billing_from_login_billing() {
+        let mut request = Request {
+            kind: Kind::Claude,
+            binary: PathBuf::from("claude"),
+            cwd: PathBuf::from("/project"),
+            prompt: "hello".into(),
+            provider_id: Some("saved-thread".into()),
+            model: None,
+            settings: Settings::default(),
+        };
+        let login = key(&request);
+        request.settings.use_api_key = true;
+        assert_ne!(login, key(&request));
+    }
+
+    #[test]
     fn reuses_only_the_same_conversation_and_launch_configuration() {
         const CHILD: &str = "MONOCODE_PARKED_REUSE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -581,6 +598,7 @@ def send(v): print(json.dumps(v),flush=True)
 for line in sys.stdin:
  v=json.loads(line)
  if v.get('id')==1: send({{'id':1,'result':{{}}}})
+ elif v.get('id')==4: send({{'id':4,'result':{{'config':{{'model_provider':'openai'}}}}}})
  elif v.get('id')==2: send({{'id':2,'result':{{'thread':{{'id':'settings-thread'}}}}}})
  elif v.get('id')==3:
   send({{'method':'item/agentMessage/delta','params':{{'itemId':'answer','delta':'ok'}}}})

@@ -246,8 +246,13 @@ fn write_json(out: &mut impl Write, value: Value) -> Result<(), String> {
 }
 
 /// State machine is deliberately testable without spawning a provider.
+/// `config/read` before a login-billed resume; ids 1–3 are the handshake.
+const CODEX_CONFIG_READ_ID: u64 = 4;
 struct Protocol {
     initialized: bool,
+    /// The configured default model provider, read before resuming a thread
+    /// on the login so a rollout recorded under the API provider still resumes.
+    codex_resume_provider: Option<String>,
     compact: bool,
     command_probe: bool,
     compact_confirmed: bool,
@@ -285,10 +290,51 @@ struct Protocol {
     async_answers: HashMap<String, (Value, String, Value, crate::agent::Question)>,
 }
 impl Protocol {
+    /// `thread/start`, or `thread/resume` for a saved thread, after the
+    /// handshake and any default-provider read.
+    fn codex_start_thread(&mut self, stdin: &mut impl Write) -> Result<(), String> {
+        let (policy, sandbox, sandbox_policy, reviewer) = self.codex_access();
+        let mut params = json!({"cwd":self.request.cwd,"approvalPolicy":policy,"sandbox":sandbox,"sandboxPolicy":sandbox_policy,"approvalsReviewer":reviewer,
+            "developerInstructions":format!("You are the coding agent in Monocode. Use the available tools to inspect and work in the supplied cwd. Do not ask the user to paste files or git output you can inspect yourself. Respect the selected access policy and request approval when required. {}", if self.request.settings.plan { "This is a planning turn: inspect and propose a plan without changing files." } else { "" })});
+        if self.request.settings.text_only {
+            params["ephemeral"] = true.into();
+            params["developerInstructions"] = "Answer the supplied text request directly. Do not call tools or inspect the workspace.".into();
+        }
+        if let Some(model) = &self.request.model {
+            params["model"] = model.clone().into();
+        }
+        if let Some(tier) = self
+            .request
+            .settings
+            .service_tier
+            .as_deref()
+            .filter(|tier| *tier != "default")
+        {
+            params["serviceTier"] = tier.into();
+        }
+        let method = if let Some(id) = &self.request.provider_id {
+            params["threadId"] = id.clone().into();
+            // The app already owns its transcript. Resume the
+            // provider context without serializing its history.
+            params["excludeTurns"] = true.into();
+            "thread/resume"
+        } else {
+            "thread/start"
+        };
+        if self.request.settings.use_api_key {
+            params["modelProvider"] = crate::api_keys::CODEX_MODEL_PROVIDER.into();
+        } else if self.request.provider_id.is_some() {
+            if let Some(provider) = &self.codex_resume_provider {
+                params["modelProvider"] = provider.clone().into();
+            }
+        }
+        write_json(stdin, json!({"id":2,"method":method,"params":params}))
+    }
     fn new(request: Request) -> Self {
         Self {
             request,
             initialized: false,
+            codex_resume_provider: None,
             compact: false,
             command_probe: false,
             compact_confirmed: false,
@@ -481,6 +527,11 @@ impl Protocol {
             Kind::Codex => {
                 if let Some(error) = v.get("error").filter(|e| !e.is_null()) {
                     let message = codex_error(error, "RPC request failed");
+                    if v["id"] == CODEX_CONFIG_READ_ID {
+                        self.codex_resume_provider = Some("openai".into());
+                        self.codex_start_thread(stdin)?;
+                        return Ok(events);
+                    }
                     if v["id"] == 2
                         && self.request.provider_id.is_some()
                         && lifecycle::recoverable_codex_resume(&message)
@@ -499,35 +550,25 @@ impl Protocol {
                             write_json(stdin, json!({"method":"initialized"}))?;
                             self.initialized = true;
                         }
-                        let (policy, sandbox, sandbox_policy, reviewer) = self.codex_access();
-                        let mut params = json!({"cwd":self.request.cwd,"approvalPolicy":policy,"sandbox":sandbox,"sandboxPolicy":sandbox_policy,"approvalsReviewer":reviewer,
-                            "developerInstructions":format!("You are the coding agent in Monocode. Use the available tools to inspect and work in the supplied cwd. Do not ask the user to paste files or git output you can inspect yourself. Respect the selected access policy and request approval when required. {}", if self.request.settings.plan { "This is a planning turn: inspect and propose a plan without changing files." } else { "" })});
-                        if self.request.settings.text_only {
-                            params["ephemeral"] = true.into();
-                            params["developerInstructions"] = "Answer the supplied text request directly. Do not call tools or inspect the workspace.".into();
-                        }
-                        if let Some(model) = &self.request.model {
-                            params["model"] = model.clone().into();
-                        }
-                        if let Some(tier) = self
-                            .request
-                            .settings
-                            .service_tier
-                            .as_deref()
-                            .filter(|tier| *tier != "default")
+                        if self.request.provider_id.is_some()
+                            && !self.request.settings.use_api_key
+                            && self.codex_resume_provider.is_none()
                         {
-                            params["serviceTier"] = tier.into();
+                            write_json(
+                                stdin,
+                                json!({"id":CODEX_CONFIG_READ_ID,"method":"config/read","params":{}}),
+                            )?;
+                            return Ok(events);
                         }
-                        let method = if let Some(id) = &self.request.provider_id {
-                            params["threadId"] = id.clone().into();
-                            // The app already owns its transcript. Resume the
-                            // provider context without serializing its history.
-                            params["excludeTurns"] = true.into();
-                            "thread/resume"
-                        } else {
-                            "thread/start"
-                        };
-                        write_json(stdin, json!({"id":2,"method":method,"params":params}))?;
+                        self.codex_start_thread(stdin)?;
+                    }
+                    Some(CODEX_CONFIG_READ_ID) => {
+                        let provider = v["result"]["config"]["model_provider"]
+                            .as_str()
+                            .filter(|p| !p.trim().is_empty())
+                            .unwrap_or("openai");
+                        self.codex_resume_provider = Some(provider.to_owned());
+                        self.codex_start_thread(stdin)?;
                     }
                     Some(2) if v.get("result").is_some() => {
                         let id = v["result"]["thread"]["id"]
@@ -1382,6 +1423,9 @@ fn run_operation(
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);
     request.settings.account.apply(request.kind, &mut command)?;
+    if request.settings.use_api_key {
+        crate::api_keys::apply(request.kind, &mut command)?;
+    }
     match request.kind {
         Kind::Codex => {
             command.arg("app-server");
@@ -1895,12 +1939,70 @@ mod tests {
             window: Some(200000)
         }));
     }
+    fn written_method(out: &[u8], method: &str) -> Option<Value> {
+        String::from_utf8_lossy(out)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|message| message["method"] == method)
+    }
+    #[test]
+    fn codex_api_key_billing_selects_the_api_model_provider_on_start_and_resume() {
+        let mut p = protocol(Kind::Codex);
+        p.request.settings.use_api_key = true;
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        let started = written_method(&out, "thread/start").unwrap();
+        assert_eq!(started["params"]["modelProvider"], "monocode-api");
+        assert!(written_method(&out, "config/read").is_none());
+
+        let mut p = protocol(Kind::Codex);
+        p.request.settings.use_api_key = true;
+        p.request.provider_id = Some("saved".into());
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        let resumed = written_method(&out, "thread/resume").unwrap();
+        assert_eq!(resumed["params"]["modelProvider"], "monocode-api");
+    }
+    #[test]
+    fn codex_login_billing_resumes_with_the_configured_default_provider() {
+        let mut p = protocol(Kind::Codex);
+        p.request.provider_id = Some("saved".into());
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        // The rollout may have been recorded under the API provider, so the
+        // configured default is read before resuming.
+        let read = written_method(&out, "config/read").unwrap();
+        assert!(written_method(&out, "thread/resume").is_none());
+        let id = read["id"].clone();
+        p.frame(
+            json!({"id":id,"result":{"config":{"model_provider":"custom-login"}}}),
+            &mut out,
+        )
+        .unwrap();
+        let resumed = written_method(&out, "thread/resume").unwrap();
+        assert_eq!(resumed["params"]["modelProvider"], "custom-login");
+        assert_eq!(resumed["params"]["threadId"], "saved");
+
+        // A fresh thread on the login keeps the configured default implicitly.
+        let mut p = protocol(Kind::Codex);
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        let started = written_method(&out, "thread/start").unwrap();
+        assert!(started["params"].get("modelProvider").is_none());
+        assert!(written_method(&out, "config/read").is_none());
+    }
     #[test]
     fn codex_handshake_stream_snapshot_and_resume() {
         let mut p = protocol(Kind::Codex);
         p.request.provider_id = Some("saved".into());
         let mut out = Vec::new();
         p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        // Login billing reads the configured provider before resuming.
+        p.frame(
+            json!({"id":4,"result":{"config":{"model_provider":"openai"}}}),
+            &mut out,
+        )
+        .unwrap();
         assert!(String::from_utf8_lossy(&out).contains("thread/resume"));
         let resumed: Value = String::from_utf8_lossy(&out)
             .lines()
@@ -2194,8 +2296,12 @@ for line in sys.stdin:
     value = json.loads(line)
     if value.get('id') == 1:
         send({'id': 1, 'result': {}})
+    elif value.get('id') == 4:
+        assert value['method'] == 'config/read'
+        send({'id': 4, 'result': {'config': {'model_provider': 'openai'}}})
     elif value.get('id') == 2:
         assert value['method'] == 'thread/resume'
+        assert value['params']['modelProvider'] == 'openai'
         send({'id': 2, 'result': {'thread': {'id': 'large-thread', 'turns': [
             {'items': [{'id': 'history', 'type': 'agentMessage', 'text': payload}]}
         ]}}})

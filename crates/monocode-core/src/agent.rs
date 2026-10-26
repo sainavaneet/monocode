@@ -105,6 +105,10 @@ pub struct Settings {
     pub turn_model: Option<TurnInfo>,
     #[serde(skip)]
     pub disable_claude_hooks: bool,
+    /// Bill the saved API key instead of the CLI login. Decided per turn from
+    /// the app preference; never saved with the conversation.
+    #[serde(skip)]
+    pub use_api_key: bool,
     #[serde(skip)]
     pub environment: std::collections::HashMap<String, String>,
     #[serde(skip)]

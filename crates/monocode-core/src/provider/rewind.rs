@@ -63,6 +63,9 @@ pub fn rewind_last_turn(
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);
     request.settings.account.apply(request.kind, &mut command)?;
+    if request.settings.use_api_key {
+        crate::api_keys::apply(request.kind, &mut command)?;
+    }
     if request.kind == Kind::Codex {
         command.arg("app-server");
     } else {
