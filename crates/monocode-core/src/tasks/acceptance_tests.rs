@@ -490,6 +490,10 @@ fn restart_preserves_state(app: App, repo: &Repo, id: &str) -> App {
     let brief = app.brief(session);
     assert!(brief.contains("Acceptance criterion fixed"), "{brief}");
     app.confirm_last();
+    // Only the replacement started: another pass launches nothing more.
+    let again = app.tick();
+    assert!(again.launched.is_empty(), "{again:?}");
+    assert_eq!(app.launcher.count(), 1);
     app
 }
 
@@ -558,6 +562,7 @@ fn correction_verified_and_reported(app: &mut App, id: &str, tree: &std::path::P
         .filter(|v| v.criterion_id.as_deref() == Some("fixed") && !v.invalidated)
         .collect();
     assert!(evidence.iter().all(|v| v.passed), "{evidence:?}");
+    assert!(!evidence.is_empty(), "the criterion has no verification");
     let recorded: Value = serde_json::from_str(&evidence[0].evidence).unwrap();
     assert_eq!(
         recorded["argv"],

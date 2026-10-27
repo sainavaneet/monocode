@@ -240,3 +240,24 @@ fn state_names_round_trip_through_text_and_serde() {
         Some(Requester::Coordinator)
     );
 }
+
+/// The Succeeded → NeedsReview cascade (`apply`) runs only when the
+/// requester who finished the attempt may also move the assignment: the two
+/// rules must allow the same requesters, or a success would never reach
+/// review.
+#[test]
+fn succeeded_and_needs_review_allow_the_same_requesters() {
+    let rule = |to: State| {
+        TRANSITIONS
+            .iter()
+            .find(|t| t.to == to)
+            .unwrap_or_else(|| panic!("no rule to {}", to.as_str()))
+    };
+    let mut succeeded = rule(State::Attempt(AttemptState::Succeeded)).requesters.to_vec();
+    let mut review = rule(State::Assignment(AssignmentState::NeedsReview))
+        .requesters
+        .to_vec();
+    succeeded.sort_by_key(|r| r.as_str());
+    review.sort_by_key(|r| r.as_str());
+    assert_eq!(succeeded, review);
+}
