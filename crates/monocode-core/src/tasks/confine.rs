@@ -12,6 +12,8 @@ use std::path::{Component, Path, PathBuf};
 mod git;
 #[path = "confine_program.rs"]
 mod program;
+#[path = "confine_runner.rs"]
+mod runner;
 
 /// Options whose value is a path, in every program a check might run.
 const PATH_FLAGS: &[&str] = &[

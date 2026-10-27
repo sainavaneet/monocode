@@ -423,8 +423,11 @@ From the controller ledger, accepted for later:
   script directly); `node --import`/`-r` are refused; `-o`, `-d` and `-f`
   are treated as path options for every program; the shell-character rule
   makes `git diff HEAD~1` unrunnable; `python -m timeit` still runs code
-  given inline; and an unknown interpreter option that takes a separate
-  value can hide a following `-e`.
+  given inline; an unknown interpreter option that takes a separate
+  value can hide a following `-e`; and `npx`/`npm exec` may fetch a package
+  from the registry when the project does not have it installed. Runner
+  options are known per runner (`tasks/confine_runner.rs`): an unknown one
+  is refused rather than guessed.
 - **Before enabling the flag for real use:** UI-thread store locks during the
   coordinator tick (Git work in the remaining locked steps above, and the GUI
   locks on the UI thread) must be removed.

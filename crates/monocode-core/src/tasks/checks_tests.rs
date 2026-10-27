@@ -417,3 +417,33 @@ fn assigned_paths_are_held_to_the_workspace() {
     );
     allowed(&["make FOO=bar", "make OUT=target/x test"], &root);
 }
+
+#[test]
+fn runner_options_cannot_hide_the_wrapped_program() {
+    let (_dir, root) = workspace();
+    refused(
+        &[
+            "uv run --python 3.12 --with x sh -c true",
+            "uv run --unknown-option x sh -c true",
+            "npx -c true",
+            "npx --call true",
+            "npm exec -c true",
+            "npm exec --call=true",
+            "pnpm exec -c true",
+            "pnpm exec --shell-mode true",
+            "yarn exec -c true",
+            "uv run \"sh -c true\"",
+        ],
+        &root,
+    );
+    allowed(
+        &[
+            "uv run --python 3.12 pytest",
+            "uv run --no-sync pytest -k sh",
+            "pnpm exec -w pkg vitest",
+            "npx -y vitest",
+            "bundle exec --gemfile Gemfile rspec",
+        ],
+        &root,
+    );
+}

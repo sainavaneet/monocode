@@ -1,9 +1,7 @@
 //! Which programs a check may run: not a shell, not a wrapper that runs
 //! another program, not an interpreter given code on the command line, and
-//! Git only for reading. A runner that wraps a program (`uv run pytest`,
-//! `bundle exec rspec`, `pnpm exec vitest`, `npx vitest`) is judged by the
-//! program it wraps; one that fetches a tool first (`pnpm dlx`, `bunx`) is
-//! refused.
+//! Git only for reading. A runner that wraps a program is judged by the
+//! program it wraps (`runner`).
 
 /// Programs that run a shell or another program given as arguments.
 const WRAPPERS: &[&str] = &[
@@ -41,27 +39,6 @@ const WRAPPERS: &[&str] = &[
     "watch",
     "flock",
     "parallel",
-];
-/// Runner subcommands that fetch and run an arbitrary tool.
-const FETCHERS: &[(&str, &str)] = &[
-    ("pnpm", "dlx"),
-    ("yarn", "dlx"),
-    ("bun", "x"),
-    ("pipx", "run"),
-];
-/// Runner subcommands that run the program named after them (`None`: the
-/// runner itself does).
-const RUNNERS: &[(&str, Option<&str>)] = &[
-    ("uv", Some("run")),
-    ("poetry", Some("run")),
-    ("pdm", Some("run")),
-    ("pipenv", Some("run")),
-    ("pnpm", Some("exec")),
-    ("yarn", Some("exec")),
-    ("bundle", Some("exec")),
-    ("npm", Some("exec")),
-    ("npm", Some("x")),
-    ("npx", None),
 ];
 /// `find` actions that run programs or write files.
 const FIND_ACTIONS: &[&str] = &[
@@ -156,14 +133,13 @@ pub(super) fn check(argv: &[String]) -> Result<(), String> {
             "`{name}` runs a shell or another program; name the check's program directly."
         ));
     }
-    if let Some(sub) = subcommand(name, args, |s| FETCHERS.contains(&(name, s))) {
-        return Err(format!(
-            "`{name} {}` fetches or runs an arbitrary program; checks run the project's own.",
-            args[sub]
-        ));
-    }
-    if let Some(wrapped) = wrapped(name, args) {
-        return wrapped.iter().try_for_each(|line| check(line));
+    super::runner::fetcher(name, args)?;
+    if let Some(line) = super::runner::wrapped(name, args)? {
+        return if line.is_empty() {
+            Ok(())
+        } else {
+            check(&line)
+        };
     }
     if name == "find" {
         if let Some(action) = args.iter().find(|a| FIND_ACTIONS.contains(&a.as_str())) {
@@ -199,63 +175,6 @@ fn base_name(name: &str) -> &str {
     } else {
         base
     }
-}
-
-/// The index in `args` of the runner's subcommand matching `wanted`,
-/// skipping its global options first (`npm -w pkg exec`).
-fn subcommand(name: &str, args: &[String], wanted: impl Fn(&str) -> bool) -> Option<usize> {
-    let known = FETCHERS.iter().any(|(r, _)| *r == name) || RUNNERS.iter().any(|(r, _)| *r == name);
-    if !known {
-        return None;
-    }
-    let mut after_bare_flag = false;
-    for (index, arg) in args.iter().enumerate() {
-        if arg.starts_with('-') {
-            after_bare_flag = !arg.contains('=');
-            continue;
-        }
-        if wanted(arg) {
-            return Some(index);
-        }
-        if !after_bare_flag {
-            return None;
-        }
-        after_bare_flag = false;
-    }
-    None
-}
-
-/// The program lines a runner wraps: the first operand after its
-/// subcommand and options, and the next one too when the first may be the
-/// value of an option (`uv run --with x pytest`). None when `name` is not a
-/// runner of a program.
-fn wrapped(name: &str, args: &[String]) -> Option<Vec<Vec<String>>> {
-    let start = if RUNNERS.contains(&(name, None)) {
-        0
-    } else {
-        subcommand(name, args, |s| RUNNERS.contains(&(name, Some(s))))? + 1
-    };
-    let rest = &args[start..];
-    let mut lines = Vec::new();
-    let mut after_bare_flag = false;
-    for (index, arg) in rest.iter().enumerate() {
-        if arg == "--" {
-            if index + 1 < rest.len() {
-                lines.push(rest[index + 1..].to_vec());
-            }
-            break;
-        }
-        if arg.starts_with('-') {
-            after_bare_flag = !arg.contains('=');
-            continue;
-        }
-        lines.push(rest[index..].to_vec());
-        if !after_bare_flag || lines.len() == 2 {
-            break;
-        }
-        after_bare_flag = false;
-    }
-    Some(lines)
 }
 
 /// Whether awk is given its program as an operand rather than with `-f`.
