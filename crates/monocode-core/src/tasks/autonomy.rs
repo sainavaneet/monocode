@@ -85,6 +85,30 @@ impl Authority {
     }
 }
 
+/// What `policy` does not allow, of commit, merge, push and deploy, in
+/// that order.
+pub fn prohibited(policy: &Autonomy) -> Vec<Authority> {
+    [
+        Authority::Commit,
+        Authority::Merge,
+        Authority::Push,
+        Authority::Deploy,
+    ]
+    .into_iter()
+    .filter(|authority| !policy.allows(*authority))
+    .collect()
+}
+
+/// `commit, merge, push or deploy`.
+pub fn either(authorities: &[Authority]) -> String {
+    let names: Vec<&str> = authorities.iter().map(|a| a.as_str()).collect();
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
 /// One Mono's policy (or a project's override of it).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]

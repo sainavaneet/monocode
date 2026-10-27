@@ -240,6 +240,9 @@ fn mono_answers_a_routine_question_and_the_worker_resumes() {
         store.persisted_session_id(worker).unwrap()
     );
     assert!(handoffs[0].question.is_none());
+    // The task's default policy forbids pushing; the hand-off carries that.
+    let forbidden = &handoffs[0].prohibited;
+    assert!(forbidden.contains(&crate::tasks::autonomy::Authority::Push));
     let message = decisions::answer_message(&handoffs[0].decision);
     assert!(
         message.contains("Use nom") && message.contains(&id),

@@ -357,7 +357,7 @@ impl Monos {
                 if !idle {
                     return;
                 }
-                let message = decisions::answer_message(decision);
+                let message = decisions::handoff_message(&handoff);
                 view.update(cx, |v, cx| v.mono_external_send(message, false, cx))
                     .map(|_| "message")
             }
