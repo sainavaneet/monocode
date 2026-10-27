@@ -477,3 +477,62 @@ fn routine_task_changes_do_not_refuse_a_steer_but_a_newer_plan_does() {
     let stale = steer(&store, "t", read, Requester::User, &second, NOW + 5);
     assert!(matches!(stale, Err(TaskError::Stale { .. })), "{stale:?}");
 }
+
+#[test]
+fn a_revised_plan_may_not_add_the_reserved_id_or_an_id_differing_only_in_case() {
+    let repo = repo();
+    let store = open(&repo);
+    let project = repo.root.to_string_lossy().into_owned();
+    let launcher = FakeLauncher::default();
+    two_running(&store, &project, &launcher);
+    let steer_with = |tasks: Vec<crate::orchestration::Task>| {
+        let request = Steer {
+            requirements: "Rework".into(),
+            assignments: vec![],
+            plan: Some(crate::orchestration::Plan {
+                title: "Plan".into(),
+                summary: "Revised".into(),
+                tasks,
+            }),
+        };
+        steer(
+            &store,
+            "t",
+            plan_revision(&store),
+            Requester::Mono,
+            &request,
+            NOW + 10,
+        )
+    };
+    let before = plan_revision(&store);
+    let reserved = steer_with(vec![
+        independent("a"),
+        independent("b"),
+        independent("Integration"),
+    ]);
+    assert!(
+        matches!(reserved, Err(TaskError::Invalid(ref m)) if m.contains("reserved")),
+        "{reserved:?}"
+    );
+    // Against a live assignment...
+    let live = steer_with(vec![independent("a"), independent("b"), independent("A")]);
+    assert!(
+        matches!(live, Err(TaskError::Invalid(ref m)) if m.contains("case")),
+        "{live:?}"
+    );
+    // ...and against one an earlier steer dropped.
+    steer_with(vec![independent("a")]).unwrap();
+    assert_eq!(status(&store, "b"), AssignmentState::Cancelled);
+    let dropped = steer_with(vec![independent("a"), independent("B")]);
+    assert!(
+        matches!(dropped, Err(TaskError::Invalid(ref m)) if m.contains("case")),
+        "{dropped:?}"
+    );
+    assert_eq!(plan_revision(&store), before + 1);
+    assert!(store
+        .tasks()
+        .unwrap()
+        .assignment("t", "B")
+        .unwrap()
+        .is_none());
+}

@@ -118,6 +118,24 @@ fn diff(current: &[Assignment], plan: &Plan) -> Diff {
     out
 }
 
+/// Refuses a plan assignment whose id differs only in case from one the
+/// task already has, live or dropped: their branches and worktrees would
+/// collide on a case-insensitive file system.
+fn refuse_case_collisions(current: &[Assignment], plan: &Plan) -> Result<(), TaskError> {
+    for new in &plan.tasks {
+        let taken = current
+            .iter()
+            .find(|a| a.id != new.id && a.id.eq_ignore_ascii_case(&new.id));
+        if let Some(taken) = taken {
+            return Err(TaskError::Invalid(format!(
+                "Assignment ID {} differs only in case from the task's assignment {}; IDs must be unique ignoring case.",
+                new.id, taken.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Checks who asks, the requirements and the task's state.
 fn check(task: &Task, requester: Requester, requirements: &str) -> Result<(), TaskError> {
     if !matches!(requester, Requester::User | Requester::Mono) {
@@ -169,6 +187,8 @@ fn assess(
     let diff = match &steer.plan {
         Some(plan) => {
             crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
+            super::integration::refuse_reserved(plan)?;
+            refuse_case_collisions(assignments, plan)?;
             diff(assignments, plan)
         }
         None => Diff::default(),
