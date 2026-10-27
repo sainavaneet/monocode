@@ -23,9 +23,11 @@ impl Verification {
         (evidence["waived"] == true).then(|| evidence["reason"].as_str().unwrap_or("").to_owned())
     }
 
-    /// Whether this records a check that could not run.
+    /// Whether this records a check that could not run (and is not already
+    /// Mono's waiver of one).
     pub fn unrunnable(&self) -> bool {
-        self.evidence_json()["unrunnable"].is_string()
+        let evidence = self.evidence_json();
+        evidence["unrunnable"].is_string() && evidence["waived"] != true
     }
 }
 

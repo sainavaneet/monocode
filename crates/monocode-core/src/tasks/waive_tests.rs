@@ -137,3 +137,24 @@ fn a_check_that_ran_and_failed_cannot_be_waived() {
     assert!(refused.contains("not a check of"), "{refused}");
     assert_eq!(store.tasks().unwrap().verifications("t").unwrap().len(), 1);
 }
+
+#[test]
+fn a_waived_check_is_not_waived_again() {
+    let store = verifying();
+    recorded(
+        &store,
+        json!({"unrunnable": "It is not a command line."}),
+        false,
+    );
+    let waiver = waive(&store, PROSE, "Checked it by hand").unwrap();
+    assert_eq!(waiver["waived"], true);
+    let tasks = store.tasks().unwrap();
+    let recorded = tasks.verifications("t").unwrap();
+    let newest = recorded.last().unwrap();
+    assert!(newest.passed);
+    assert_eq!(newest.checkpoint_commit, "snap-1");
+    assert_eq!(newest.waived().as_deref(), Some("Checked it by hand"));
+    let refused = waive(&store, PROSE, "Again").unwrap_err();
+    assert!(refused.contains("cannot be waived"), "{refused}");
+    assert_eq!(tasks.verifications("t").unwrap().len(), 2);
+}

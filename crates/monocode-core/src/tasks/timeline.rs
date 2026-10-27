@@ -256,7 +256,7 @@ pub fn entry(event: &Event, names: &Names) -> Option<TimelineEntry> {
             let reason = text_field(event, "reason").unwrap_or_default();
             (
                 Verification,
-                format!("Mono waived `{check}`: waived: {reason}"),
+                format!("Mono judged `{check}` met without running it, waived: {reason}"),
             )
         }
         "task.completed" => (Verification, "The task is complete".to_owned()),
