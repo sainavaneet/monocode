@@ -64,13 +64,9 @@ pub fn waive_check(
         )));
     }
     let tx = tasks.begin()?;
-    let newest = tasks
-        .verifications(task_id)?
-        .into_iter()
-        .filter(|v| {
-            !v.invalidated && v.criterion_id.as_deref() == Some(criterion_id) && v.check == check
-        })
-        .next_back();
+    let newest = tasks.verifications(task_id)?.into_iter().rfind(|v| {
+        !v.invalidated && v.criterion_id.as_deref() == Some(criterion_id) && v.check == check
+    });
     let Some(blocked) = newest.filter(Verification::unrunnable) else {
         return Err(TaskError::Invalid(format!(
             "`{check}` has not been recorded as unable to run, so it cannot be waived: a check that ran and failed needs the work to change, and one not yet tried runs in the next verification round."
