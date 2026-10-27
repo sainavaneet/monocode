@@ -58,6 +58,10 @@ pub struct CriterionReport {
     /// The latest live verification of the criterion and its checkpoint.
     pub verification: Option<String>,
     pub checkpoint: Option<String>,
+    /// Declared checks that could not run and Mono waived, each shown as
+    /// "`check` waived: reason".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waived: Vec<String>,
 }
 
 /// What the task delivered, each claim derived from recorded evidence.
@@ -210,6 +214,7 @@ pub(super) fn build_report(
                 satisfied: criterion_satisfied(c, &live),
                 verification: latest.map(|v| v.id.clone()),
                 checkpoint: latest.map(|v| v.checkpoint_commit.clone()),
+                waived: waivers(c, &live),
             }
         })
         .collect();
@@ -230,6 +235,22 @@ pub(super) fn build_report(
         generated_at: now,
         integration: tasks.integration(task_id)?,
     })
+}
+
+/// The criterion's checks whose newest live verification is Mono's waiver.
+fn waivers(criterion: &super::AcceptanceCriterion, live: &[Verification]) -> Vec<String> {
+    criterion
+        .checks
+        .iter()
+        .filter_map(|check| {
+            let newest = live.iter().rev().find(|v| {
+                v.criterion_id.as_deref() == Some(criterion.id.as_str()) && v.check == *check
+            })?;
+            newest
+                .waived()
+                .map(|reason| format!("`{check}` waived: {reason}"))
+        })
+        .collect()
 }
 
 /// Completes the task: refreshes its verifications and reads its branches,

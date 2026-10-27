@@ -15,13 +15,14 @@ use crate::tasks::{
 };
 use serde_json::{json, Value};
 
-pub const MONO_TASK_ACTIONS: [&str; 10] = [
+pub const MONO_TASK_ACTIONS: [&str; 11] = [
     "tasks.decisions.list",
     "tasks.decisions.answer",
     "tasks.decisions.escalate",
     "tasks.review.accept",
     "tasks.review.sendBack",
     "tasks.criteria.verify",
+    "tasks.criteria.waive",
     "tasks.pause",
     "tasks.resume",
     "tasks.cancel",
@@ -126,6 +127,20 @@ pub fn mono_task_action(
             )
         }
         "tasks.review.accept" | "tasks.review.sendBack" => review(&tasks, mono, action, input, now),
+        "tasks.criteria.waive" => {
+            let task = owned_task(&tasks, mono, &text(input, "taskId", 512)?)?;
+            let criterion = text(input, "criterionId", 512)?;
+            let check = text(input, "check", MAX_CHECK)?;
+            let reason = optional_text(input, "reason", MAX_WHY)?.unwrap_or_default();
+            let waiver = crate::tasks::waive::waive_check(
+                &tasks, &task.id, &criterion, &check, &reason, now,
+            )
+            .map_err(failed)?;
+            Ok(
+                json!({"verificationId": waiver.id, "criterionId": criterion, "check": check,
+                      "waived": true, "checkpoint": waiver.checkpoint_commit}),
+            )
+        }
         "tasks.pause" | "tasks.resume" | "tasks.cancel" | "tasks.steer" => {
             let task = owned_task(&tasks, mono, &text(input, "taskId", 512)?)?;
             control(store, &task.id, action, input, Requester::Mono, now)

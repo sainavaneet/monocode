@@ -38,6 +38,7 @@ pub mod timeline;
 pub mod verify;
 pub mod view;
 pub mod waiting;
+pub mod waive;
 pub mod worker;
 pub mod workspace_check;
 pub mod workspaces;

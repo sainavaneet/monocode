@@ -43,6 +43,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "tasks.review.accept"=>"taskId assignmentId revision",
         "tasks.review.sendBack"=>"taskId assignmentId revision reason",
         "tasks.criteria.verify"=>"taskId criterionId check assignmentId",
+        "tasks.criteria.waive"=>"taskId criterionId check reason",
         "tasks.pause"|"tasks.cancel"=>"taskId revision",
         "tasks.resume"=>"taskId revision assignmentIds confirmedStopped",
         "tasks.steer"=>"taskId revision requirements assignmentIds plan",

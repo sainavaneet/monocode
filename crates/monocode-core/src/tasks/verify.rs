@@ -14,8 +14,9 @@
 //! snapshots. A failing check (or one that changes the workspace) sends the
 //! responsible assignment back with a correction and the stage back to
 //! Implementing. A criterion without checks, or a check that cannot run,
-//! waits for Mono (`mono_review`), who may call `verify_criterion`; it is
-//! never satisfied by default. A criterion with checks is satisfied only when
+//! waits for Mono (`mono_review`): Mono may verify a check-less criterion
+//! with `verify_criterion`, and waive a declared check that cannot run with
+//! a reason (`waive`); neither is satisfied by default. A criterion with checks is satisfied only when
 //! every one of its checks passed on one snapshot (`criterion_satisfied`);
 //! a check that could not run is recorded as not passing. When every
 //! required criterion is satisfied
@@ -591,7 +592,7 @@ fn round_findings(job: &VerifyJob, inspection: &RoundInspection) -> Vec<Finding>
             Ok(_) => {}
             Err(reason) => findings.push(Finding::UnrunnableCheck {
                 check: check.clone(),
-                reason: reason.clone(),
+                reason: format!("{reason} {}", waive_hint(&job.task.id, criterion, check)),
             }),
         }
     }
@@ -606,6 +607,12 @@ fn round_findings(job: &VerifyJob, inspection: &RoundInspection) -> Vec<Finding>
         });
     }
     findings
+}
+
+/// How Mono can settle a declared check that cannot run.
+fn waive_hint(task: &str, criterion: &str, check: &str) -> String {
+    let input = json!({"taskId": task, "criterionId": criterion, "check": check, "reason": "..."});
+    format!("If it cannot be made to run, judge criterion {criterion} yourself and waive this check with tasks.criteria.waive {input} (a reason is required; a check that ran and failed cannot be waived).")
 }
 
 /// One verification per criterion check of the round's snapshot, a check
