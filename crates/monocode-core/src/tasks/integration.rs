@@ -56,8 +56,12 @@ const AFTER_ANSWER: &str = "Integration runs again once this decision is answere
 
 /// The task's integration branch.
 pub fn branch_for(task: &str) -> String {
-    super::workspaces::branch_for(task, "integration")
+    super::workspaces::branch_for(task, RESERVED_ID)
 }
+
+/// The name integration's branch and worktree take after the task; no
+/// assignment may use it (ignoring case).
+pub const RESERVED_ID: &str = "integration";
 
 /// The record id of the task's integration worktree.
 pub fn workspace_id(task: &str) -> String {

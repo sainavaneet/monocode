@@ -613,3 +613,20 @@ fn writable_desktop_stores_create_task_tables_on_first_use_and_readers_never_do(
         .unwrap();
     assert_eq!(task_tables(&memory), 10);
 }
+
+#[test]
+fn the_integration_id_is_reserved_for_the_integration_branch() {
+    for reserved in ["integration", "Integration"] {
+        let store = memory();
+        let tasks = store.tasks().unwrap();
+        tasks.create_task(&new_task("t"), 1).unwrap();
+        let refused = tasks
+            .save_plan("t", 1, &plan(vec![assignment(reserved, &[])]), 2)
+            .unwrap_err();
+        assert!(
+            matches!(&refused, TaskError::Invalid(why) if why.contains("reserved")),
+            "{reserved}: {refused:?}"
+        );
+        assert!(tasks.assignments("t").unwrap().is_empty());
+    }
+}

@@ -733,6 +733,17 @@ pub(super) fn write_plan(
     now: u64,
 ) -> Result<u64, TaskError> {
     crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
+    let reserved = super::integration::RESERVED_ID;
+    if let Some(taken) = plan
+        .tasks
+        .iter()
+        .find(|a| a.id.eq_ignore_ascii_case(reserved))
+    {
+        return Err(TaskError::Invalid(format!(
+            "Assignment ID {} is reserved for the task's integration branch; rename it.",
+            taken.id
+        )));
+    }
     let key = Subject::Task(id).key();
     let stage = guard(tx, &key, "stage", expected_revision)?;
     if !matches!(

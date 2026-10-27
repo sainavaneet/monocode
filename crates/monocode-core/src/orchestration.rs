@@ -210,10 +210,12 @@ pub fn validate(plan: &Plan) -> Result<(), String> {
                 .id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            || !ids.insert(task.id.as_str())
+            // Branch names come from IDs, and they collide on a
+            // case-insensitive file system.
+            || !ids.insert(task.id.to_ascii_lowercase())
         {
             return Err(
-                "Task IDs must be unique and contain only letters, numbers, '-' and '_'.".into(),
+                "Task IDs must be unique ignoring case and contain only letters, numbers, '-' and '_'.".into(),
             );
         }
         if task.title.trim().is_empty()
@@ -326,6 +328,16 @@ mod tests {
             depends_on: deps.iter().map(|s| (*s).into()).collect(),
             ..Task::default()
         }
+    }
+    #[test]
+    fn rejects_ids_that_differ_only_by_case() {
+        let plan = Plan {
+            title: "Work".into(),
+            summary: String::new(),
+            tasks: vec![task("Api", &[], "src"), task("api", &[], "tests")],
+        };
+        let refused = validate(&plan).unwrap_err();
+        assert!(refused.contains("ignoring case"), "{refused}");
     }
     #[test]
     fn rejects_cycles_unknown_dependencies_and_scope_escapes() {
