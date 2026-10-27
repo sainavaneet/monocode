@@ -354,5 +354,9 @@ pub(super) fn in_flight(attempt: &Attempt) -> bool {
 mod tests;
 
 #[cfg(test)]
+#[path = "coordinator_workspace_tests.rs"]
+mod workspace_tests;
+
+#[cfg(test)]
 #[path = "scheduling_tests.rs"]
 mod scheduling_tests;

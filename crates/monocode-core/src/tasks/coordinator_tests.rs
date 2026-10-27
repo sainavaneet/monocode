@@ -13,15 +13,15 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const NOW: u64 = 1_000_000;
+pub(super) const NOW: u64 = 1_000_000;
 
-struct Repo {
+pub(super) struct Repo {
     _dir: tempfile::TempDir,
-    root: PathBuf,
-    db: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) db: PathBuf,
 }
 
-fn git(cwd: &Path, args: &[&str]) -> String {
+pub(super) fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(cwd)
         .args(args)
@@ -35,7 +35,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-fn repo() -> Repo {
+pub(super) fn repo() -> Repo {
     let dir = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(dir.path()).unwrap();
     let root = base.join("project");
@@ -55,14 +55,14 @@ fn repo() -> Repo {
 }
 
 /// A file-backed store, as two processes sharing monocode.db would open it.
-fn open(repo: &Repo) -> Store {
+pub(super) fn open(repo: &Repo) -> Store {
     let store = Store::open(&repo.db).unwrap();
     store.save_setting(FLAG, "enabled").unwrap();
     store
 }
 
 /// Task `t`, planned and explicitly started by Mono.
-fn started(store: &Store, repo: &Repo, assignments: Vec<crate::tasks::Assignment>) {
+pub(super) fn started(store: &Store, repo: &Repo, assignments: Vec<crate::tasks::Assignment>) {
     let tasks = store.tasks().unwrap();
     tasks
         .create_task(
@@ -88,7 +88,7 @@ fn started(store: &Store, repo: &Repo, assignments: Vec<crate::tasks::Assignment
 }
 
 /// Reads the project in place: plans mark investigation with `checkout`.
-fn investigation(id: &str) -> crate::tasks::Assignment {
+pub(super) fn investigation(id: &str) -> crate::tasks::Assignment {
     crate::tasks::Assignment {
         files: vec![".".into()],
         workspace: Some(WorkspaceMode::Checkout),
@@ -96,7 +96,7 @@ fn investigation(id: &str) -> crate::tasks::Assignment {
     }
 }
 
-fn scoped(id: &str, files: &[&str], deps: &[&str]) -> crate::tasks::Assignment {
+pub(super) fn scoped(id: &str, files: &[&str], deps: &[&str]) -> crate::tasks::Assignment {
     crate::tasks::Assignment {
         files: files.iter().map(|f| (*f).to_owned()).collect(),
         workspace: None,
@@ -106,8 +106,8 @@ fn scoped(id: &str, files: &[&str], deps: &[&str]) -> crate::tasks::Assignment {
 
 /// Stands in for the GUI: records each session it is asked to start.
 #[derive(Default)]
-struct FakeLauncher {
-    started: RefCell<Vec<(Session, Settings)>>,
+pub(super) struct FakeLauncher {
+    pub(super) started: RefCell<Vec<(Session, Settings)>>,
     crash: Cell<bool>,
     refuse: Cell<bool>,
 }
@@ -127,7 +127,7 @@ impl Launcher for FakeLauncher {
     }
 }
 
-fn coordinator(holder: &str) -> Coordinator {
+pub(super) fn coordinator(holder: &str) -> Coordinator {
     Coordinator::new(holder, ExplicitStart)
 }
 
@@ -140,7 +140,7 @@ fn attempts(store: &Store, id: &str) -> Vec<crate::tasks::Attempt> {
     store.tasks().unwrap().attempts("t", id).unwrap()
 }
 
-fn events(store: &Store, kind: &str) -> Vec<crate::tasks::Event> {
+pub(super) fn events(store: &Store, kind: &str) -> Vec<crate::tasks::Event> {
     let tasks = store.tasks().unwrap();
     let all = tasks.events_after(0, 10_000).unwrap();
     all.into_iter().filter(|e| e.kind == kind).collect()
@@ -534,64 +534,6 @@ fn two_coordinators_cannot_both_hold_a_task_lease() {
 }
 
 #[test]
-fn a_dirty_checkout_is_left_intact_and_the_worktree_starts_from_head() {
-    let repo = repo();
-    std::fs::write(repo.root.join("src/lib.rs"), "pub fn edited() {}\n").unwrap();
-    std::fs::write(repo.root.join("notes.txt"), "untracked\n").unwrap();
-    let before = git(&repo.root, &["status", "--porcelain"]);
-    let store = open(&repo);
-    started(&store, &repo, vec![scoped("a", &["src"], &[])]);
-    let launcher = FakeLauncher::default();
-    let tick = coordinator("gpui-1").tick(&store, &launcher, NOW).unwrap();
-    assert_eq!(tick.launched.len(), 1, "{tick:?}");
-    // The user's checkout keeps its changes exactly.
-    assert_eq!(git(&repo.root, &["status", "--porcelain"]), before);
-    assert_eq!(
-        std::fs::read_to_string(repo.root.join("src/lib.rs")).unwrap(),
-        "pub fn edited() {}\n"
-    );
-    assert!(repo.root.join("notes.txt").is_file());
-    // The worktree has HEAD's content and none of the dirty changes.
-    let workspace = &store.tasks().unwrap().workspaces("t").unwrap()[0];
-    let tree = Path::new(&workspace.path);
-    assert_eq!(
-        std::fs::read_to_string(tree.join("src/lib.rs")).unwrap(),
-        "pub fn one() {}\n"
-    );
-    assert!(!tree.join("notes.txt").exists());
-    assert_eq!(git(tree, &["status", "--porcelain"]), "");
-    // Not silent: the intent says the base checkout had uncommitted changes.
-    let intent = &events(&store, "attempt.launch_intent")[0];
-    assert_eq!(intent.payload["dirtyBase"], true);
-}
-
-#[test]
-fn investigation_reads_the_existing_checkout() {
-    let repo = repo();
-    let store = open(&repo);
-    started(&store, &repo, vec![investigation("look")]);
-    let launcher = FakeLauncher::default();
-    let tick = coordinator("gpui-1").tick(&store, &launcher, NOW).unwrap();
-    assert_eq!(tick.launched.len(), 1, "{tick:?}");
-    let workspace = &store.tasks().unwrap().workspaces("t").unwrap()[0];
-    assert_eq!(workspace.mode, WorkspaceMode::Checkout);
-    assert_eq!(workspace.path, repo.root.to_string_lossy());
-    assert_eq!(workspace.branch.as_deref(), Some("main"));
-    assert_eq!(git(&repo.root, &["worktree", "list"]).lines().count(), 1);
-    assert_eq!(launcher.started.borrow()[0].1.worktree_cwd, None);
-    let brief = store
-        .follow_ups(launcher.started.borrow()[0].0.id)
-        .unwrap()
-        .draft
-        .unwrap()
-        .text;
-    assert!(brief.contains("the user's project checkout"), "{brief}");
-    assert!(brief.contains("make no edits"), "{brief}");
-    assert!(!brief.contains("Files you may change"), "{brief}");
-    assert!(!brief.contains("worktree"), "{brief}");
-}
-
-#[test]
 fn a_failed_claim_is_classified_by_the_coordinator_without_a_retry() {
     let repo = repo();
     let store = open(&repo);
@@ -772,31 +714,4 @@ fn a_block_while_reconciling_launches_nothing_else_that_tick() {
     assert_eq!(status(&store, "b"), AssignmentState::Queued);
     assert!(tasks.workspaces("t").unwrap().is_empty());
     assert!(launcher.started.borrow().is_empty());
-}
-
-#[test]
-fn a_leftover_branch_is_adopted_with_its_commits() {
-    let repo = repo();
-    let main = git(&repo.root, &["rev-parse", "HEAD"]);
-    // An earlier run's branch survives without its worktree.
-    let branch = crate::tasks::workspaces::branch_for("t", "a");
-    git(&repo.root, &["checkout", "-q", "-b", &branch]);
-    std::fs::write(repo.root.join("src/earlier.rs"), "// kept\n").unwrap();
-    git(&repo.root, &["add", "."]);
-    git(&repo.root, &["commit", "-q", "-m", "earlier work"]);
-    git(&repo.root, &["checkout", "-q", "main"]);
-    let store = open(&repo);
-    started(&store, &repo, vec![scoped("a", &["src"], &[])]);
-    let launcher = FakeLauncher::default();
-    let tick = coordinator("gpui-1").tick(&store, &launcher, NOW).unwrap();
-    assert_eq!(tick.launched.len(), 1, "{tick:?}");
-    let tasks = store.tasks().unwrap();
-    assert_eq!(
-        tasks.task("t").unwrap().unwrap().lifecycle,
-        TaskLifecycle::Active
-    );
-    let workspace = &tasks.workspaces("t").unwrap()[0];
-    assert_eq!(workspace.branch.as_deref(), Some(branch.as_str()));
-    assert!(Path::new(&workspace.path).join("src/earlier.rs").is_file());
-    assert_eq!(workspace.base_commit.as_deref(), Some(main.as_str()));
 }
