@@ -9,7 +9,9 @@ use gpui::{App, AsyncApp, Entity, Global, WeakEntity};
 use monocode_core::agent::Settings;
 use monocode_core::store::Session;
 use monocode_core::tasks;
-use monocode_core::tasks::coordinator::{Coordinator, ExplicitStart, Launcher, TICK_INTERVAL_MS};
+use monocode_core::tasks::coordinator::{
+    Coordinator, ExplicitStart, Launcher, TICK_INTERVAL_MS, Tick,
+};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +63,12 @@ impl Launcher for ShellLauncher {
 /// Reviews workers' success claims. Only collecting the requests and
 /// recording the outcomes hold the store lock; snapshotting the workspace and
 /// running the plan's checks (which may take minutes) do not.
-fn review_claims(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> Result<(), String> {
+/// A reporting worker's stop that stalls goes into `tick.stalled`.
+fn review_claims(
+    coordinator: &Coordinator<ExplicitStart>,
+    store: &Database,
+    tick: &mut Tick,
+) -> Result<(), String> {
     let now = monocode_core::time::now_ms;
     let jobs = {
         let store = locked(store)?;
@@ -69,7 +76,7 @@ fn review_claims(coordinator: &Coordinator<ExplicitStart>, store: &Database) -> 
             return Ok(());
         }
         coordinator
-            .review_jobs(&store, now())
+            .review_jobs(&store, now(), tick)
             .map_err(|e| e.to_string())?
     };
     // One failing review must not stop the others; each failure counts
@@ -317,29 +324,30 @@ pub(crate) fn tick_pass(
         Ok(_) => {}
         Err(error) => eprintln!("Task coordinator takeover: {error}"),
     }
-    let tick = locked(store).map_err(|e| e.to_string()).and_then(|store| {
+    let mut tick = locked(store).map_err(|e| e.to_string()).and_then(|store| {
         coordinator
             .tick(&store, launcher, monocode_core::time::now_ms())
             .map_err(|e| e.to_string())
     });
-    match tick {
-        Ok(tick) if !tick.errors.is_empty() || !tick.stalled.is_empty() => {
+    // Review's stalled stops join the tick's, so one log line reports both.
+    let mut detached = Tick::default();
+    let target = match &mut tick {
+        Ok(tick) => tick,
+        Err(_) => &mut detached,
+    };
+    if let Err(error) = review_claims(coordinator, store, target) {
+        eprintln!("Task coordinator review: {error}");
+    }
+    match &tick {
+        Ok(tick) => {
             if !tick.errors.is_empty() {
                 eprintln!("Task coordinator: {}", tick.errors.join("; "));
             }
-            if !tick.stalled.is_empty() {
-                eprintln!(
-                    "Task recovery: the stop of {} has not been confirmed; no replacement starts until it is.",
-                    tick.stalled.join(", ")
-                );
-            }
+            report_stalled(&tick.stalled);
         }
         Err(error) => eprintln!("Task coordinator: {error}"),
-        Ok(_) => {}
     }
-    if let Err(error) = review_claims(coordinator, store) {
-        eprintln!("Task coordinator review: {error}");
-    }
+    report_stalled(&detached.stalled);
     if let Err(error) = verify_tasks(coordinator, store) {
         eprintln!("Task coordinator verification: {error}");
     }
@@ -347,6 +355,16 @@ pub(crate) fn tick_pass(
         eprintln!("Task coordinator integration: {error}");
     }
     true
+}
+
+/// Logs the workers whose stop has not been confirmed past the stall limit.
+fn report_stalled(stalled: &[String]) {
+    if !stalled.is_empty() {
+        eprintln!(
+            "Task recovery: the stop of {} has not been confirmed; no replacement starts until it is.",
+            stalled.join(", ")
+        );
+    }
 }
 
 /// A name for this process in task leases; never shared with another process.

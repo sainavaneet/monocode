@@ -121,3 +121,30 @@ fn review_waits_for_the_reporting_worker_to_stop() {
     let reviews = run.coordinator.review(&store, NOW + 6).unwrap();
     assert_eq!(reviews.len(), 1, "{reviews:?}");
 }
+
+#[test]
+fn a_stalled_stop_before_review_is_listed_in_the_tick_once() {
+    let repo = repo();
+    let store = open(&repo);
+    let run = reported(&store, &repo.root, "succeeded");
+    let tick = run
+        .coordinator
+        .tick(&store, &run.launcher, NOW + 3)
+        .unwrap();
+    assert_eq!(tick.reviews.len(), 1, "{tick:?}");
+    let late = NOW + 3 + crate::tasks::recovery::STOP_STALL_MS;
+    let mut tick = crate::tasks::coordinator::Tick::default();
+    let jobs = run
+        .coordinator
+        .review_jobs(&store, late, &mut tick)
+        .unwrap();
+    assert!(jobs.is_empty());
+    assert_eq!(tick.stalled.len(), 1, "{tick:?}");
+    let mut again = crate::tasks::coordinator::Tick::default();
+    let jobs = run
+        .coordinator
+        .review_jobs(&store, late + 1, &mut again)
+        .unwrap();
+    assert!(jobs.is_empty());
+    assert!(again.stalled.is_empty(), "reported once: {again:?}");
+}

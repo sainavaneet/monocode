@@ -338,11 +338,13 @@ pub(super) fn acknowledge(conn: &Connection, id: &str, now: u64) -> Result<(), T
 impl<P: Policy> Coordinator<P> {
     /// The pending review requests this coordinator holds the task lease
     /// for. A request already reviewed is acknowledged and skipped; a paused
-    /// or blocked task's requests wait.
+    /// or blocked task's requests wait. A reporting worker's stop that
+    /// stalls is listed in `tick.stalled` (once, as in the tick).
     pub fn review_jobs(
         &self,
         store: &crate::store::Store,
         now: u64,
+        tick: &mut super::coordinator::Tick,
     ) -> Result<Vec<ReviewJob>, TaskError> {
         let tasks = store.tasks()?;
         let mut jobs = Vec::new();
@@ -376,8 +378,7 @@ impl<P: Policy> Coordinator<P> {
             // The worker that reported is stopped first, so nothing it
             // still writes lands after the reviewed snapshot. A stop that
             // stalls is reported to Mono once.
-            let mut ignored = super::coordinator::Tick::default();
-            if self.held_by_stop(&tasks, &task.id, &assignment.id, now, &mut ignored)? {
+            if self.held_by_stop(&tasks, &task.id, &assignment.id, now, tick)? {
                 continue;
             }
             let claim = tasks.claim(&attempt.id)?;
@@ -520,7 +521,8 @@ impl<P: Policy> Coordinator<P> {
     /// `store` throughout. The app uses the three steps separately.
     pub fn review(&self, store: &crate::store::Store, now: u64) -> Result<Vec<Review>, TaskError> {
         let mut reviews = Vec::new();
-        for job in self.review_jobs(store, now)? {
+        let mut tick = super::coordinator::Tick::default();
+        for job in self.review_jobs(store, now, &mut tick)? {
             let inspection = job.inspect();
             reviews.extend(self.record_review(store, &job, inspection, now)?);
         }

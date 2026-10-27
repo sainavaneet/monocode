@@ -150,7 +150,10 @@ fn repeated_review_failures_hand_the_claim_to_mono() {
     let store = open(&repo);
     let run = claimed(&store, &repo, scoped(&[CHECK]), feature);
     for n in 0..REVIEW_RETRY_LIMIT {
-        let jobs = run.coordinator.review_jobs(&store, NOW + 10).unwrap();
+        let jobs = run
+            .coordinator
+            .review_jobs(&store, NOW + 10, &mut Default::default())
+            .unwrap();
         assert_eq!(jobs.len(), 1);
         let error = format!("database is locked ({n})");
         run.coordinator

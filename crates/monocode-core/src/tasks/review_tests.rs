@@ -380,8 +380,14 @@ fn duplicate_review_deliveries_do_not_review_twice() {
     let store = open(&repo);
     let run = claimed(&store, &repo, scoped(&[CHECK]), feature);
     // Two passes pick up the same delivery before either records.
-    let first = run.coordinator.review_jobs(&store, NOW + 10).unwrap();
-    let second = run.coordinator.review_jobs(&store, NOW + 10).unwrap();
+    let first = run
+        .coordinator
+        .review_jobs(&store, NOW + 10, &mut Default::default())
+        .unwrap();
+    let second = run
+        .coordinator
+        .review_jobs(&store, NOW + 10, &mut Default::default())
+        .unwrap();
     assert_eq!((first.len(), second.len()), (1, 1));
     let recorded = run
         .coordinator
