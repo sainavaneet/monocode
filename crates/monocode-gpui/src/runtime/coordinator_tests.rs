@@ -438,3 +438,58 @@ fn startup_interrupts_workers_that_died_with_the_last_run() {
     assert_eq!(row.failure, monocode_core::tasks::restart::RESTART);
     assert_eq!(row.state, "scheduled");
 }
+
+/// With the flag off a tick touches nothing beyond reading the flag and
+/// does not wake the stop pump; with it on the same tick launches the task.
+#[test]
+fn a_tick_with_the_coordinator_off_does_nothing_and_wakes_no_pump() {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    started_task(&store, Path::new("/work/monocode"));
+    let store: Database = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let coordinator = Coordinator::new("gpui-tick-test", ExplicitStart);
+    let launcher = Recorded::default();
+    let events = |store: &Database| {
+        let store = locked(store).unwrap();
+        store
+            .tasks()
+            .unwrap()
+            .events_after(0, 10_000)
+            .unwrap()
+            .len()
+    };
+    let before = events(&store);
+    assert!(!super::coordinator::tick_pass(
+        &coordinator,
+        &store,
+        &launcher
+    ));
+    assert!(launcher.0.borrow().is_empty());
+    assert_eq!(events(&store), before, "nothing was recorded");
+    locked(&store)
+        .unwrap()
+        .save_setting(FLAG, "enabled")
+        .unwrap();
+    assert!(super::coordinator::tick_pass(
+        &coordinator,
+        &store,
+        &launcher
+    ));
+}
+
+/// Launches go to the most recent window; once it closes, to another one
+/// still open rather than nowhere.
+#[gpui::test]
+fn launches_fall_back_to_another_live_window(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    struct Window;
+    let first = cx.update(|cx| cx.new(|_| Window));
+    let latest = cx.update(|cx| cx.new(|_| Window));
+    let all = vec![first.downgrade(), latest.downgrade()];
+    let preferred = latest.downgrade();
+    let chosen = super::coordinator::preferred_or_live(&preferred, &all).unwrap();
+    assert_eq!(chosen.entity_id(), latest.entity_id());
+    drop((latest, chosen));
+    cx.run_until_parked();
+    let chosen = super::coordinator::preferred_or_live(&preferred, &all).unwrap();
+    assert_eq!(chosen.entity_id(), first.entity_id());
+}

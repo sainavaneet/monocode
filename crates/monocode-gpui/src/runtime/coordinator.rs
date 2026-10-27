@@ -28,6 +28,23 @@ impl Service {
     fn live_shells(&self) -> Vec<Entity<Shell>> {
         self.shells.iter().filter_map(WeakEntity::upgrade).collect()
     }
+
+    /// Where a launched worker is installed.
+    fn launch_shell(&self) -> Option<Entity<Shell>> {
+        preferred_or_live(&self.shell, &self.shells)
+    }
+}
+
+/// `preferred` while it is alive, otherwise the most recent live one of
+/// `all`: closing the latest window must not strand worker launches while
+/// another window is still open.
+pub(crate) fn preferred_or_live<T: 'static>(
+    preferred: &WeakEntity<T>,
+    all: &[WeakEntity<T>],
+) -> Option<Entity<T>> {
+    preferred
+        .upgrade()
+        .or_else(|| all.iter().rev().find_map(WeakEntity::upgrade))
 }
 impl Global for Service {}
 
@@ -280,6 +297,58 @@ async fn stop_failed_workers(store: &Database, cx: &mut AsyncApp) {
     }
 }
 
+/// One coordinator tick. The flag is read once, holding the store only for
+/// that: with `native-task-coordinator` off nothing else touches the store
+/// and the stop pump is not woken. Returns whether the tick ran.
+pub(crate) fn tick_pass(
+    coordinator: &Coordinator<ExplicitStart>,
+    store: &Database,
+    launcher: &impl Launcher,
+) -> bool {
+    if !locked(store).is_ok_and(|store| tasks::coordinator::enabled(&store)) {
+        return false;
+    }
+    // Tasks taken over since startup are reconciled the same way:
+    // the store is locked only to read and write, never for Git.
+    match reconcile(store, false) {
+        Ok(taken) if !taken.errors.is_empty() => {
+            eprintln!("Task coordinator takeover: {}", taken.errors.join("; "))
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("Task coordinator takeover: {error}"),
+    }
+    let tick = locked(store).map_err(|e| e.to_string()).and_then(|store| {
+        coordinator
+            .tick(&store, launcher, monocode_core::time::now_ms())
+            .map_err(|e| e.to_string())
+    });
+    match tick {
+        Ok(tick) if !tick.errors.is_empty() || !tick.stalled.is_empty() => {
+            if !tick.errors.is_empty() {
+                eprintln!("Task coordinator: {}", tick.errors.join("; "));
+            }
+            if !tick.stalled.is_empty() {
+                eprintln!(
+                    "Task recovery: the stop of {} has not been confirmed; no replacement starts until it is.",
+                    tick.stalled.join(", ")
+                );
+            }
+        }
+        Err(error) => eprintln!("Task coordinator: {error}"),
+        Ok(_) => {}
+    }
+    if let Err(error) = review_claims(coordinator, store) {
+        eprintln!("Task coordinator review: {error}");
+    }
+    if let Err(error) = verify_tasks(coordinator, store) {
+        eprintln!("Task coordinator verification: {error}");
+    }
+    if let Err(error) = integrate_tasks(coordinator, store) {
+        eprintln!("Task coordinator integration: {error}");
+    }
+    true
+}
+
 /// A name for this process in task leases; never shared with another process.
 fn holder() -> String {
     format!(
@@ -448,7 +517,7 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                 if !allowed {
                     return Err("The worker's launch was given up before the app started it.");
                 }
-                let shell = cx.try_global::<Service>().and_then(|s| s.shell.upgrade());
+                let shell = cx.try_global::<Service>().and_then(Service::launch_shell);
                 match shell {
                     Some(shell) => {
                         shell.update(cx, |shell, cx| {
@@ -496,45 +565,9 @@ pub(crate) fn install(store: Database, shell: WeakEntity<Shell>, cx: &mut App) {
                 if STARTING.load(Ordering::SeqCst) {
                     continue;
                 }
-                // Tasks taken over since startup are reconciled the same way:
-                // the store is locked only to read and write, never for Git.
-                match reconcile(&store, false) {
-                    Ok(taken) if !taken.errors.is_empty() => {
-                        eprintln!("Task coordinator takeover: {}", taken.errors.join("; "))
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("Task coordinator takeover: {error}"),
+                if tick_pass(coordinator, &store, &launcher) {
+                    let _ = pumps.try_send(());
                 }
-                let tick = locked(&store).map_err(|e| e.to_string()).and_then(|store| {
-                    coordinator
-                        .tick(&store, &launcher, monocode_core::time::now_ms())
-                        .map_err(|e| e.to_string())
-                });
-                match tick {
-                    Ok(tick) if !tick.errors.is_empty() || !tick.stalled.is_empty() => {
-                        if !tick.errors.is_empty() {
-                            eprintln!("Task coordinator: {}", tick.errors.join("; "));
-                        }
-                        if !tick.stalled.is_empty() {
-                            eprintln!(
-                                "Task recovery: the stop of {} has not been confirmed; no replacement starts until it is.",
-                                tick.stalled.join(", ")
-                            );
-                        }
-                    }
-                    Err(error) => eprintln!("Task coordinator: {error}"),
-                    Ok(_) => {}
-                }
-                if let Err(error) = review_claims(coordinator, &store) {
-                    eprintln!("Task coordinator review: {error}");
-                }
-                if let Err(error) = verify_tasks(coordinator, &store) {
-                    eprintln!("Task coordinator verification: {error}");
-                }
-                if let Err(error) = integrate_tasks(coordinator, &store) {
-                    eprintln!("Task coordinator integration: {error}");
-                }
-                let _ = pumps.try_send(());
             }
         })
         .detach();
