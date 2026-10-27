@@ -21,6 +21,7 @@
 //! required criterion is satisfied
 //! the final report is persisted and the task completes. As with review,
 //! only collecting and recording use the store.
+use super::autonomy::Authority;
 use super::checks::{self, Batch};
 use super::completion::{
     complete, criterion_satisfied, evidence, refresh_verifications, FinalReport,
@@ -84,6 +85,8 @@ pub struct VerifyJob {
     /// and decisions looked like when it started.
     round: String,
     corrections: usize,
+    /// The task has commit authority, so a check may commit.
+    may_commit: bool,
 }
 
 /// What a round's checks found; no store access.
@@ -114,7 +117,13 @@ impl VerifyJob {
         let path = &self.workspace.path;
         match crate::checkpoint::snapshot_workspace(path, &side("before")) {
             Ok(before) => {
-                found.batch = checks::run_batch(path, &found.checks, &before, &side("after"));
+                found.batch = checks::run_batch(
+                    path,
+                    &found.checks,
+                    &before,
+                    &side("after"),
+                    self.may_commit,
+                );
                 found.error = found.batch.error.clone();
                 found.checkpoint = Some(before);
             }
@@ -356,7 +365,14 @@ impl<P: Policy> Coordinator<P> {
                 .count(),
             None => 0,
         };
+        // Fail closed: an error reading the policy fails the pass.
+        let may_commit = match self.authorize(store, id, Authority::Commit) {
+            Ok(()) => true,
+            Err(TaskError::Invalid(_)) => false,
+            Err(error) => return Err(error),
+        };
         Ok(Some(VerifyJob {
+            may_commit,
             task,
             assignment,
             workspace,

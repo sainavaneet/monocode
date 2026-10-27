@@ -7,6 +7,7 @@ pub mod autonomy;
 pub mod brief;
 pub mod checks;
 pub mod completion;
+mod confine;
 pub mod coordinator;
 pub mod decisions;
 pub mod events;

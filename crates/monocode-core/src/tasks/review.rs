@@ -222,6 +222,7 @@ impl ReviewJob {
             &self.assignment.verification,
             &checkpoint,
             &after_ref,
+            !self.commits_refused,
         );
         found.error = found.batch.error.clone();
         found

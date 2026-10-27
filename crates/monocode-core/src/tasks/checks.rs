@@ -5,7 +5,9 @@
 //! workspace, so a step that needs a shell (pipes, `&&`, redirection,
 //! variables, globs) or is prose (`Run the tests`) cannot run: review hands it
 //! to Mono instead of guessing. A program named by path must stay inside the
-//! workspace.
+//! workspace, and so must every path argument; Git may not reach a remote or
+//! another repository, and commits only with commit authority (`confine`).
+pub(super) use super::confine::confine;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -45,8 +47,13 @@ impl CheckRun {
 }
 
 /// The program and arguments of `check`, or why it cannot run without a
-/// shell or a person reading it.
-pub fn command_line(check: &str, cwd: &Path) -> Result<(PathBuf, Vec<String>), String> {
+/// shell or a person reading it, or may not run here ([`confine`]).
+/// `may_commit`: the task has commit authority.
+pub fn command_line(
+    check: &str,
+    cwd: &Path,
+    may_commit: bool,
+) -> Result<(PathBuf, Vec<String>), String> {
     let argv = shlex::split(check.trim())
         .filter(|argv| !argv.is_empty())
         .ok_or("It is not a command line.")?;
@@ -57,6 +64,7 @@ pub fn command_line(check: &str, cwd: &Path) -> Result<(PathBuf, Vec<String>), S
     {
         return Err("It needs a shell; checks run without one.".into());
     }
+    confine(&argv, cwd, may_commit)?;
     let program = resolve(&argv[0], cwd)?;
     Ok((program, argv))
 }
@@ -103,10 +111,20 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Runs `check` in `cwd` until it exits or `timeout` passes. Errs only when
-/// it cannot run at all ([`command_line`]).
+/// Runs `check` in `cwd` until it exits or `timeout` passes, without commit
+/// authority. Errs only when it cannot run at all ([`command_line`]).
 pub fn run(check: &str, cwd: &Path, timeout: Duration) -> Result<CheckRun, String> {
-    let (program, argv) = command_line(check, cwd)?;
+    run_allowing(check, cwd, timeout, false)
+}
+
+/// As [`run`], committing allowed when `may_commit`.
+pub fn run_allowing(
+    check: &str,
+    cwd: &Path,
+    timeout: Duration,
+    may_commit: bool,
+) -> Result<CheckRun, String> {
+    let (program, argv) = command_line(check, cwd, may_commit)?;
     let mut command = Command::new(&program);
     crate::scm::shell::apply_gui_env(&mut command);
     command
@@ -217,12 +235,19 @@ impl Batch {
 
 /// Runs `checks` in the workspace at `path`, whose snapshot before them is
 /// `before`, then snapshots it again at `after_ref` and reports any change.
-pub fn run_batch(path: &str, checks: &[String], before: &str, after_ref: &str) -> Batch {
+/// Commit-capable Git runs only when `may_commit`.
+pub fn run_batch(
+    path: &str,
+    checks: &[String],
+    before: &str,
+    after_ref: &str,
+    may_commit: bool,
+) -> Batch {
     let timeout = Duration::from_millis(CHECK_TIMEOUT_MS);
     let mut batch = Batch {
         results: checks
             .iter()
-            .map(|check| run(check, Path::new(path), timeout))
+            .map(|check| run_allowing(check, Path::new(path), timeout, may_commit))
             .collect(),
         ..Batch::default()
     };
@@ -258,3 +283,7 @@ fn keep_end(text: &str) -> (String, bool) {
     }
     (text[start..].to_owned(), true)
 }
+
+#[cfg(test)]
+#[path = "checks_tests.rs"]
+mod tests;

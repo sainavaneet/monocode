@@ -160,3 +160,28 @@ fn a_failed_check_keeps_the_task_open_after_the_round_changes() {
     assert_eq!(task.stage, TaskStage::Verifying);
     assert!(events(&store, "task.final_report").is_empty());
 }
+
+#[test]
+fn monos_own_checks_are_confined_like_the_plans() {
+    let repo = repo();
+    let store = open(&repo);
+    claimed_with(&store, &repo, scoped(&[CHECK]), &[CHECK], feature);
+    let workspace = store.tasks().unwrap().workspaces("t").unwrap().remove(0);
+    for refused in ["git push origin main", "cat /etc/hosts", "git -C .. status"] {
+        let run = crate::tasks::completion::verify_criterion(
+            &store,
+            "t",
+            "c1",
+            &workspace,
+            refused,
+            NOW + 5,
+        );
+        assert!(run.is_err(), "{refused}: {run:?}");
+    }
+    let tasks = store.tasks().unwrap();
+    assert!(tasks
+        .verifications("t")
+        .unwrap()
+        .iter()
+        .all(|v| v.criterion_id.is_none()));
+}
