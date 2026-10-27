@@ -3,7 +3,8 @@
 Written 2026-10-26 after checking every claim against the code. Mono plans,
 delegates, answers workers, reviews and reports. The app persists state,
 routes decisions, detects failures, switches authorized accounts and resumes
-interrupted work. Nothing below is built yet except where marked **exists**.
+interrupted work. The plan sections below were written before the build;
+**exists** marks what was already there then.
 
 **Update 2026-10-27:** phases 0 to 8 are now built on `feat/project-switcher`
 behind the `native-task-coordinator` setting (off by default). The sections
@@ -257,7 +258,10 @@ see **Built > Proof**.
 
 ## Built (2026-10-27)
 
-Twelve tasks, each reviewed and merged on `feat/project-switcher`. Core paths
+Twelve tasks on `feat/project-switcher`, each reviewed before it landed
+(tasks 9 and 10 were built on side branches and merged; the others were
+committed on the branch directly), then a final whole-branch review and fix
+batch (below). Core paths
 are under `crates/monocode-core/src/`, app paths under
 `crates/monocode-gpui/src/`.
 
@@ -363,14 +367,16 @@ From the controller ledger, accepted for later:
   `orchestration_card.rs`; untested shell glue; planning state split across
   `composer_features.rs` and `orchestration_card.rs`.
 - Store: `TaskStore::state` race; idempotent inserts ignore a differing
-  payload; `CriteriaSatisfied` is true with zero criteria; no events for
+  payload; no events for
   requirement edits; no secondary indexes; `tasks()` re-runs `CREATE TABLE IF
   NOT EXISTS` per call.
 - Worker protocol: `NO_SESSION` matched by string between `app_access.rs` and
-  `store/shared.rs`; requester sets for Succeeded/NeedsReview kept aligned by
-  hand.
-- Coordinator: the store lock is held over a whole tick including Git (UI
-  stalls when the flag is on); GUI install/confirm receiver untested;
+  `store/shared.rs`. (The Succeeded/NeedsReview requester sets are now pinned
+  by `states::tests::succeeded_and_needs_review_allow_the_same_requesters`.)
+- Coordinator: verification no longer runs Git under the store lock, but
+  other steps of the tick still do (review preparation, launch preparation,
+  integration preparation, recovery's workspace checks), and the GUI takes
+  the store lock on the UI thread in places (`refresh_cards`, `batch_failed`); GUI install/confirm receiver untested;
   `dirtyBase` lost on a crash between `save_workspace` and the intent; no
   remote:// refusal or rate limit on the worker route; first-call race refusal
   does not say retry.
@@ -398,6 +404,40 @@ From the controller ledger, accepted for later:
 - Integration: stops at the first conflict; a revoked-merge clean record is
   usable by Mono's manual Verifying; a committed file that is now gitignored
   is falsely refused.
+
+- Authority over a worker's own shell: the app cannot technically stop a
+  worker from pushing, merging or deploying with its own tools if told to.
+  What is enforced: the brief states what the effective policy forbids, an
+  answer that mentions such a step reaches the worker after a reminder that
+  it cannot grant authority (`brief::handoff_message`), Mono's help says
+  answers cannot grant authority, commits are enforced at review
+  (`UnauthorizedCommits`), merges only by integration with Merge authority,
+  and checks may never push. Mono's answers themselves are not refused for
+  granting authority, and a provider-native reply carries no reminder.
+- **Before enabling the flag for real use:** UI-thread store locks during the
+  coordinator tick (Git work in the remaining locked steps above, and the GUI
+  locks on the UI thread) must be removed.
+
+### Final review fixes (2026-10-27)
+
+- A criterion with several checks is satisfied only when every one of its
+  checks passed on one snapshot; a check that cannot run is recorded as not
+  passing (`completion::criterion_satisfied`, shared by the completion
+  precondition, the next round, the report and the task view).
+- A worker that reports a result is stopped; nothing relaunches in its
+  workspace and its claim is not reviewed until the app confirms the stop.
+- Checks are confined to their workspace: no path argument outside it, no
+  Git push, remote change, refspec fetch or `-C`/`--git-dir`/`--work-tree`/
+  `-c`, and commit-capable Git only with Commit authority (`tasks/confine.rs`).
+- Verification's locked steps run no Git; the final report is built inside
+  the completing transaction (`tasks/report.rs`).
+- Plan assignment ids must differ ignoring case, and `integration` is
+  reserved; recording a verification is idempotent.
+- With the flag off the GUI shows no Autonomy settings and Mono chats switch
+  accounts exactly as before; the ticker does nothing beyond one flag check.
+  A worker's routed question is never auto-skipped when routing fails, a
+  KeepOpen permission stays pending, launches fall back to any live window,
+  and a recreated worker view takes its billing pin from the task policy.
 
 ### Remaining
 
