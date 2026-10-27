@@ -420,11 +420,12 @@ fn settle_failure(
     let Some(found) = tasks.attempt(attempt_id)? else {
         return Ok(Outcome::Ignored);
     };
-    let task = task(&tasks, &found.task_id)?;
     let tx = tasks.begin()?;
     let inside = TaskStore { conn: &tx };
-    // Re-read under the write lock: a concurrent report may have won. Only
-    // then is anything (the account's standing included) recorded.
+    // Re-read under the write lock: a concurrent report may have won, or the
+    // task may have been paused or cancelled. Only then is anything (the
+    // account's standing included) recorded.
+    let task = task(&inside, &found.task_id)?;
     let Some(attempt) = inside.attempt(attempt_id)? else {
         return Ok(Outcome::Ignored);
     };
