@@ -22,7 +22,7 @@ mod response_menu;
 mod submission_tests;
 pub(crate) mod task_controls;
 pub(crate) mod task_monitor;
-mod task_questions;
+pub(crate) mod task_questions;
 pub(crate) mod task_recovery;
 mod title;
 use crate::{
@@ -207,6 +207,9 @@ pub(crate) struct Conversation {
     question_overlay: crate::questions::Overlay,
     /// Provider questions routed to Mono: (decision id, question id).
     task_questions: Vec<(String, String)>,
+    /// Worker questions a storage error kept from Mono; kept open and routed
+    /// again on the next task pass.
+    unrouted_questions: Vec<monocode_core::agent::Question>,
     controls: Option<std::sync::mpsc::Sender<Control>>,
     branch: Option<String>,
     git: Option<monocode_core::git::Snapshot>,
@@ -648,6 +651,7 @@ impl Conversation {
             questions: Default::default(),
             question_overlay: Default::default(),
             task_questions: Vec::new(),
+            unrouted_questions: Vec::new(),
             controls: None,
             branch: git.as_ref().and_then(|s| s.current.clone()),
             git,
@@ -721,6 +725,14 @@ impl Conversation {
         let mono = self.settings.mono.is_some();
         let work = cx.background_executor().spawn(async move {
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
+            // A task worker's billing pin is not saved with its settings:
+            // it comes from the task's policy snapshot.
+            let pin = locked(&store)
+                .and_then(|s| task_recovery::worker_billing(&s, id))
+                .unwrap_or_else(|error| {
+                    eprintln!("Task worker billing for session {id}: {error}");
+                    None
+                });
             let execution_cwd = settings
                 .as_ref()
                 .ok()
@@ -750,10 +762,11 @@ impl Conversation {
                 locked(&store).and_then(|s| s.context_usage(id)),
                 locked(&store).and_then(|s| s.follow_ups(id)),
                 locked(&store).and_then(|s| s.history_before(id)),
+                pin,
             )
         });
         cx.spawn(async move |this, cx| {
-            let (result, git, settings, context, follow_ups, before) = work.await;
+            let (result, git, settings, context, follow_ups, before, pin) = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
                 this.branch = git.as_ref().and_then(|s| s.current.clone());
@@ -801,11 +814,14 @@ impl Conversation {
                     this.model = settings.model.clone();
                     let mono = this.settings.mono.take();
                     let environment = std::mem::take(&mut this.settings.environment);
+                    let launched = this.settings.api_key_pin;
                     this.settings = settings;
+                    this.settings.api_key_pin = launched;
                     this.attach_account(cx);
                     this.settings.mono = mono;
                     this.settings.environment = environment;
                 }
+                this.settings.api_key_pin = pin.or(this.settings.api_key_pin);
                 match result {
                     Ok((history, edits)) => {
                         this.remember_session_edits(edits);
@@ -1324,71 +1340,7 @@ impl Conversation {
                         } else {
                             this.route_task_questions(update.questions)
                         };
-                        for request in questions {
-                            let card =
-                                cx.new(|cx| crate::questions::QuestionCard::new(request, cx));
-                            let events = cx.subscribe(
-                                &card,
-                                |this, _, reply: &crate::questions::Answered, cx| {
-                                    if this
-                                        .questions
-                                        .front()
-                                        .is_none_or(|(card, _)| card.read(cx).id() != reply.id)
-                                    {
-                                        return;
-                                    }
-                                    let before = this.needs_approval();
-                                    let decision = reply
-                                        .answers
-                                        .clone()
-                                        .map_or(Decision::Deny, Decision::Answer);
-                                    if this.controls.as_ref().is_none_or(|controls| {
-                                        controls
-                                            .send(Control {
-                                                id: reply.id.clone(),
-                                                decision,
-                                            })
-                                            .is_err()
-                                    }) {
-                                        this.status =
-                                            "The provider is no longer waiting for this answer"
-                                                .into();
-                                        cx.notify();
-                                        return;
-                                    }
-                                    if let Some((card, _)) = this.questions.pop_front() {
-                                        this.question_overlay.release(card, cx);
-                                    }
-                                    this.status = if !this.approvals.is_empty() {
-                                        "Waiting for approval"
-                                    } else if !this.questions.is_empty() {
-                                        "Waiting for your answer"
-                                    } else {
-                                        "Working…"
-                                    }
-                                    .into();
-                                    if before != this.needs_approval() {
-                                        cx.emit(SessionChanged);
-                                    }
-                                    cx.notify();
-                                },
-                            );
-                            let keep_open = cx.subscribe(
-                                &card,
-                                |this, _, request: &crate::questions::KeptOpen, cx| {
-                                    if let Some(controls) = &this.controls {
-                                        let _ = controls.send(Control {
-                                            id: request.id.clone(),
-                                            decision: Decision::KeepOpen,
-                                        });
-                                    }
-                                    cx.emit(SessionChanged);
-                                    cx.notify();
-                                },
-                            );
-                            this.questions.push_back((card, vec![events, keep_open]));
-                            this.status = "Waiting for your answer".into();
-                        }
+                        this.show_user_questions(questions, cx);
                         if !finished && !this.approvals.is_empty() {
                             this.status = "Waiting for approval".into();
                         } else if !finished && !this.questions.is_empty() {

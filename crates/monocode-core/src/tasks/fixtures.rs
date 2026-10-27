@@ -20,6 +20,20 @@ pub fn break_monitor(store: &Store) -> Result<(), TaskError> {
     Ok(())
 }
 
+/// Hides the decisions table (`hidden`) so writing a decision fails as a
+/// storage error would, or restores it. Destructive and test-only.
+#[doc(hidden)]
+pub fn hide_decisions(store: &Store, hidden: bool) -> Result<(), TaskError> {
+    let sql = if hidden {
+        "ALTER TABLE native_task_decisions RENAME TO hidden_task_decisions;"
+    } else {
+        "DROP TABLE IF EXISTS native_task_decisions;
+         ALTER TABLE hidden_task_decisions RENAME TO native_task_decisions;"
+    };
+    store.connection().execute_batch(sql)?;
+    Ok(())
+}
+
 /// Task `t` owned by `mono` in `project`, Implementing, with assignment `a`
 /// ("Assignment a", files `src`) Running and attempt `x` Running and bound to
 /// a new worker session, whose handle is returned.

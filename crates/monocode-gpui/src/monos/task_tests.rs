@@ -46,7 +46,7 @@ pub(super) fn mono_busy(s: &Setup, cx: &mut TestAppContext) {
 }
 
 /// No test may start a real provider: the core guard refused nothing here.
-fn assert_no_provider_started(before: usize) {
+pub(super) fn assert_no_provider_started(before: usize) {
     use monocode_core::provider::test_guard;
     assert!(test_guard::under_test());
     assert!(monocode_core::provider::resolve(monocode_core::provider::Kind::Codex).is_none());
@@ -175,7 +175,7 @@ fn a_failing_task_message_is_retried_then_shown_in_monos_chat(cx: &mut TestAppCo
     assert_no_provider_started(before);
 }
 
-fn storage_question() -> Question {
+pub(super) fn storage_question() -> Question {
     Question {
         id: "\"wire-1\"".into(),
         title: "The agent has a question".into(),

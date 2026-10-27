@@ -66,6 +66,10 @@ impl Monos {
         if self.pumping_tasks {
             return;
         }
+        // Worker questions a storage error kept open are routed again.
+        if let Some(owner) = self.owner.upgrade() {
+            owner.update(cx, |owner, cx| owner.retry_task_questions(cx));
+        }
         let monos: Vec<(String, Option<i64>)> = self
             .roster
             .monos

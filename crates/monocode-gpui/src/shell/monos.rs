@@ -91,6 +91,12 @@ impl Shell {
             model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
         }
     }
+    /// Routes again every worker question a storage error held back.
+    pub(crate) fn retry_task_questions(&mut self, cx: &mut Context<Self>) {
+        for view in self.sessions.values() {
+            view.update(cx, |view, cx| view.retry_task_questions(cx));
+        }
+    }
     /// A session changed: a Mono's task card that shows it as a worker
     /// updates now (busy, waiting on input, last activity).
     pub(super) fn task_worker_changed(&mut self, id: i64, cx: &mut Context<Self>) {

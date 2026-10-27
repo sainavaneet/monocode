@@ -29,6 +29,33 @@ pub(crate) fn turn_end(
     }
 }
 
+/// The billing choice snapshotted into the task policy of the worker whose
+/// session is `session`, so a worker view recreated from the store bills as
+/// its launch did. None for every other session, or with the coordinator off.
+pub(crate) fn worker_billing(
+    store: &monocode_core::store::Store,
+    session: i64,
+) -> Result<Option<bool>, String> {
+    if !monocode_core::tasks::coordinator::enabled(store) {
+        return Ok(None);
+    }
+    let Some(tasks) = store.existing_tasks().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let Ok(bound) = store.persisted_session_id(session) else {
+        return Ok(None);
+    };
+    let Some(attempt) = tasks
+        .attempt_for_session(&bound)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let policy =
+        monocode_core::tasks::policy::of(&tasks, &attempt.task_id).map_err(|e| e.to_string())?;
+    Ok(policy.map(|p| p.use_api_key))
+}
+
 impl Conversation {
     /// The running turn's final update arrived.
     #[cfg(test)]

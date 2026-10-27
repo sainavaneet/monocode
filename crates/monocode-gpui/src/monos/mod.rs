@@ -27,6 +27,8 @@ mod status;
 mod task_monitor_tests;
 mod task_overview;
 #[cfg(test)]
+mod task_session_tests;
+#[cfg(test)]
 mod task_tests;
 mod tasks;
 #[cfg(test)]
