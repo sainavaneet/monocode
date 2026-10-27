@@ -330,6 +330,12 @@ impl Monos {
         );
     }
 
+    /// Whether the task coordinator flag is on; the Autonomy settings exist
+    /// only then.
+    pub(super) fn tasks_enabled(&self) -> bool {
+        locked(&self.store).is_ok_and(|store| monocode_core::tasks::coordinator::enabled(&store))
+    }
+
     /// Reloads the active Mono's tasks, allowlist and known accounts.
     pub(super) fn refresh_autonomy(&mut self, cx: &mut Context<Self>) {
         let Some(mono) = self.active.clone() else {

@@ -185,9 +185,32 @@ fn the_autonomy_section_edits_the_policy_applies_it_and_unblocks_a_task(cx: &mut
 }
 
 #[gpui::test]
+fn the_autonomy_section_is_absent_with_the_task_coordinator_off(cx: &mut TestAppContext) {
+    let _unpublish = Unpublish;
+    let s = setup(cx);
+    let visual = &mut open_autonomy(&s, cx);
+    // Even when asked for, the page falls back to General.
+    assert!(visual.debug_bounds("mono-autonomy-page").is_none());
+    assert!(visual.debug_bounds("mono-settings-General").is_some());
+    assert!(visual.debug_bounds("mono-settings-Autonomy").is_none());
+    locked(&s.store)
+        .unwrap()
+        .save_setting(FLAG, "enabled")
+        .unwrap();
+    s.manager.update(visual, |_, cx| cx.notify());
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("mono-settings-Autonomy").is_some());
+    assert!(visual.debug_bounds("mono-autonomy-page").is_some());
+}
+
+#[gpui::test]
 fn the_account_list_cannot_be_edited_until_a_new_scope_has_loaded(cx: &mut TestAppContext) {
     let _unpublish = Unpublish;
     let s = setup(cx);
+    locked(&s.store)
+        .unwrap()
+        .save_setting(FLAG, "enabled")
+        .unwrap();
     let visual = &mut open_autonomy(&s, cx);
     click(visual, "mono-autonomy-add-codex-default");
     let saved = |scope: Scope<'_>| {

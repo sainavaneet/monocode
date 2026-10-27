@@ -65,6 +65,9 @@ pub(crate) struct SettingsContext {
     pub mobile: Option<monocode_core::mobile::Status>,
     /// The pairing code on show.
     pub mobile_invite: Option<monocode_core::mobile::Invite>,
+    /// The task coordinator flag (`native-task-coordinator`); Mono autonomy
+    /// settings exist only with it on.
+    pub tasks_enabled: bool,
 }
 impl PartialEq for SettingsContext {
     fn eq(&self, other: &Self) -> bool {
@@ -87,6 +90,7 @@ impl PartialEq for SettingsContext {
             && self.inbox_connections == other.inbox_connections
             && self.mobile == other.mobile
             && self.mobile_invite == other.mobile_invite
+            && self.tasks_enabled == other.tasks_enabled
     }
 }
 #[derive(Clone, Debug, PartialEq)]

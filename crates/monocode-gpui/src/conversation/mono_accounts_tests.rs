@@ -19,6 +19,10 @@ fn database() -> Database {
             ..Book::default()
         })
         .unwrap();
+    // Mono account recovery belongs to the task coordinator.
+    store
+        .save_setting(monocode_core::tasks::coordinator::FLAG, "enabled")
+        .unwrap();
     Arc::new(std::sync::Mutex::new(store))
 }
 
@@ -159,4 +163,31 @@ fn ordinary_chats_and_monos_without_an_allowlist_keep_their_account(cx: &mut gpu
     });
     assert_eq!(resumed.get(), 0);
     assert!(available(&store, "default"));
+}
+
+#[gpui::test]
+fn with_the_task_coordinator_off_a_mono_chat_keeps_its_account_as_before(
+    cx: &mut gpui::TestAppContext,
+) {
+    let store = database();
+    locked(&store)
+        .unwrap()
+        .save_setting(monocode_core::tasks::coordinator::FLAG, "")
+        .unwrap();
+    allow(&store, Scope::Mono("mono-1"), [None, None]);
+    let (view, resumed) = chat(&store, true, cx);
+    fail(
+        &view,
+        "Usage limit reached: Fixture subscription exhausted",
+        cx,
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.settings.account.id, "default");
+        assert!(v.settings.usage_limit.is_some());
+    });
+    assert_eq!(resumed.get(), 0);
+    // Nothing is recorded against the account either.
+    assert!(available(&store, "default"));
+    let health = eligibility::health(&locked(&store).unwrap()).unwrap();
+    assert_eq!(health.get("codex", "default"), Default::default());
 }

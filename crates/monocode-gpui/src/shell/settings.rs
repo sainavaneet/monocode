@@ -65,6 +65,8 @@ impl Shell {
             }
         }
         SettingsContext {
+            tasks_enabled: locked(&self.store)
+                .is_ok_and(|store| monocode_core::tasks::coordinator::enabled(&store)),
             remote: Some(self.remote.clone()),
             mobile: self.mobile_status(),
             mobile_invite: self.mobile.invite.clone(),

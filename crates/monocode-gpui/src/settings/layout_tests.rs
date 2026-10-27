@@ -195,6 +195,45 @@ fn mono_mascot_is_beside_name_and_sidebar_switch_stays_visible(cx: &mut TestAppC
     assert!(switch.right() <= px(700.));
 }
 
+fn layout_mono() -> MonoSetting {
+    MonoSetting {
+        id: "layout-mono".into(),
+        name: "Big Boss".into(),
+        mascot: "ghost".into(),
+        color: 0xee99bb,
+        projects: vec!["monocode".into()],
+        show: false,
+        folders: false,
+    }
+}
+
+#[gpui::test]
+fn mono_autonomy_settings_are_absent_with_the_task_coordinator_off(cx: &mut TestAppContext) {
+    let window = window(Section::Monos, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.ctx.monos = vec![layout_mono()];
+            view.ctx.tasks_enabled = false;
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(size(px(1200.), px(4000.)));
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("settings-mono-sidebar-switch")
+            .is_some()
+    );
+    for selector in [
+        "settings-mono-autonomy-note",
+        "settings-toggle-autonomy-automatic-execution",
+        "settings-toggle-autonomy-push",
+    ] {
+        assert!(visual.debug_bounds(selector).is_none(), "{selector}");
+    }
+}
+
 #[gpui::test]
 fn mono_autonomy_rows_edit_each_monos_policy_through_settings_changed(cx: &mut TestAppContext) {
     use std::{cell::RefCell, rc::Rc};
@@ -203,6 +242,7 @@ fn mono_autonomy_rows_edit_each_monos_policy_through_settings_changed(cx: &mut T
     let sink = changes.clone();
     window
         .update(cx, |view, _, cx| {
+            view.ctx.tasks_enabled = true;
             view.ctx.monos = vec![MonoSetting {
                 id: "layout-mono".into(),
                 name: "Big Boss".into(),

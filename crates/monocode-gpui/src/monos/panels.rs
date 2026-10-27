@@ -1384,7 +1384,13 @@ impl Monos {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let section = self.settings?;
+        // Autonomy belongs to the task coordinator: with its flag off the
+        // settings are what they were before.
+        let tasks_enabled = self.tasks_enabled();
+        let section = match self.settings? {
+            SettingsSection::Autonomy if !tasks_enabled => SettingsSection::General,
+            section => section,
+        };
         let size = window.viewport_size();
         let width = 880f32.min(size.width.as_f32() - 24.);
         let height = 680f32.min(size.height.as_f32() - 32.);
@@ -1480,6 +1486,9 @@ impl Monos {
                                             (SettingsSection::Autonomy, "Autonomy", "square-lock"),
                                         ]
                                         .into_iter()
+                                        .filter(|(tab, ..)| {
+                                            tasks_enabled || *tab != SettingsSection::Autonomy
+                                        })
                                         .map(
                                             |(tab, label, glyph)| {
                                                 let row_id = format!("mono-settings-{label}");

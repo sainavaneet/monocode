@@ -97,7 +97,11 @@ impl SettingsView {
             roster.push(super::super::widgets::note("No monos yet."));
         }
         let mut groups = vec![self.group(None,true,"Monos",None,None,rows),self.group(Some("mono-list"),false,"Your monos",Some("Show or hide sessions started by each Mono. Hidden sessions remain available from the Mono's chat.".into()),None,roster)];
-        groups.extend(self.autonomy_groups(cx));
+        // Autonomy belongs to the task coordinator: with its flag off the
+        // page is what it was before.
+        if self.ctx.tasks_enabled {
+            groups.extend(self.autonomy_groups(cx));
+        }
         groups
     }
 

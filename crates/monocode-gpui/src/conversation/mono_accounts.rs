@@ -6,7 +6,7 @@
 //! sharing a spent quota rests together, and configuration or policy errors
 //! never switch. Without an allowlist the chat keeps today's behaviour: it
 //! waits on its own account for the user. Ordinary conversations are never
-//! touched.
+//! touched, and nothing here runs while `native-task-coordinator` is off.
 use super::*;
 use monocode_core::accounts::eligibility::{self, AccountPlan, AllowedAccount, Pool};
 use monocode_core::store::Store;
@@ -27,6 +27,11 @@ pub(crate) fn mono_plan(
     exhausted_until: &dyn Fn(&AllowedAccount) -> Option<u64>,
     now: u64,
 ) -> Result<Option<AccountPlan>, String> {
+    // Mono account rules belong to the task coordinator: with its flag off
+    // the chat keeps the previous behaviour and nothing is recorded.
+    if !monocode_core::tasks::coordinator::enabled(store) {
+        return Ok(None);
+    }
     if !matches!(
         failure,
         Failure::UsageExhausted | Failure::SharedQuota | Failure::Auth
