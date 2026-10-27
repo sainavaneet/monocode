@@ -261,6 +261,34 @@ fn attempt_workspace_decision_and_verification_round_trip() {
 }
 
 #[test]
+fn recording_a_verification_again_returns_the_stored_one() {
+    let store = memory();
+    let tasks = store.tasks().unwrap();
+    tasks.create_task(&new_task("t"), 1).unwrap();
+    let first = Verification {
+        id: "v1".into(),
+        task_id: "t".into(),
+        assignment_id: None,
+        criterion_id: Some("c1".into()),
+        checkpoint_commit: "abc".into(),
+        check: "cargo test".into(),
+        passed: true,
+        evidence: "{}".into(),
+        invalidated: false,
+        created_at: 10,
+    };
+    tasks.record_verification(&first).unwrap();
+    let retried = Verification {
+        passed: false,
+        created_at: 11,
+        ..first.clone()
+    };
+    let stored = tasks.record_verification(&retried).unwrap();
+    assert_eq!(stored, first);
+    assert_eq!(tasks.verifications("t").unwrap(), vec![first]);
+}
+
+#[test]
 fn stale_revisions_are_rejected_without_changes() {
     let store = memory();
     let tasks = store.tasks().unwrap();

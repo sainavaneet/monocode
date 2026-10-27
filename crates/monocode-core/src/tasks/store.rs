@@ -687,13 +687,20 @@ impl TaskStore<'_> {
         Ok(revision)
     }
 
-    pub fn record_verification(&self, v: &Verification) -> Result<(), TaskError> {
+    /// Records `v` unless a verification with its id exists; returns the
+    /// stored one, so a retried write changes nothing.
+    pub fn record_verification(&self, v: &Verification) -> Result<Verification, TaskError> {
         self.conn.execute(
             "INSERT INTO native_task_verifications(id,task_id,assignment_id,criterion_id,checkpoint_commit,check_name,passed,evidence,invalidated,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO NOTHING",
             params![v.id, v.task_id, v.assignment_id, v.criterion_id, v.checkpoint_commit, v.check, v.passed, v.evidence, v.invalidated, ms(v.created_at)],
         )?;
-        Ok(())
+        self.one(
+            &format!("SELECT {VERIFICATION} FROM native_task_verifications WHERE id=?"),
+            &[&v.id],
+            verification,
+        )?
+        .ok_or_else(|| TaskError::NotFound(format!("verification:{}", v.id)))
     }
 
     pub fn verifications(&self, task_id: &str) -> Result<Vec<Verification>, TaskError> {
@@ -733,17 +740,7 @@ pub(super) fn write_plan(
     now: u64,
 ) -> Result<u64, TaskError> {
     crate::orchestration::validate(plan).map_err(TaskError::Invalid)?;
-    let reserved = super::integration::RESERVED_ID;
-    if let Some(taken) = plan
-        .tasks
-        .iter()
-        .find(|a| a.id.eq_ignore_ascii_case(reserved))
-    {
-        return Err(TaskError::Invalid(format!(
-            "Assignment ID {} is reserved for the task's integration branch; rename it.",
-            taken.id
-        )));
-    }
+    super::integration::refuse_reserved(plan)?;
     let key = Subject::Task(id).key();
     let stage = guard(tx, &key, "stage", expected_revision)?;
     if !matches!(

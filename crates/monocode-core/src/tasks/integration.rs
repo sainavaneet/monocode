@@ -63,6 +63,21 @@ pub fn branch_for(task: &str) -> String {
 /// assignment may use it (ignoring case).
 pub const RESERVED_ID: &str = "integration";
 
+/// Refuses a plan with an assignment named [`RESERVED_ID`] (ignoring case).
+pub(super) fn refuse_reserved(plan: &crate::orchestration::Plan) -> Result<(), TaskError> {
+    match plan
+        .tasks
+        .iter()
+        .find(|a| a.id.eq_ignore_ascii_case(RESERVED_ID))
+    {
+        Some(taken) => Err(TaskError::Invalid(format!(
+            "Assignment ID {} is reserved for the task's integration branch; rename it.",
+            taken.id
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The record id of the task's integration worktree.
 pub fn workspace_id(task: &str) -> String {
     format!("{task}/integration")

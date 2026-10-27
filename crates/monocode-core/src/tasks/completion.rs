@@ -177,7 +177,7 @@ impl CriterionRun {
                 actual,
             });
         }
-        tasks.record_verification(verification)
+        tasks.record_verification(verification).map(|_| ())
     }
 }
 
