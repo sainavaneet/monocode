@@ -827,6 +827,7 @@ fn resolve_edit_path(workspace: &Path, root: &Path, path: &str) -> Result<String
 }
 
 fn git_command(root: &Path, args: &[&str]) -> Command {
+    crate::git::counted();
     let mut command = Command::new("git");
     #[cfg(windows)]
     {

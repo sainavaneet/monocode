@@ -20,15 +20,16 @@
 //! a check that could not run is recorded as not passing. When every
 //! required criterion is satisfied
 //! the final report is persisted and the task completes. As with review,
-//! only collecting and recording use the store.
+//! only collecting and recording use the store, and neither runs Git:
+//! refreshing evidence, snapshots, checks and the report's branch facts all
+//! happen in `inspect`.
 use super::autonomy::Authority;
 use super::checks::{self, Batch};
-use super::completion::{
-    complete, criterion_satisfied, evidence, refresh_verifications, FinalReport,
-};
+use super::completion::{criterion_satisfied, evidence, invalidate_in, stale_verifications};
 use super::coordinator::{Coordinator, Policy};
 use super::events::{append, NewEvent};
 use super::findings::{task_ref, Finding, Review, ReviewOutcome};
+use super::report::{complete_with, FinalReport, ReportFacts};
 use super::review::{MAX_CORRECTIONS, MONO_REVIEW, REVIEWED, REVIEW_RETRY_LIMIT};
 use super::states::apply;
 use super::{
@@ -77,10 +78,14 @@ pub struct VerifyJob {
     /// integrated result of several.
     assignment: Option<Assignment>,
     workspace: Workspace,
-    /// Required criteria with checks and no live passing verification.
-    pending: Vec<AcceptanceCriterion>,
-    /// Required criteria with no checks and no live passing verification.
-    unchecked: Vec<String>,
+    /// The task's workspaces, whose branches the final report describes.
+    workspaces: Vec<Workspace>,
+    /// The task's live verifications as recorded; `inspect` checks which
+    /// still match their workspace.
+    live: Vec<Verification>,
+    /// This round already waited (for Mono or a precondition): it runs again
+    /// only if `inspect` finds stale evidence.
+    waited: bool,
     /// Names this round: the task's revision and what its verifications
     /// and decisions looked like when it started.
     round: String,
@@ -98,16 +103,56 @@ pub struct RoundInspection {
     checks: Vec<String>,
     batch: Batch,
     error: Option<String>,
+    /// Live verifications whose workspace changed since they ran.
+    stale: Vec<String>,
+    /// Required criteria with no checks and no live passing verification.
+    unchecked: Vec<String>,
+    /// A round that already waited found nothing new: nothing to record.
+    idle: bool,
+    /// The branches' Git facts, for the final report.
+    facts: ReportFacts,
 }
 
 impl VerifyJob {
-    /// Snapshots the result worktree and runs the pending criteria's checks.
+    /// Everything that needs Git, without the store: finds stale evidence,
+    /// snapshots the result worktree, runs the checks of every required
+    /// criterion not yet satisfied, and reads the branches for the report.
     pub fn inspect(&self) -> RoundInspection {
-        let mut found = RoundInspection::default();
-        if self.pending.is_empty() {
-            return found;
+        let stale = stale_verifications(&self.task.id, &self.live);
+        if self.waited && stale.is_empty() {
+            return RoundInspection {
+                idle: true,
+                ..RoundInspection::default()
+            };
         }
-        for criterion in &self.pending {
+        let live: Vec<Verification> = (self.live.iter())
+            .filter(|v| !stale.contains(&v.id))
+            .cloned()
+            .collect();
+        let mut found = RoundInspection {
+            stale,
+            ..RoundInspection::default()
+        };
+        let mut pending = Vec::new();
+        for criterion in self.task.criteria.iter().filter(|c| c.required) {
+            if criterion_satisfied(criterion, &live) {
+                continue;
+            }
+            if criterion.checks.is_empty() {
+                found.unchecked.push(criterion.id.clone());
+            } else {
+                pending.push(criterion);
+            }
+        }
+        if !pending.is_empty() {
+            self.run_checks(&pending, &mut found);
+        }
+        found.facts = ReportFacts::gather(&self.workspaces);
+        found
+    }
+
+    fn run_checks(&self, pending: &[&AcceptanceCriterion], found: &mut RoundInspection) {
+        for criterion in pending {
             for check in &criterion.checks {
                 found.criteria.push(criterion.id.clone());
                 found.checks.push(check.clone());
@@ -129,7 +174,24 @@ impl VerifyJob {
             }
             Err(error) => found.error = Some(error),
         }
-        found
+    }
+
+    /// Marks this round's stale evidence invalidated, inside the caller's
+    /// transaction.
+    fn invalidate_stale(
+        &self,
+        conn: &rusqlite::Connection,
+        inspection: &RoundInspection,
+        now: u64,
+    ) -> Result<(), TaskError> {
+        for v in self
+            .live
+            .iter()
+            .filter(|v| inspection.stale.contains(&v.id))
+        {
+            invalidate_in(conn, v, now)?;
+        }
+        Ok(())
     }
 }
 
@@ -323,12 +385,9 @@ impl<P: Policy> Coordinator<P> {
         let Some((task, assignment, workspace)) = self.advance(tasks, id, now)? else {
             return Ok(None);
         };
-        refresh_verifications(store, id, now)?;
         let round = round_key(tasks, &task)?;
         let waited = wait_event(id, &round);
-        if event_exists(tasks, &waited)? {
-            return Ok(None);
-        }
+        let already_waited = event_exists(tasks, &waited)?;
         let failures = failures(tasks, id, &round)?;
         if failures.len() >= REVIEW_RETRY_LIMIT as usize {
             let reason = format!(
@@ -345,18 +404,6 @@ impl<P: Policy> Coordinator<P> {
             .into_iter()
             .filter(|v| !v.invalidated)
             .collect();
-        let mut pending = Vec::new();
-        let mut unchecked = Vec::new();
-        for criterion in task.criteria.iter().filter(|c| c.required) {
-            if criterion_satisfied(criterion, &live) {
-                continue;
-            }
-            if criterion.checks.is_empty() {
-                unchecked.push(criterion.id.clone());
-            } else {
-                pending.push(criterion.clone());
-            }
-        }
         let corrections = match &assignment {
             Some(assignment) => tasks
                 .reviews(id, &assignment.id)?
@@ -373,11 +420,12 @@ impl<P: Policy> Coordinator<P> {
         };
         Ok(Some(VerifyJob {
             may_commit,
+            workspaces: tasks.workspaces(id)?,
+            live,
+            waited: already_waited,
             task,
             assignment,
             workspace,
-            pending,
-            unchecked,
             round,
             corrections,
         }))
@@ -427,7 +475,7 @@ impl<P: Policy> Coordinator<P> {
                 && t.stage == TaskStage::Verifying
                 && t.lifecycle == TaskLifecycle::Active
         });
-        if !unchanged {
+        if !unchanged || inspection.idle {
             return Ok(None);
         }
         let mut findings = round_findings(job, &inspection);
@@ -448,6 +496,7 @@ impl<P: Policy> Coordinator<P> {
         }
         if findings.iter().any(Finding::needs_mono) {
             let tx = tasks.begin()?;
+            job.invalidate_stale(&tx, &inspection, now)?;
             record_criteria(&tasks, job, &inspection, now)?;
             // Keyed after recording, so this round's own rows do not make
             // the next pass look like a new round.
@@ -457,9 +506,11 @@ impl<P: Policy> Coordinator<P> {
             return Ok(Some(round(job, RoundOutcome::NeedsMonoReview, findings)));
         }
         let tx = tasks.begin()?;
+        job.invalidate_stale(&tx, &inspection, now)?;
         record_criteria(&tasks, job, &inspection, now)?;
         tx.commit()?;
-        match complete(store, &job.task.id, Requester::Coordinator, now) {
+        let coordinator = Requester::Coordinator;
+        match complete_with(&tasks, &job.task.id, coordinator, &inspection.facts, now) {
             Ok(report) => Ok(Some(Round {
                 report: Some(report),
                 ..round(job, RoundOutcome::Completed, findings)
@@ -549,7 +600,7 @@ fn round_findings(job: &VerifyJob, inspection: &RoundInspection) -> Vec<Finding>
             files: inspection.batch.modified.clone(),
         });
     }
-    for criterion in &job.unchecked {
+    for criterion in &inspection.unchecked {
         findings.push(Finding::NotChecked {
             reason: format!("Acceptance criterion {criterion} has no check; Mono verifies it."),
         });
@@ -623,6 +674,7 @@ fn send_back(
     now: u64,
 ) -> Result<Round, TaskError> {
     let tx = tasks.begin()?;
+    job.invalidate_stale(&tx, inspection, now)?;
     let assignment = Subject::Assignment {
         task: &job.task.id,
         id: &responsible.id,
@@ -670,6 +722,9 @@ fn send_back(
     tx.commit()?;
     Ok(round(job, RoundOutcome::Correction, findings))
 }
+#[cfg(test)]
+#[path = "verify_lock_tests.rs"]
+mod lock_tests;
 #[cfg(test)]
 #[path = "verify_tests.rs"]
 mod tests;

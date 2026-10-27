@@ -7,29 +7,22 @@
 //! shown as a stale result. Completion needs every assignment accepted, at
 //! least one required criterion and every required criterion satisfied by a
 //! live verification, no unresolved decision, and a final report persisted in
-//! the same transaction. The report states implemented, committed, merged,
-//! pushed and deployed from evidence only, never from a worker's words.
+//! the same transaction (`report`).
 use super::checks::{self, CheckRun};
 use super::events::{append, NewEvent};
 use super::findings::task_ref;
-use super::states::apply;
+pub use super::report::{
+    complete, final_report, AssignmentReport, CriterionReport, FinalReport, FINAL_REPORT,
+};
 use super::{
-    AcceptanceCriterion, AssignmentState, Requester, State, Subject, TaskError, TaskLifecycle,
-    TaskStage, Verification, Workspace,
+    AcceptanceCriterion, AssignmentState, State, TaskError, TaskStage, Verification, Workspace,
 };
 use crate::checkpoint;
-use crate::git::git;
-use crate::orchestration::WorkspaceMode;
 use crate::store::Store;
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::Path;
 
-/// The record kind of a persisted final report; its event id is
-/// `final_report:<task>`.
-pub const FINAL_REPORT: &str = "task.final_report";
 const INVALIDATED: &str = "verification.invalidated";
 
 /// The verification evidence: where and how the check ran, and the end of
@@ -217,12 +210,27 @@ pub fn refresh_verifications(
     now: u64,
 ) -> Result<Vec<String>, TaskError> {
     let tasks = store.tasks()?;
+    let live: Vec<Verification> = tasks
+        .verifications(task_id)?
+        .into_iter()
+        .filter(|v| !v.invalidated)
+        .collect();
+    let stale = stale_verifications(task_id, &live);
+    for v in live.iter().filter(|v| stale.contains(&v.id)) {
+        let tx = tasks.begin()?;
+        invalidate_in(&tx, v, now)?;
+        tx.commit()?;
+    }
+    Ok(stale)
+}
+
+/// The ids among `live` whose workspace no longer holds the files they
+/// were checked against. Runs Git only; touches no store, so the
+/// coordinator calls it without the store lock.
+pub(super) fn stale_verifications(task_id: &str, live: &[Verification]) -> Vec<String> {
     let mut current: HashMap<String, Option<String>> = HashMap::new();
     let mut stale = Vec::new();
-    for v in tasks.verifications(task_id)? {
-        if v.invalidated {
-            continue;
-        }
+    for v in live {
         let place: serde_json::Value = serde_json::from_str(&v.evidence).unwrap_or_default();
         let Some(path) = place["path"].as_str() else {
             continue;
@@ -236,16 +244,20 @@ pub fn refresh_verifications(
             checkpoint::same_snapshot(path, now, &v.checkpoint_commit).unwrap_or(false)
         });
         if !same {
-            invalidate(&tasks, &v, now)?;
-            stale.push(v.id);
+            stale.push(v.id.clone());
         }
     }
-    Ok(stale)
+    stale
 }
 
-fn invalidate(tasks: &super::TaskStore<'_>, v: &Verification, now: u64) -> Result<(), TaskError> {
-    let tx = tasks.begin()?;
-    let changed = tx.execute(
+/// Marks `v` invalidated (once, with its event) inside the caller's
+/// transaction.
+pub(super) fn invalidate_in(
+    conn: &Connection,
+    v: &Verification,
+    now: u64,
+) -> Result<(), TaskError> {
+    let changed = conn.execute(
         "UPDATE native_task_verifications SET invalidated=1 WHERE id=?1 AND invalidated=0",
         [&v.id],
     )?;
@@ -263,9 +275,8 @@ fn invalidate(tasks: &super::TaskStore<'_>, v: &Verification, now: u64) -> Resul
             kind: INVALIDATED.into(),
             payload,
         };
-        append(&tx, &event, now)?;
+        append(conn, &event, now)?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -324,198 +335,6 @@ pub fn live_verifications(
         .into_iter()
         .filter(|v| !v.invalidated)
         .collect())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AssignmentReport {
-    pub id: String,
-    pub status: AssignmentState,
-    pub mode: Option<WorkspaceMode>,
-    pub path: Option<String>,
-    pub branch: Option<String>,
-    pub base_commit: Option<String>,
-    /// Commits on the branch since its base, oldest first.
-    pub commits: Vec<String>,
-    /// The worktree has changes no commit holds.
-    pub uncommitted: bool,
-    /// Accepted, with a live passing verification.
-    pub implemented: bool,
-    pub committed: bool,
-    /// The branch tip is in the repository's checked-out HEAD.
-    pub merged: bool,
-    /// A remote-tracking branch contains the tip.
-    pub pushed: bool,
-    /// No task step records deployment evidence, so this is never inferred.
-    pub deployed: bool,
-    /// Live passing verifications of the assignment.
-    pub verifications: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CriterionReport {
-    pub id: String,
-    pub required: bool,
-    pub satisfied: bool,
-    /// The latest live verification of the criterion and its checkpoint.
-    pub verification: Option<String>,
-    pub checkpoint: Option<String>,
-}
-
-/// What the task delivered, each claim derived from recorded evidence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FinalReport {
-    pub task_id: String,
-    /// Each flag holds for every assignment that is not cancelled (and
-    /// committed, merged and pushed only when some assignment has a branch).
-    pub implemented: bool,
-    pub committed: bool,
-    pub merged: bool,
-    pub pushed: bool,
-    pub deployed: bool,
-    pub assignments: Vec<AssignmentReport>,
-    pub criteria: Vec<CriterionReport>,
-    pub generated_at: u64,
-    /// The task's final integration record, when several worktrees were
-    /// integrated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub integration: Option<serde_json::Value>,
-}
-
-fn branch_facts(workspace: &Workspace, report: &mut AssignmentReport) {
-    let (Some(branch), Some(base)) = (&workspace.branch, &workspace.base_commit) else {
-        return;
-    };
-    let repository = Path::new(&workspace.repository);
-    let reference = format!("refs/heads/{branch}");
-    let Ok(tip) = git(repository, &["rev-parse", "--verify", &reference]) else {
-        return;
-    };
-    let tip = tip.trim().to_owned();
-    let range = format!("{base}..{tip}");
-    report.commits = git(repository, &["rev-list", "--reverse", &range])
-        .map(|out| out.lines().map(str::to_owned).collect())
-        .unwrap_or_default();
-    report.committed = !report.commits.is_empty();
-    report.merged =
-        report.committed && git(repository, &["merge-base", "--is-ancestor", &tip, "HEAD"]).is_ok();
-    report.pushed = report.committed
-        && git(repository, &["branch", "-r", "--contains", &tip])
-            .is_ok_and(|out| !out.trim().is_empty());
-}
-
-/// The task's final report as the evidence stands now, after refreshing its
-/// verifications.
-pub fn final_report(store: &Store, task_id: &str, now: u64) -> Result<FinalReport, TaskError> {
-    let live = live_verifications(store, task_id, now)?;
-    let tasks = store.tasks()?;
-    let task = tasks
-        .task(task_id)?
-        .ok_or_else(|| TaskError::NotFound(format!("task:{task_id}")))?;
-    let workspaces = tasks.workspaces(task_id)?;
-    let mut assignments = Vec::new();
-    for a in tasks.assignments(task_id)? {
-        if a.status == AssignmentState::Cancelled {
-            continue;
-        }
-        let workspace = workspaces
-            .iter()
-            .find(|w| w.assignment_id.as_deref() == Some(a.id.as_str()));
-        let verifications: Vec<String> = live
-            .iter()
-            .filter(|v| v.passed && v.assignment_id.as_deref() == Some(a.id.as_str()))
-            .map(|v| v.id.clone())
-            .collect();
-        let mut report = AssignmentReport {
-            implemented: a.status == AssignmentState::Accepted && !verifications.is_empty(),
-            id: a.id,
-            status: a.status,
-            mode: workspace.map(|w| w.mode),
-            path: workspace.map(|w| w.path.clone()),
-            branch: workspace.and_then(|w| w.branch.clone()),
-            base_commit: workspace.and_then(|w| w.base_commit.clone()),
-            commits: Vec::new(),
-            uncommitted: false,
-            committed: false,
-            merged: false,
-            pushed: false,
-            deployed: false,
-            verifications,
-        };
-        if let Some(w) = workspace.filter(|w| w.mode == WorkspaceMode::Worktree) {
-            branch_facts(w, &mut report);
-            report.uncommitted = git(Path::new(&w.path), &["status", "--porcelain"])
-                .is_ok_and(|out| !out.trim().is_empty());
-        }
-        assignments.push(report);
-    }
-    let criteria = task
-        .criteria
-        .iter()
-        .map(|c| {
-            let latest = live
-                .iter()
-                .rev()
-                .find(|v| v.criterion_id.as_deref() == Some(c.id.as_str()));
-            CriterionReport {
-                id: c.id.clone(),
-                required: c.required,
-                satisfied: criterion_satisfied(c, &live),
-                verification: latest.map(|v| v.id.clone()),
-                checkpoint: latest.map(|v| v.checkpoint_commit.clone()),
-            }
-        })
-        .collect();
-    let branched: Vec<&AssignmentReport> =
-        assignments.iter().filter(|a| a.branch.is_some()).collect();
-    let all = |flag: fn(&AssignmentReport) -> bool| {
-        !branched.is_empty() && branched.iter().all(|a| flag(a))
-    };
-    Ok(FinalReport {
-        task_id: task_id.into(),
-        implemented: !assignments.is_empty() && assignments.iter().all(|a| a.implemented),
-        committed: all(|a| a.committed),
-        merged: all(|a| a.merged),
-        pushed: all(|a| a.pushed),
-        deployed: false,
-        assignments,
-        criteria,
-        generated_at: now,
-        integration: tasks.integration(task_id)?,
-    })
-}
-
-/// Completes the task: refreshes its verifications, then in one
-/// transaction persists the final report and moves the stage Verifying →
-/// Completed and the lifecycle Active → Completed. Any unmet precondition
-/// rolls everything back, report included.
-pub fn complete(
-    store: &Store,
-    task_id: &str,
-    requester: Requester,
-    now: u64,
-) -> Result<FinalReport, TaskError> {
-    let report = final_report(store, task_id, now)?;
-    let tasks = store.tasks()?;
-    let tx = tasks.begin()?;
-    let event = NewEvent {
-        id: format!("final_report:{task_id}"),
-        task_id: task_id.into(),
-        assignment_id: None,
-        attempt_id: None,
-        kind: FINAL_REPORT.into(),
-        payload: serde_json::to_value(&report)?,
-    };
-    append(&tx, &event, now)?;
-    let task = Subject::Task(task_id);
-    let completed = State::Stage(TaskStage::Completed);
-    apply(&tx, task, completed, requester, tasks.revision(task)?, now)?;
-    let done = State::Lifecycle(TaskLifecycle::Completed);
-    apply(&tx, task, done, requester, tasks.revision(task)?, now)?;
-    tx.commit()?;
-    Ok(report)
 }
 
 #[cfg(test)]

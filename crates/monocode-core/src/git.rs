@@ -31,7 +31,26 @@ pub struct Snapshot {
     pub branches: Vec<Branch>,
     pub worktrees: Vec<Worktree>,
 }
+#[cfg(test)]
+thread_local! {
+    static CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a Git invocation on this thread, so tests can show a step under
+/// the store lock runs none.
+pub(crate) fn counted() {
+    #[cfg(test)]
+    CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+/// Git invocations on this thread so far (tests only).
+#[cfg(test)]
+pub(crate) fn calls() -> usize {
+    CALLS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    counted();
     if crate::files::remote::is_remote(cwd) {
         return Err("This isn’t available for projects on another machine yet.".into());
     }

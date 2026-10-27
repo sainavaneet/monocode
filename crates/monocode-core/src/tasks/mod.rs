@@ -27,6 +27,7 @@ mod park;
 pub mod policy;
 pub mod recovery;
 mod replace;
+pub mod report;
 pub mod restart;
 pub mod review;
 pub mod states;
