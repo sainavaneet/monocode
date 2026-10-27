@@ -167,7 +167,14 @@ fn monos_own_checks_are_confined_like_the_plans() {
     let store = open(&repo);
     claimed_with(&store, &repo, scoped(&[CHECK]), &[CHECK], feature);
     let workspace = store.tasks().unwrap().workspaces("t").unwrap().remove(0);
-    for refused in ["git push origin main", "cat /etc/hosts", "git -C .. status"] {
+    for refused in [
+        "git push origin main",
+        "cat /etc/hosts",
+        "git -C .. status",
+        "sh -c true",
+        "python3 -c print(1)",
+        "git config core.hooksPath hooks",
+    ] {
         let run = crate::tasks::completion::verify_criterion(
             &store,
             "t",

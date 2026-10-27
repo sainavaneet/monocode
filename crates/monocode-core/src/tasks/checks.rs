@@ -5,8 +5,10 @@
 //! workspace, so a step that needs a shell (pipes, `&&`, redirection,
 //! variables, globs) or is prose (`Run the tests`) cannot run: review hands it
 //! to Mono instead of guessing. A program named by path must stay inside the
-//! workspace, and so must every path argument; Git may not reach a remote or
-//! another repository, and commits only with commit authority (`confine`).
+//! workspace, and so must every path argument; shells, wrappers and inline
+//! interpreter code are refused, and Git may only read (commits need commit
+//! authority). This is best effort (`confine`): a script the project itself
+//! runs can do anything that script does.
 pub(super) use super::confine::confine;
 use std::io::Read;
 use std::path::{Path, PathBuf};

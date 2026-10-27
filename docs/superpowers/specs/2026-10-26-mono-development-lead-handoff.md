@@ -414,6 +414,10 @@ From the controller ledger, accepted for later:
   (`UnauthorizedCommits`), merges only by integration with Merge authority,
   and checks may never push. Mono's answers themselves are not refused for
   granting authority, and a provider-native reply carries no reminder.
+- Check confinement is best effort, not a sandbox: a program the project
+  itself runs (`npm run`, `make`, `cargo run`, `./gradlew`, a test runner)
+  can do anything its scripts do, including reaching outside the workspace,
+  and the argument rules are heuristics over argv.
 - **Before enabling the flag for real use:** UI-thread store locks during the
   coordinator tick (Git work in the remaining locked steps above, and the GUI
   locks on the UI thread) must be removed.
@@ -426,9 +430,20 @@ From the controller ledger, accepted for later:
   precondition, the next round, the report and the task view).
 - A worker that reports a result is stopped; nothing relaunches in its
   workspace and its claim is not reviewed until the app confirms the stop.
-- Checks are confined to their workspace: no path argument outside it, no
-  Git push, remote change, refspec fetch or `-C`/`--git-dir`/`--work-tree`/
-  `-c`, and commit-capable Git only with Commit authority (`tasks/confine.rs`).
+- Checks are confined to their workspace, best effort (`tasks/confine.rs`):
+  path-option values and arguments that are (or would be created beside)
+  something outside the workspace, or climb out with `..`, are refused, while
+  patterns such as `/health` pass; shells, wrappers (`env`, `xargs`, `sudo`,
+  `timeout`, `npx`, `pnpm dlx` ...) and interpreters given inline code
+  (`python -c`, `node -e` ...) are refused; Git may only read (read-only
+  subcommands and the listing forms of `branch`/`tag`/`remote`/`stash`/
+  `worktree`), never with `-C`/`--git-dir`/`--work-tree`/`-c`/`--exec-path`,
+  aliases or `!`; commit-making Git needs Commit authority. Mono's own
+  `tasks.criteria.verify` checks go through the same confinement.
+- A declared check that cannot run no longer blocks completion for good: Mono
+  may waive it with `tasks.criteria.waive` and a required reason, shown as
+  "waived: <reason>" in the final report and the timeline. A check that ran
+  and failed cannot be waived (`tasks/waive.rs`).
 - Verification's locked steps run no Git; the final report is built inside
   the completing transaction (`tasks/report.rs`).
 - Plan assignment ids must differ ignoring case, and `integration` is
