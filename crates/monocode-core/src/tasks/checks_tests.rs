@@ -1,6 +1,6 @@
 //! Checks stay inside their workspace, best effort: no path argument outside
-//! it, no shell, wrapper or inline interpreter code, Git only for reading
-//! (and committing with commit authority).
+//! it, no shell, wrapper or inline interpreter code (looking through
+//! runners such as `uv run`), and Git only for reading, never committing.
 use super::*;
 
 fn workspace() -> (tempfile::TempDir, PathBuf) {
@@ -20,20 +20,20 @@ fn workspace() -> (tempfile::TempDir, PathBuf) {
     (dir, root)
 }
 
-fn confined(check: &str, root: &Path, may_commit: bool) -> Result<(), String> {
+fn confined(check: &str, root: &Path) -> Result<(), String> {
     let argv = shlex::split(check).unwrap();
-    confine(&argv, root, may_commit)
+    confine(&argv, root)
 }
 
 fn refused(checks: &[&str], root: &Path) {
     for check in checks {
-        assert!(confined(check, root, true).is_err(), "{check}");
+        assert!(confined(check, root).is_err(), "{check}");
     }
 }
 
 fn allowed(checks: &[&str], root: &Path) {
     for check in checks {
-        let result = confined(check, root, false);
+        let result = confined(check, root);
         assert!(result.is_ok(), "{check}: {result:?}");
     }
 }
@@ -98,17 +98,21 @@ fn git_that_changes_configuration_refs_or_runs_programs_is_refused() {
 }
 
 #[test]
-fn git_commits_need_commit_authority() {
+fn git_that_commits_is_refused_even_with_commit_authority() {
     let (_dir, root) = workspace();
     for check in [
         "git commit -am wip",
         "git merge other",
+        "git merge -s ours other",
         "git rebase main",
+        "git rebase --exec true main",
+        "git rebase -x true main",
         "git cherry-pick abc",
+        "git revert HEAD",
+        "git am x.patch",
     ] {
-        let refused = confined(check, &root, false).unwrap_err();
-        assert!(refused.contains("commit"), "{check}: {refused}");
-        assert!(confined(check, &root, true).is_ok(), "{check}");
+        let refused = confined(check, &root).unwrap_err();
+        assert!(refused.contains("read-only"), "{check}: {refused}");
     }
 }
 
@@ -133,7 +137,6 @@ fn shells_wrappers_and_inline_code_are_refused() {
             "node --eval 1",
             "ruby -e 1",
             "perl -e 1",
-            "npx some-tool",
         ],
         &root,
     );
@@ -207,7 +210,7 @@ fn refused_checks_do_not_run_and_ordinary_ones_do() {
     assert!(run("cat /etc/hosts", &root, timeout).is_err());
     // A batch reports a refused check as one that could not run.
     let checks = ["git commit -m x".to_owned()];
-    let batch = run_batch(&root.to_string_lossy(), &checks, "unused", "unused", false);
+    let batch = run_batch(&root.to_string_lossy(), &checks, "unused", "unused");
     assert!(batch.results[0].is_err());
 }
 
@@ -227,7 +230,6 @@ fn every_wrapper_runner_and_inline_interpreter_is_refused() {
             "expect run.exp",
             "pnpm dlx some-tool",
             "yarn dlx some-tool",
-            "npm exec some-tool",
             "bunx some-tool",
             "python -B -c print(1)",
             "python -Bc print(1)",
@@ -309,10 +311,6 @@ fn git_is_read_only_beyond_its_listing_forms() {
         ],
         &root,
     );
-    for commits in ["git revert HEAD", "git am x.patch"] {
-        assert!(confined(commits, &root, false).is_err(), "{commits}");
-        assert!(confined(commits, &root, true).is_ok(), "{commits}");
-    }
 }
 
 #[test]
@@ -337,4 +335,85 @@ fn path_options_are_held_to_the_workspace() {
         ],
         &root,
     );
+}
+
+#[test]
+fn runners_are_judged_by_the_program_they_wrap() {
+    let (_dir, root) = workspace();
+    refused(
+        &[
+            "uv run sh -c true",
+            "uv run --with x sh -c true",
+            "poetry run bash scripts/x",
+            "pdm run python -c print(1)",
+            "pipenv run env cargo test",
+            "pnpm exec sh -c true",
+            "yarn exec node -e 1",
+            "bundle exec ruby -e 1",
+            "npm exec -- sh -c true",
+            "npm -w pkg exec sh -c true",
+            "npx sh -c true",
+            "npx -y git push",
+            "uv run git commit -m x",
+        ],
+        &root,
+    );
+    allowed(
+        &[
+            "uv run pytest",
+            "poetry run pytest tests/",
+            "pdm run pytest",
+            "pipenv run pytest",
+            "bundle exec rspec",
+            "pnpm exec vitest run",
+            "yarn exec jest",
+            "npm exec -- vitest",
+            "npm -w pkg exec vitest",
+            "npx vitest",
+            "npm exec some-tool",
+            "npm test",
+        ],
+        &root,
+    );
+}
+
+#[test]
+fn awk_programs_and_more_wrappers_are_refused() {
+    let (_dir, root) = workspace();
+    refused(
+        &[
+            "awk BEGIN{system(1)}",
+            "gawk -F : {print} src/feature.rs",
+            "mawk -v x=1 {print}",
+            "nawk -- {print}",
+            "arch -arm64 cargo test",
+            "caffeinate cargo test",
+            "watch cargo test",
+            "flock lock cargo test",
+            "parallel cargo test",
+            "python3.12 -c print(1)",
+            "php8.2 -r echo(1);",
+            "perl5.34 -e 1",
+        ],
+        &root,
+    );
+    allowed(
+        &["awk -f scripts/x src/feature.rs", "python3.12 -m pytest"],
+        &root,
+    );
+}
+
+#[test]
+fn assigned_paths_are_held_to_the_workspace() {
+    let (_dir, root) = workspace();
+    refused(
+        &[
+            "dd of=/tmp/x",
+            "make PREFIX=/usr/local",
+            "pytest -o cache_dir=/tmp/x",
+            "make OUT=../x",
+        ],
+        &root,
+    );
+    allowed(&["make FOO=bar", "make OUT=target/x test"], &root);
 }

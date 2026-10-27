@@ -1,9 +1,11 @@
 //! Git in a check: reading only. Read-only subcommands (and the listing
 //! forms of `branch`, `tag`, `remote`, `stash` and `worktree`) run;
-//! commit-making ones only with commit authority; everything else — config,
+//! everything else — commits, merges and rebases (which change history
+//! without changing the tree, and `rebase --exec` runs programs), config,
 //! ref moves, remotes, fetch and push, submodules, unknown names (which may
 //! be aliases that run programs) — is refused, as are global options that
-//! point Git elsewhere or override its configuration.
+//! point Git elsewhere or override its configuration. A check verifies; it
+//! never authors.
 
 /// Subcommands that only read the repository.
 const READ_ONLY: &[&str] = &[
@@ -26,8 +28,6 @@ const READ_ONLY: &[&str] = &[
     "for-each-ref",
     "check-ignore",
 ];
-/// Subcommands that make commits: allowed only with commit authority.
-const COMMITS: &[&str] = &["commit", "merge", "rebase", "cherry-pick", "revert", "am"];
 /// Global options that change nothing outside the command's own output.
 const GLOBAL_ALLOWED: &[&str] = &[
     "--no-pager",
@@ -80,7 +80,7 @@ const LIST_VALUED: &[&str] = &[
 ];
 
 /// Git's global options and subcommand, checked.
-pub(super) fn git(args: &[String], may_commit: bool) -> Result<(), String> {
+pub(super) fn git(args: &[String]) -> Result<(), String> {
     if let Some(bang) = args.iter().find(|a| a.starts_with('!')) {
         return Err(format!(
             "`git {bang}` runs a program through Git; a check may not."
@@ -104,15 +104,6 @@ pub(super) fn git(args: &[String], may_commit: bool) -> Result<(), String> {
     if READ_ONLY.contains(&subcommand) {
         return reads(subcommand, &rest);
     }
-    if COMMITS.contains(&subcommand) {
-        return if may_commit {
-            Ok(())
-        } else {
-            Err(format!(
-                "`git {subcommand}` makes commits, and the task has no commit authority."
-            ))
-        };
-    }
     let listing = match subcommand {
         "branch" => lists(&rest, BRANCH_LIST, false),
         "tag" => lists(&rest, TAG_LIST, true),
@@ -125,7 +116,7 @@ pub(super) fn git(args: &[String], may_commit: bool) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "`git {subcommand}` is not a read-only Git command; a check may only read the repository (no config, ref, remote, fetch or push changes, and no aliases)."
+        "`git {subcommand}` is not a read-only Git command; a check may only read the repository (no commits, config, ref, remote, fetch or push changes, and no aliases)."
     ))
 }
 

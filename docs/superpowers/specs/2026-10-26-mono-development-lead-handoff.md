@@ -417,7 +417,14 @@ From the controller ledger, accepted for later:
 - Check confinement is best effort, not a sandbox: a program the project
   itself runs (`npm run`, `make`, `cargo run`, `./gradlew`, a test runner)
   can do anything its scripts do, including reaching outside the workspace,
-  and the argument rules are heuristics over argv.
+  and the argument rules are heuristics over argv. Known consequences:
+  a route pattern whose first segment exists at `/` (such as `/users` on
+  macOS) is refused as a path; `bash scripts/test.sh` is refused (run the
+  script directly); `node --import`/`-r` are refused; `-o`, `-d` and `-f`
+  are treated as path options for every program; the shell-character rule
+  makes `git diff HEAD~1` unrunnable; `python -m timeit` still runs code
+  given inline; and an unknown interpreter option that takes a separate
+  value can hide a following `-e`.
 - **Before enabling the flag for real use:** UI-thread store locks during the
   coordinator tick (Git work in the remaining locked steps above, and the GUI
   locks on the UI thread) must be removed.
@@ -435,11 +442,15 @@ From the controller ledger, accepted for later:
   something outside the workspace, or climb out with `..`, are refused, while
   patterns such as `/health` pass; shells, wrappers (`env`, `xargs`, `sudo`,
   `timeout`, `npx`, `pnpm dlx` ...) and interpreters given inline code
-  (`python -c`, `node -e` ...) are refused; Git may only read (read-only
-  subcommands and the listing forms of `branch`/`tag`/`remote`/`stash`/
-  `worktree`), never with `-C`/`--git-dir`/`--work-tree`/`-c`/`--exec-path`,
-  aliases or `!`; commit-making Git needs Commit authority. Mono's own
-  `tasks.criteria.verify` checks go through the same confinement.
+  (`python -c`, `node -e`, an awk program ...) are refused; runners
+  (`uv run`, `poetry run`, `bundle exec`, `pnpm exec`, `npx` ...) are judged
+  by the program they wrap; `name=/abs` arguments are checked after the `=`;
+  Git may only read (read-only subcommands and the listing forms of
+  `branch`/`tag`/`remote`/`stash`/`worktree`), never with `-C`/`--git-dir`/
+  `--work-tree`/`-c`/`--exec-path`, aliases or `!`, and never commits, merges
+  or rebases, whatever the task's authority (a check verifies; `rebase
+  --exec` runs programs, and history changes leave the tree unchanged).
+  Mono's own `tasks.criteria.verify` checks go through the same confinement.
 - A declared check that cannot run no longer blocks completion for good: Mono
   may waive it with `tasks.criteria.waive` and a required reason, shown as
   "waived: <reason>" in the final report and the timeline. A check that ran

@@ -88,8 +88,6 @@ pub struct CriterionRun {
     /// The task revision read when preparing; a change refuses the record.
     pub task_revision: u64,
     run_id: String,
-    /// The task's effective policy lets it commit, so the check may.
-    may_commit: bool,
 }
 
 impl CriterionRun {
@@ -109,12 +107,7 @@ impl CriterionRun {
                 "Task {task_id} has no criterion {criterion_id}."
             )));
         }
-        let snapshot = super::policy::of(&store.tasks()?, task_id)?;
-        let live = super::autonomy::live(task.mono_id.as_deref(), &task.project);
-        let may_commit = super::autonomy::effective(snapshot.as_ref(), &live)
-            .allows(super::autonomy::Authority::Commit);
         Ok(Self {
-            may_commit,
             task_id: task_id.into(),
             criterion_id: criterion_id.into(),
             workspace: workspace.clone(),
@@ -139,7 +132,6 @@ impl CriterionRun {
             &checks,
             &checkpoint,
             &reference("after"),
-            self.may_commit,
         );
         if let Some(error) = batch.error.take() {
             return Err(TaskError::Invalid(error));

@@ -24,7 +24,6 @@
 //! only collecting and recording use the store, and neither runs Git:
 //! refreshing evidence, snapshots, checks and the report's branch facts all
 //! happen in `inspect`.
-use super::autonomy::Authority;
 use super::checks::{self, Batch};
 use super::completion::{criterion_satisfied, evidence, invalidate_in, stale_verifications};
 use super::coordinator::{Coordinator, Policy};
@@ -91,8 +90,6 @@ pub struct VerifyJob {
     /// and decisions looked like when it started.
     round: String,
     corrections: usize,
-    /// The task has commit authority, so a check may commit.
-    may_commit: bool,
 }
 
 /// What a round's checks found; no store access.
@@ -163,13 +160,7 @@ impl VerifyJob {
         let path = &self.workspace.path;
         match crate::checkpoint::snapshot_workspace(path, &side("before")) {
             Ok(before) => {
-                found.batch = checks::run_batch(
-                    path,
-                    &found.checks,
-                    &before,
-                    &side("after"),
-                    self.may_commit,
-                );
+                found.batch = checks::run_batch(path, &found.checks, &before, &side("after"));
                 found.error = found.batch.error.clone();
                 found.checkpoint = Some(before);
             }
@@ -366,7 +357,7 @@ impl<P: Policy> Coordinator<P> {
         let mut jobs = Vec::new();
         let mut errors = Vec::new();
         for id in in_progress(&tasks)? {
-            match self.verify_job(store, &tasks, &id, now) {
+            match self.verify_job(&tasks, &id, now) {
                 Ok(Some(job)) => jobs.push(job),
                 Ok(None) | Err(TaskError::LeaseHeld { .. }) => {}
                 Err(error) => errors.push(format!("{id}: {error}")),
@@ -377,7 +368,6 @@ impl<P: Policy> Coordinator<P> {
 
     fn verify_job(
         &self,
-        store: &Store,
         tasks: &TaskStore<'_>,
         id: &str,
         now: u64,
@@ -413,14 +403,7 @@ impl<P: Policy> Coordinator<P> {
                 .count(),
             None => 0,
         };
-        // Fail closed: an error reading the policy fails the pass.
-        let may_commit = match self.authorize(store, id, Authority::Commit) {
-            Ok(()) => true,
-            Err(TaskError::Invalid(_)) => false,
-            Err(error) => return Err(error),
-        };
         Ok(Some(VerifyJob {
-            may_commit,
             workspaces: tasks.workspaces(id)?,
             live,
             waited: already_waited,
