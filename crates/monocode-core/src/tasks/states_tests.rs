@@ -253,7 +253,9 @@ fn succeeded_and_needs_review_allow_the_same_requesters() {
             .find(|t| t.to == to)
             .unwrap_or_else(|| panic!("no rule to {}", to.as_str()))
     };
-    let mut succeeded = rule(State::Attempt(AttemptState::Succeeded)).requesters.to_vec();
+    let mut succeeded = rule(State::Attempt(AttemptState::Succeeded))
+        .requesters
+        .to_vec();
     let mut review = rule(State::Assignment(AssignmentState::NeedsReview))
         .requesters
         .to_vec();
