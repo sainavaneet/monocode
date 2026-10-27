@@ -5,7 +5,8 @@ use crate::tasks::coordinator::FLAG;
 use crate::tasks::review::tests::{claimed_with, events, feature, open, repo, scoped, CHECK, NOW};
 use crate::tasks::store::tests::{assignment, force, memory, new_task, plan};
 use crate::tasks::{
-    AcceptanceCriterion, AssignmentState, RoundOutcome, State, Subject, TaskStage, Verification,
+    AcceptanceCriterion, AssignmentState, RoundOutcome, State, Subject, TaskLifecycle, TaskStage,
+    Verification,
 };
 use serde_json::json;
 
@@ -157,4 +158,61 @@ fn a_waived_check_is_not_waived_again() {
     let refused = waive(&store, PROSE, "Again").unwrap_err();
     assert!(refused.contains("cannot be waived"), "{refused}");
     assert_eq!(tasks.verifications("t").unwrap().len(), 2);
+}
+
+#[test]
+fn the_waive_hint_reaches_mono_but_not_a_workers_correction() {
+    let repo = repo();
+    let store = open(&repo);
+    let missing = "test -f src/missing.rs";
+    let run = claimed_with(&store, &repo, scoped(&[CHECK]), &[missing, PROSE], feature);
+    run.coordinator.review(&store, NOW + 10).unwrap();
+    let rounds = run.coordinator.verify(&store, NOW + 20).unwrap();
+    assert_eq!(rounds[0].outcome, RoundOutcome::Correction, "{rounds:?}");
+    let tasks = store.tasks().unwrap();
+    let all = tasks.events_after(0, 10_000).unwrap();
+    let recorded = format!("{all:?} {:?}", tasks.reviews("t", "a").unwrap());
+    assert!(recorded.contains(PROSE), "the correction names the check");
+    assert!(!recorded.contains("criteria.waive"), "{recorded}");
+}
+
+#[test]
+fn a_finished_task_cannot_be_waived() {
+    for finished in [TaskLifecycle::Completed, TaskLifecycle::Cancelled] {
+        let store = verifying();
+        recorded(
+            &store,
+            json!({"unrunnable": "It is not a command line."}),
+            false,
+        );
+        force(&store, Subject::Task("t"), State::Lifecycle(finished));
+        let refused = waive(&store, PROSE, "Checked by hand").unwrap_err();
+        assert!(refused.contains("finished"), "{finished:?}: {refused}");
+        assert_eq!(store.tasks().unwrap().verifications("t").unwrap().len(), 1);
+        assert!(events(&store, "verification.waived").is_empty());
+    }
+}
+
+#[test]
+fn only_the_owning_mono_can_waive() {
+    let store = verifying();
+    recorded(
+        &store,
+        json!({"unrunnable": "It is not a command line."}),
+        false,
+    );
+    let input = json!({"taskId": "t", "criterionId": "c1", "check": PROSE, "reason": "ok"});
+    let other =
+        crate::app_access::mono_task_action(&store, "mono-2", "tasks.criteria.waive", &input, NOW)
+            .unwrap_err();
+    assert!(other.contains("task:t"), "{other}");
+    let worker =
+        crate::app_access::worker_action(&store, 1, "w1", "tasks.criteria.waive", &input, NOW);
+    assert!(
+        worker
+            .as_ref()
+            .is_err_and(|e| e.contains("Unknown worker action")),
+        "{worker:?}"
+    );
+    assert_eq!(store.tasks().unwrap().verifications("t").unwrap().len(), 1);
 }

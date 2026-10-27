@@ -485,6 +485,7 @@ impl<P: Policy> Coordinator<P> {
             // Keyed after recording, so this round's own rows do not make
             // the next pass look like a new round.
             let id = wait_event(&job.task.id, &round_key(&tasks, &job.task)?);
+            let findings = with_waive_hints(job, &inspection, findings);
             hand_to_mono(&tasks, &job.task.id, &id, WAITING, &findings, now)?;
             tx.commit()?;
             return Ok(Some(round(job, RoundOutcome::NeedsMonoReview, findings)));
@@ -575,7 +576,7 @@ fn round_findings(job: &VerifyJob, inspection: &RoundInspection) -> Vec<Finding>
             Ok(_) => {}
             Err(reason) => findings.push(Finding::UnrunnableCheck {
                 check: check.clone(),
-                reason: format!("{reason} {}", waive_hint(&job.task.id, criterion, check)),
+                reason: reason.clone(),
             }),
         }
     }
@@ -590,6 +591,35 @@ fn round_findings(job: &VerifyJob, inspection: &RoundInspection) -> Vec<Finding>
         });
     }
     findings
+}
+
+/// The findings for Mono: each unrunnable criterion check says how Mono
+/// may waive it. Workers' corrections never carry this.
+fn with_waive_hints(
+    job: &VerifyJob,
+    inspection: &RoundInspection,
+    findings: Vec<Finding>,
+) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .map(|finding| match finding {
+            Finding::UnrunnableCheck { check, reason } => {
+                let criterion = inspection
+                    .checks
+                    .iter()
+                    .position(|c| *c == check)
+                    .and_then(|index| inspection.criteria.get(index));
+                let reason = match criterion {
+                    Some(criterion) => {
+                        format!("{reason} {}", waive_hint(&job.task.id, criterion, &check))
+                    }
+                    None => reason,
+                };
+                Finding::UnrunnableCheck { check, reason }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// How Mono can settle a declared check that cannot run.

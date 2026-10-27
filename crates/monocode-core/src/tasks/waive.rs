@@ -7,7 +7,7 @@
 //! check could not run against. A check that ran and failed is never waived;
 //! the work must change instead.
 use super::events::{append, NewEvent};
-use super::{TaskError, TaskStore, Verification};
+use super::{TaskError, TaskLifecycle, TaskStore, Verification};
 use serde_json::json;
 
 const WAIVED: &str = "verification.waived";
@@ -51,6 +51,15 @@ pub fn waive_check(
     let task = tasks
         .task(task_id)?
         .ok_or_else(|| TaskError::NotFound(format!("task:{task_id}")))?;
+    if matches!(
+        task.lifecycle,
+        TaskLifecycle::Completed | TaskLifecycle::Cancelled
+    ) {
+        return Err(TaskError::Invalid(format!(
+            "Task {task_id} is finished ({}); its checks can no longer be waived.",
+            task.lifecycle.as_str()
+        )));
+    }
     let criterion = task
         .criteria
         .iter()
