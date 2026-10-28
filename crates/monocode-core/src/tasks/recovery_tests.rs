@@ -343,7 +343,7 @@ fn no_eligible_account_blocks_the_task_with_a_clear_reason_and_tells_mono() {
     };
     assert!(reason.contains("No eligible account"), "{reason}");
     assert!(
-        reason.contains("codex/default needs to sign in again"),
+        reason.contains("codex/default has a recorded authentication failure"),
         "{reason}"
     );
     let task = task(&store);
@@ -365,7 +365,7 @@ fn no_eligible_account_blocks_the_task_with_a_clear_reason_and_tells_mono() {
         batch.message
     );
     assert!(
-        batch.message.contains("needs to sign in again"),
+        batch.message.contains("recorded authentication failure"),
         "{}",
         batch.message
     );

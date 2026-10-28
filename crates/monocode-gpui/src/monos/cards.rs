@@ -293,7 +293,7 @@ pub(crate) fn render(
         .into_any_element()
 }
 /// launchedSessionState: where a session the Mono started stands.
-fn launched_state(session: &Conversation, cx: &App) -> &'static str {
+pub(super) fn launched_state(session: &Conversation, cx: &App) -> &'static str {
     if session.needs_approval() {
         "input"
     } else if session.busy {
@@ -309,7 +309,61 @@ fn launched_state(session: &Conversation, cx: &App) -> &'static str {
     }
 }
 impl Monos {
+    // Refresh every loaded Mono, including those only visible in the sidebar.
+    // A completion must not leave a background Mono stuck in Waiting.
+    fn refresh_mono_activity(&self, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let summaries = owner.read(cx).mono_session_views(cx);
+        for (id, chat) in &self.chats {
+            let Some(mono) = self.roster.get(id) else {
+                continue;
+            };
+            let source = chat.read(cx).summary.id;
+            let workers = mono
+                .launches
+                .iter()
+                .filter(|l| {
+                    l.notify_on_complete
+                        && !l.completed
+                        && !l.dismissed
+                        && l.origin_session == source
+                })
+                .map(|l| {
+                    let session = owner.read(cx).mono_session_entity(l.session_id);
+                    let (title, state) = if let Some(session) = session {
+                        let session = session.read(cx);
+                        (session.summary.title.clone(), launched_state(session, cx))
+                    } else if let Some(summary) = summaries.iter().find(|s| s.id == l.session_id) {
+                        (
+                            summary.title.clone(),
+                            if summary.needs_input {
+                                "input"
+                            } else if summary.busy {
+                                "working"
+                            } else if !summary.has_messages {
+                                "draft"
+                            } else {
+                                "done"
+                            },
+                        )
+                    } else {
+                        (l.title.clone(), "unavailable")
+                    };
+                    crate::conversation::mono_activity::DelegatedWorker {
+                        session: l.session_id,
+                        title,
+                        state,
+                        model: l.model.clone().unwrap_or_else(|| l.harness.clone()),
+                    }
+                })
+                .collect();
+            chat.update(cx, |v, cx| v.set_mono_workers(workers, cx));
+        }
+    }
     pub(super) fn refresh_cards(&mut self, cx: &mut Context<Self>) {
+        self.refresh_mono_activity(cx);
         let Some(mono) = self.current().cloned() else {
             return;
         };
@@ -324,7 +378,7 @@ impl Monos {
             .map(|owner| owner.read(cx).mono_session_views(cx))
             .unwrap_or_default();
         // LaunchedSessionCard: each launch's live state, for the chat's cards.
-        let launches = mono
+        let launches: std::collections::HashMap<i64, crate::transcript::LaunchView> = mono
             .launches
             .iter()
             .map(|launch| {

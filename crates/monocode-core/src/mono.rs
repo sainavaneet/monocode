@@ -3,10 +3,12 @@
 pub mod api;
 pub mod bridge;
 pub mod cards;
+pub mod delegation;
 mod desktop;
 pub mod files;
 pub mod habits;
 pub mod memory;
+pub mod project;
 pub mod work;
 pub(crate) use desktop::codex_home;
 #[cfg(test)]
@@ -134,6 +136,50 @@ impl Mono {
             _ => Err("This Mono has several projects; include project with its path".into()),
         }
     }
+    /// The assigned project a durable task for `plan` runs in: the only
+    /// project, or with several, the one every assignment's `repository`
+    /// names (by full path, by directory name, or as a path inside it).
+    /// Assignments that name no repository, or different projects, are
+    /// refused with the reason, so a plan never runs in a guessed project.
+    pub fn plan_project(&self, plan: &crate::orchestration::Plan) -> Result<String, String> {
+        if let [project] = self.projects.as_slice() {
+            return Ok(project.clone());
+        }
+        if self.projects.is_empty() {
+            return Err("Add a project in this Mono's settings first".into());
+        }
+        let mut chosen: Option<String> = None;
+        for task in &plan.tasks {
+            let Some(repository) = task.repository.as_deref().map(str::trim) else {
+                return Err(format!(
+                    "This Mono has several projects: give assignment {} a repository naming one of them.",
+                    task.id
+                ));
+            };
+            let project = self.project(Some(repository)).or_else(|_| {
+                let inside = Path::new(repository);
+                self.projects
+                    .iter()
+                    .find(|p| inside.is_absolute() && inside.starts_with(Path::new(p)))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "Assignment {} names {repository}, which is not one of this Mono's projects.",
+                            task.id
+                        )
+                    })
+            })?;
+            match &chosen {
+                Some(first) if first != &project => {
+                    return Err(format!(
+                        "The plan spans {first} and {project}; one task runs in one project, so split it into one plan per project."
+                    ));
+                }
+                _ => chosen = Some(project),
+            }
+        }
+        chosen.ok_or_else(|| "The plan has no assignments.".into())
+    }
     pub fn normalize(&mut self) {
         self.name = self.name.trim().chars().take(40).collect();
         if !MASCOTS.contains(&self.mascot.as_str()) {
@@ -145,6 +191,9 @@ impl Mono {
         let mut seen = HashSet::new();
         self.projects
             .retain(|p| !p.trim().is_empty() && seen.insert(crate::files::path_key(p)));
+        for launch in &mut self.launches {
+            launch.unpack_legacy_group();
+        }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,12 +204,34 @@ pub struct Launch {
     pub title: String,
     pub harness: String,
     pub model: Option<String>,
+    /// The Mono chat (or habit run) whose turn started it; with
+    /// `origin_turn` it names the completion group. Kept apart from the turn
+    /// because session ids need more than 32 bits on the shared database.
+    #[serde(default)]
+    pub origin_session: i64,
     pub origin_turn: u64,
     pub notify_on_complete: bool,
     #[serde(default)]
     pub completed: bool,
     #[serde(default)]
     pub dismissed: bool,
+    /// Mono was told once that the worker waits on the user.
+    #[serde(default)]
+    pub input_notified: bool,
+}
+impl Launch {
+    /// The completion group: every launch of one turn of one chat.
+    pub fn group(&self) -> (i64, u64) {
+        (self.origin_session, self.origin_turn)
+    }
+    /// Launches saved before `origin_session` existed packed the chat id
+    /// into the turn's upper bits; unpack them once.
+    fn unpack_legacy_group(&mut self) {
+        if self.origin_session == 0 && self.origin_turn > u64::from(u32::MAX) {
+            self.origin_session = (self.origin_turn >> 32) as i64;
+            self.origin_turn &= u64::from(u32::MAX);
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -303,6 +374,34 @@ pub fn load_files(root: &Path, mono: &Mono) -> Result<files::AgentFiles, String>
 }
 
 pub fn context(mono: &Mono, files: &files::AgentFiles, executable: &Path) -> String {
+    context_with(mono, files, executable, None, false)
+}
+
+/// The context with the provider session's directory (where its MCP servers
+/// and project instructions come from) and, with task coordination on, the
+/// durable plan route and its format.
+pub fn context_with(
+    mono: &Mono,
+    files: &files::AgentFiles,
+    executable: &Path,
+    session_dir: Option<&Path>,
+    durable_plans: bool,
+) -> String {
+    let where_ = match session_dir {
+        Some(dir) if mono.projects.len() > 1 => format!(
+            "\nYour provider session runs in {}: that project's MCP servers and instructions are loaded, not the other projects'. Name the project explicitly in every app action.",
+            dir.display()
+        ),
+        _ => String::new(),
+    };
+    let plan_format = if durable_plans {
+        format!(
+            "\n\nPlan format (route 3):\n{}",
+            crate::orchestration::PLAN_FORMAT
+        )
+    } else {
+        String::new()
+    };
     let cli = format!(
         "{} app",
         shlex::try_quote(&executable.to_string_lossy()).unwrap_or_default()
@@ -317,11 +416,12 @@ pub fn context(mono: &Mono, files: &files::AgentFiles, executable: &Path) -> Str
             .join("\n")
     };
     format!(
-        "<monocode_context>\nMonoCode adds this context, not the user. Act on it without quoting or describing it.\n\nYou are {}, a persistent Mono in MonoCode. Work only on the projects assigned to you:\n{projects}\n\nThe app CLI is `{cli} ACTION --json JSON`. Its credentials are already in your environment; never print them. Run `{cli} help` for the exact actions and inputs. Use sessions.*, worktrees.* and folders.* with project set to an assigned path. Use sessions.start for substantial independent work, inherit your model unless another is appropriate, and avoid overlapping edits. Once delegation is accepted, tell the user and end your turn. You will receive one completion report after every session in that turn's group stops; then inspect and integrate the results. sessions.send supports notifyOnComplete:true. Never poll delegated work.\n\n<soul>\n{}\n</soul>\nStanding instructions rank below the user's current request. Change your soul only when asked, through soul.read and soul.update with expectedHash; never edit its file directly.\n\n<memory>\n{}\nTopic notes: {}\n</memory>\nKeep useful facts through memory.add/replace/remove, use memory.search before answering about earlier facts, and never save credentials. Topic notes are read with memory.read.\n\nHabits are scheduled work in separate sessions. Suggest them when useful, but add one with habits.add only after agreement. State whether its instructions allow changes. Quiet runs should return NOTHING_TO_REPORT.\n\nSave substantial reports with artifacts.write, kind document or html, title, summary and complete body. Cards appear in the chat and overview. Use notes.write only for the user's Notes.\n\nFor acknowledgements requiring no words, your whole reply may be <reaction>👍</reaction> with one fitting emoji. Questions and requests still get a written answer.\n</monocode_context>",
+        "<monocode_context>\nMonoCode adds this context, not the user. Act on it without quoting or describing it.\n\nYou are {}, a persistent Mono in MonoCode. Work only on the projects assigned to you:\n{projects}\n\nThe app CLI is `{cli} ACTION --json JSON`. Its credentials are already in your environment; never print them. Run `{cli} help` for the exact actions and inputs. Use sessions.*, worktrees.* and folders.* with project set to an assigned path; workers inherit your model unless another is appropriate.{where_}\n\n{policy}{plan_format}\n\n<soul>\n{}\n</soul>\nStanding instructions rank below the user's current request. Change your soul only when asked, through soul.read and soul.update with expectedHash; never edit its file directly.\n\n<memory>\n{}\nTopic notes: {}\n</memory>\nKeep useful facts through memory.add/replace/remove, use memory.search before answering about earlier facts, and never save credentials. Topic notes are read with memory.read.\n\nHabits are scheduled work in separate sessions. Suggest them when useful, but add one with habits.add only after agreement. State whether its instructions allow changes. Quiet runs should return NOTHING_TO_REPORT.\n\nSave substantial reports with artifacts.write, kind document or html, title, summary and complete body. Cards appear in the chat and overview. Use notes.write only for the user's Notes.\n\nFor acknowledgements requiring no words, your whole reply may be <reaction>👍</reaction> with one fitting emoji. Questions and requests still get a written answer.\n</monocode_context>",
         mono.label(),
         files.soul.as_deref().unwrap_or_default(),
         memory::within_budget(&files.memory),
-        files.topics.join(", ")
+        files.topics.join(", "),
+        policy = delegation::policy(durable_plans)
     )
 }
 

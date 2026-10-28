@@ -658,3 +658,26 @@ fn the_integration_id_is_reserved_for_the_integration_branch() {
         assert!(tasks.assignments("t").unwrap().is_empty());
     }
 }
+
+#[test]
+fn legacy_assignments_are_readable_and_migrate_without_losing_the_plan() {
+    let store = memory();
+    let tasks = store.tasks().unwrap();
+    tasks.create_task(&new_task("t"), 1).unwrap();
+    tasks
+        .save_plan("t", 1, &plan(vec![assignment("a", &[])]), 2)
+        .unwrap();
+    tasks.conn.execute_batch("ALTER TABLE native_task_assignments DROP COLUMN repository; ALTER TABLE native_task_assignments DROP COLUMN base_ref;").unwrap();
+    let old = tasks.assignments("t").unwrap();
+    assert_eq!(old[0].prompt, "Do the work");
+    assert!(old[0].repository.is_none());
+    let tasks = store.tasks().unwrap();
+    let mut a = tasks.assignment("t", "a").unwrap().unwrap();
+    a.repository = Some("DigitalTwin".into());
+    a.base_ref = Some("pipeline".into());
+    tasks.update_assignment("t", &a, 3).unwrap();
+    let saved = tasks.assignment("t", "a").unwrap().unwrap();
+    assert_eq!(saved.repository, a.repository);
+    assert_eq!(saved.base_ref, a.base_ref);
+    assert_eq!(saved.prompt, a.prompt);
+}

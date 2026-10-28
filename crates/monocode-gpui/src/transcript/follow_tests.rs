@@ -2020,3 +2020,67 @@ fn empty_and_unrevealed_replacements_do_not_reopen_previous_work(cx: &mut TestAp
         })
         .unwrap();
 }
+
+#[test]
+fn mono_live_activity_uses_real_tools_not_startup_inventory() {
+    let tool_row = |id: &str, name: &str, state: ToolState| {
+        let mut tool = ToolCall::new(id, name);
+        tool.state = state;
+        row("tool", &serde_json::to_string(&tool).unwrap())
+    };
+    let mut rows = vec![
+        row("user", "Check graph"),
+        tool_row(
+            "monocode-mcp-startup",
+            "MCP connection status",
+            ToolState::Completed,
+        ),
+    ];
+    assert_eq!(mono_work_label(&rows, 0), "Thinking…");
+    rows.push(tool_row(
+        "graph",
+        "mcp__digital-twin__get_sync_status",
+        ToolState::Running,
+    ));
+    rows.push(tool_row("read", "Read", ToolState::Completed));
+    assert_eq!(
+        mono_work_label(&rows, 0),
+        "Running mcp__digital-twin__get_sync_status…"
+    );
+    rows.push(row("assistant", "Checking in parallel"));
+    assert!(mono_work_label(&rows, 0).starts_with("Running mcp__digital-twin"));
+    rows.push(tool_row("shell", "Bash", ToolState::Running));
+    assert_eq!(mono_work_label(&rows, 0), "Running Bash… · +1 running");
+    rows.push(row("user", "Next turn"));
+    assert_eq!(mono_work_label(&rows, 0), "Thinking…");
+    rows.push(tool_row("done", "Read", ToolState::Completed));
+    assert_eq!(mono_work_label(&rows, 0), "Reviewing Read result…");
+    rows.push(tool_row("bad", "Bash", ToolState::Failed));
+    assert_eq!(mono_work_label(&rows, 0), "Bash failed");
+}
+
+#[gpui::test]
+fn decision_options_wrap_inside_the_chat_card(cx: &mut TestAppContext) {
+    let window = chat(cx);
+    window.update(cx, |view, _, cx| {
+        view.smooth_reveal = false;
+        let card = serde_json::json!({"type":"decision", "decisionId":"long-internal-reference", "revision":1,
+            "question":"Recover the original generator?", "why":"The original files preserve provenance.",
+            "recommendation":"Allow one read-only copy of the generator scripts and README from the archived workspace. No layout changes, deployments or robot commands are included in this option.",
+            "alternatives":["Rebuild the generator from documented provenance and mark it as a reconstruction."],
+            "paused":"Generator recovery", "continues":"Other independent work continues."});
+        view.patch(0, vec![row("user", "Review the options"), row("mono-card", &card.to_string())], cx);
+    }).unwrap();
+    render(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    let card = visual.debug_bounds("mono-decision-card").unwrap();
+    let option = visual.debug_bounds("mono-decision-option-0").unwrap();
+    assert!(
+        option.size.height > px(34.) && option.size.height <= px(64.),
+        "long option must wrap without becoming an oversized block: {:?}",
+        option.size.height
+    );
+    assert!(option.origin.x >= card.origin.x);
+    assert!(option.origin.x + option.size.width <= card.origin.x + card.size.width);
+}

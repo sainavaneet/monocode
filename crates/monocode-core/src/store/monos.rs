@@ -218,10 +218,12 @@ impl Store {
                     title: value["title"].as_str().unwrap().into(),
                     harness: value["harness"].as_str().unwrap().into(),
                     model: value["model"].as_str().map(str::to_owned),
+                    origin_session: 0,
                     origin_turn: index as u64,
                     notify_on_complete: false,
                     completed: true,
                     dismissed: false,
+                    input_notified: false,
                 });
             }
         }

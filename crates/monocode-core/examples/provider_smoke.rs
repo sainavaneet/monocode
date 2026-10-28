@@ -5,7 +5,20 @@ fn main() -> Result<(), String> {
     let name = std::env::args().nth(1).unwrap_or_else(|| "codex".into());
     let kind = Kind::parse(&name).ok_or_else(|| format!("Unknown provider: {name}"))?;
     let binary = provider::resolve(kind).ok_or("CLI not installed")?;
-    if std::env::args().nth(2).as_deref() == Some("--models") {
+    if std::env::args().nth(2).as_deref() == Some("--models-api") {
+        if kind != Kind::Gemini {
+            return Err("API catalog probe currently supports Gemini only".into());
+        }
+        let dir = std::env::args()
+            .nth(3)
+            .ok_or("Pass an isolated API key data directory")?;
+        monocode_core::api_keys::init(dir.into());
+        monocode_core::api_keys::configure_gemini_catalog(true);
+    }
+    if matches!(
+        std::env::args().nth(2).as_deref(),
+        Some("--models" | "--models-api")
+    ) {
         for model in monocode_core::catalog::models(kind)? {
             println!(
                 "{} | {} | {:?} | fast={}",

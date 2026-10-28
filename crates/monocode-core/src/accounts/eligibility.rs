@@ -313,6 +313,36 @@ pub fn mark_healthy(
     })
 }
 
+/// A completed subscription turn verifies only its own account. An older
+/// success must not erase a failure recorded by a concurrent, newer turn.
+pub fn verified_subscription_turn(
+    store: &Store,
+    provider: &str,
+    account_id: &str,
+    started_at: u64,
+    use_api_key: bool,
+    now: u64,
+) -> Result<(), String> {
+    if use_api_key || !matches!(provider, "claude" | "codex") {
+        return Ok(());
+    }
+    let current = health(store)?.get(provider, account_id);
+    if !current.unhealthy || current.updated_at > started_at {
+        return Ok(());
+    }
+    update(store, |book| {
+        let mut current = book.get(provider, account_id);
+        if current.unhealthy && current.updated_at <= started_at {
+            current.unhealthy = false;
+            if current.failure == Some(Failure::Auth) {
+                current.failure = None;
+            }
+            current.updated_at = now;
+            book.set(provider, account_id, current);
+        }
+    })
+}
+
 /// Records what the failure says about the account: an exhausted account
 /// rests until its reset (or [`DEFAULT_COOLDOWN_MS`]), a shared quota rests
 /// every account sharing it, bad credentials make it unhealthy. Other
@@ -391,7 +421,7 @@ impl Pool<'_> {
         let what = if !(self.exists)(account) {
             "was removed".to_owned()
         } else if health.unhealthy {
-            "needs to sign in again".to_owned()
+            "has a recorded authentication failure; verify sign-in".to_owned()
         } else if let Some(until) = health.cooldown_until.filter(|at| *at > now) {
             format!("is cooling down until {until}")
         } else if let Some(until) = (self.exhausted_until)(account).filter(|at| *at > now) {
@@ -410,12 +440,25 @@ pub fn first_eligible(
     skip: Option<&AllowedAccount>,
     now: u64,
 ) -> Option<AllowedAccount> {
-    pool.allowlist
-        .ordered()
-        .into_iter()
+    let accounts = pool.allowlist.ordered();
+    let eligible = |a: &&AllowedAccount| skip.is_none_or(|s| !s.same(a)) && pool.eligible(a, now);
+    accounts
+        .iter()
+        .copied()
         .filter(|a| a.provider == provider)
-        .filter(|a| skip.is_none_or(|s| !s.same(a)))
-        .find(|a| pool.eligible(a, now))
+        .find(eligible)
+        .or_else(|| {
+            pool.allowlist
+                .provider_fallback
+                .then(|| {
+                    accounts
+                        .iter()
+                        .copied()
+                        .filter(|a| a.provider != provider)
+                        .find(eligible)
+                })
+                .flatten()
+        })
         .cloned()
 }
 

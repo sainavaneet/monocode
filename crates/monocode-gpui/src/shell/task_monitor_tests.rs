@@ -122,6 +122,7 @@ fn each_task_state_renders_its_label_on_the_monitoring_card(cx: &mut gpui::TestA
                 busy: true,
                 needs_input: true,
                 updated_at: 5,
+                ..Default::default()
             };
             shell.sessions[&lead].update(cx, |v, cx| v.set_worker_live(worker, live, cx));
         })

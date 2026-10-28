@@ -1021,12 +1021,13 @@ impl Monos {
                 .on_click(cx.listener(|this, _, window, cx| this.filter_menu(window, cx))),
         );
         let no_matches = launches.is_empty() && !mono.launches.is_empty();
-        let tasks = self.task_overview(mono);
+        let tasks = self.task_overview(mono, cx);
+        let has_tasks = tasks.is_some();
         div().size_full().flex().flex_col()
-            .children(tasks)
             .when(!mono.launches.is_empty(),|d|d.child(search_bar))
             .child(div().id("mono-session-list").debug_selector(|| "mono-session-list".into()).flex_1().min_h_0().overflow_y_scroll().px(px(6.)).py_2().flex().flex_col().gap_1()
-                .when(mono.launches.is_empty(),|d|d.child(empty_state("message-multiple",&format!("Ask {} to start a session on one of your projects, like a bug fix or a review, and it shows up here.",mono.label()))))
+                .children(tasks)
+                .when(mono.launches.is_empty() && !has_tasks,|d|d.child(empty_state("message-multiple",&format!("Ask {} to start a session on one of your projects, like a bug fix or a review, and it shows up here.",mono.label()))))
                 .when(no_matches,|d|d.child(empty_state("search-01",if query.trim().is_empty(){"No sessions match these filters."}else{"No sessions match this search."})))
                 .children(launches.into_iter().map(|launch|{
                     // Sidebar.tsx's SessionCard with `modelInFooter`.
@@ -1060,7 +1061,7 @@ impl Monos {
                             .child(div().flex_shrink_0().flex().items_center().text_size(px(11.)).text_color(content(0.5))
                                 .child(div().max_w(px(0.)).overflow_hidden().whitespace_nowrap().group_hover("mono-launch",|s|s.max_w(px(128.)).pr(px(6.))).child(model))
                                 .child(provider_icon(&launch.harness,14.))))
-                        .on_click(cx.listener(move|this,_,_,cx|{this.route=Some(Route::Session(id));cx.notify();}))
+                        .on_click(cx.listener(move|this,_,_,cx|{this.open_task_session(id,cx);}))
 }))).into_any_element()
     }
     fn document_list(&mut self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
@@ -1366,11 +1367,12 @@ impl Monos {
         if rows.is_empty() {
             return empty_state("list-bullet", "No activity in this turn yet.");
         }
-        let key = mono::files::content_hash(&format!("{rows:?}"));
+        let live = chat.read(cx).responding() && end == source.len();
+        let key = mono::files::content_hash(&format!("{live}:{rows:?}"));
         if self.activity.as_ref().is_none_or(|(old, _)| old != &key) {
             self.activity = Some((
                 key,
-                cx.new(|cx| crate::transcript::TranscriptView::activity(rows, cx)),
+                cx.new(|cx| crate::transcript::TranscriptView::activity(rows, live, cx)),
             ));
         }
         div()

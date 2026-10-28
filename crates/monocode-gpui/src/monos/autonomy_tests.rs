@@ -92,6 +92,7 @@ fn the_autonomy_section_edits_the_policy_applies_it_and_unblocks_a_task(cx: &mut
     let visual = &mut open_autonomy(&s, cx);
     for selector in [
         "mono-autonomy-page",
+        "mono-autonomy-worker-access-full-access",
         "mono-autonomy-spending-note",
         "mono-autonomy-task-t",
         "mono-autonomy-workers-2",

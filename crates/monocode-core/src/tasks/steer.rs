@@ -95,6 +95,8 @@ fn changed(old: &Assignment, new: &Assignment) -> bool {
         || old.depends_on != new.depends_on
         || old.verification != new.verification
         || old.workspace != new.workspace
+        || old.repository != new.repository
+        || old.base_ref != new.base_ref
 }
 
 fn diff(current: &[Assignment], plan: &Plan) -> Diff {
@@ -349,12 +351,12 @@ fn apply_plan(conn: &Connection, task: &str, diff: &Diff, now: u64) -> Result<()
             |row| row.get(0),
         )?;
         conn.execute(
-            "INSERT INTO native_task_assignments(task_id,id,position,title,prompt,files,depends_on,workspace,verification,status,revision,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10,?11)",
+            "INSERT INTO native_task_assignments(task_id,id,position,title,prompt,files,depends_on,workspace,verification,status,revision,updated_at,repository,base_ref)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10,?11,?12,?13)",
             params![task, a.id, *position as i64, a.title, a.prompt,
                 serde_json::to_string(&a.files)?, serde_json::to_string(&a.depends_on)?,
                 a.workspace.map(WorkspaceMode::as_str), serde_json::to_string(&a.verification)?,
-                first, ms(now)],
+                first, ms(now), a.repository, a.base_ref],
         )?;
     }
     Ok(())

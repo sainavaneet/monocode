@@ -87,7 +87,7 @@ fn each_task_state_shows_its_activity_and_badge() {
     assert_eq!(view.activity, MonoActivity::Waiting);
     assert_eq!(view.for_user(), 1);
     assert_eq!(view.badge(), Some(Badge::NeedsDecision));
-    assert_eq!(Badge::NeedsDecision.label(), "Needs your decision");
+    assert_eq!(Badge::NeedsDecision.label(), "Decision needed");
 }
 
 #[test]

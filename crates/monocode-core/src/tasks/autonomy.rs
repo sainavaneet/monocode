@@ -113,6 +113,8 @@ pub fn either(authorities: &[Authority]) -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Autonomy {
+    /// Provider permissions for workers when they launch or restart.
+    pub worker_access: crate::agent::AccessMode,
     /// Planned tasks start executing without an explicit start.
     pub automatic_execution: bool,
     pub workspace: WorkspacePreference,
@@ -138,6 +140,7 @@ pub struct Autonomy {
 impl Default for Autonomy {
     fn default() -> Self {
         Self {
+            worker_access: crate::agent::AccessMode::FullAccess,
             automatic_execution: false,
             workspace: WorkspacePreference::Automatic,
             worker_limit: 1,
@@ -151,6 +154,23 @@ impl Default for Autonomy {
             worktree_retention: Retention::Keep,
             api_key_billing: None,
         }
+    }
+}
+
+/// An explicit downgrade constrains future launches. Increasing authority
+/// requires applying policy to an existing task; running processes are unchanged.
+pub fn restricted_worker_access(
+    a: crate::agent::AccessMode,
+    b: crate::agent::AccessMode,
+) -> crate::agent::AccessMode {
+    use crate::agent::AccessMode::*;
+    match (a, b) {
+        (a, b) if a == b => a,
+        (ReadOnly, _) | (_, ReadOnly) => ReadOnly,
+        (Supervised, _) | (_, Supervised) => Supervised,
+        (FullAccess, other) | (other, FullAccess) => other,
+        // Auto and Auto-accept edits have different permission semantics.
+        _ => Supervised,
     }
 }
 
@@ -175,6 +195,7 @@ impl Autonomy {
     /// took away is gone at once; authority it added waits for [`apply`].
     pub fn restricted_by(&self, live: &Autonomy) -> Autonomy {
         Autonomy {
+            worker_access: restricted_worker_access(self.worker_access, live.worker_access),
             automatic_execution: self.automatic_execution && live.automatic_execution,
             worker_limit: self.worker_limit.min(live.worker_limit.max(1)),
             commit: self.commit && live.commit,

@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 
 fn row(label: &'static str, text: String) -> gpui::Div {
     div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
         .gap_0p5()
@@ -19,10 +21,29 @@ fn row(label: &'static str, text: String) -> gpui::Div {
         )
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .text_size(px(12.))
                 .text_color(content(0.75))
                 .child(text),
         )
+}
+
+fn useful_context(value: &Value) -> Option<String> {
+    let paused = value["paused"].as_str().unwrap_or_default();
+    let continues = value["continues"].as_str().unwrap_or_default();
+    let paused = if paused == "New launches for the whole task; nothing else" {
+        "New task launches"
+    } else {
+        paused
+    };
+    let continues = (!continues.is_empty() && continues != "nothing else").then_some(continues);
+    match (!paused.is_empty(), continues) {
+        (true, Some(continues)) => Some(format!("Paused: {paused} · Continuing: {continues}")),
+        (true, None) => Some(format!("Paused: {paused}")),
+        (false, Some(continues)) => Some(format!("Continuing: {continues}")),
+        (false, None) => None,
+    }
 }
 
 pub(super) fn render(
@@ -34,6 +55,8 @@ pub(super) fn render(
     let revision = value["revision"].as_u64().unwrap_or_default();
     let recommendation = text("recommendation");
     let answered = value["state"] == "answered";
+    let context = useful_context(value);
+    let accent = crate::theme::accent_color();
     let choices: Vec<String> = std::iter::once(recommendation.clone())
         .chain(
             value["alternatives"]
@@ -45,49 +68,151 @@ pub(super) fn render(
         .filter(|c| !c.is_empty() && !answered)
         .collect();
     div()
+        .debug_selector(|| "mono-decision-card".into())
         .rounded_lg()
         .border_1()
-        .border_color(content(0.12))
-        .bg(content(0.035))
+        .border_color(gpui::Hsla { a: 0.18, ..accent })
+        .bg(gpui::Hsla { a: 0.025, ..accent })
         .p_3()
-        .max_w(px(480.))
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
         .flex()
         .flex_col()
-        .gap_2()
+        .gap_1p5()
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .text_size(px(13.))
-                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(12.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(if answered { content(0.7) } else { accent })
                 .child(icon("message-square", 16.))
                 .child(if answered {
                     "Decision answered"
                 } else {
-                    "Needs your decision"
+                    "Decision needed"
                 }),
         )
-        .child(div().text_size(px(13.)).child(text("question")))
-        .child(row("Why it matters", text("why")))
-        .child(row("Recommendation", recommendation))
-        .child(row("Paused", text("paused")))
-        .child(row("Continues", text("continues")))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(19.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(text("question")),
+        )
+        .when(!text("why").is_empty(), |d| {
+            d.child(
+                div()
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(content(0.55))
+                    .child(text("why")),
+            )
+        })
         .when(answered, |d| d.child(row("Answer", text("answer"))))
         .children(choices.into_iter().enumerate().map(|(ix, choice)| {
             let card = json!({"type": "decision-answer", "decisionId": decision,
                 "revision": revision, "text": choice});
-            panels::button(("mono-decision-choice", ix), choice)
-                .bg(content(0.06))
+            div()
+                .id(("mono-decision-choice", ix))
+                .debug_selector(move || format!("mono-decision-option-{ix}"))
+                .role(Role::Button)
+                .aria_label(choice.clone())
+                .w_full()
+                .min_w_0()
+                .cursor_pointer()
+                .px_2()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(if ix == 0 {
+                    gpui::Hsla { a: 0.4, ..accent }
+                } else {
+                    content(0.08)
+                })
+                .bg(if ix == 0 {
+                    gpui::Hsla { a: 0.09, ..accent }
+                } else {
+                    content(0.018)
+                })
+                .hover(move |s| {
+                    s.bg(if ix == 0 {
+                        gpui::Hsla { a: 0.14, ..accent }
+                    } else {
+                        content(0.07)
+                    })
+                })
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .text_color(if ix == 0 { accent } else { content(0.5) })
+                        .child(if ix == 0 {
+                            "✓".to_owned()
+                        } else {
+                            format!("{}", ix + 1)
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .w_full()
+                                .text_size(px(12.))
+                                .line_height(px(17.))
+                                .child(choice),
+                        )
+                        .when(ix == 0, |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(gpui::Hsla { a: 0.12, ..accent })
+                                    .text_size(px(9.))
+                                    .text_color(accent)
+                                    .child("RECOMMENDED"),
+                            )
+                        }),
+                )
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(CardAction(card.clone()))))
         }))
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(content(0.45))
-                .child(format!(
-                    "Decision {decision} · or reply starting with \u{201c}{decision}:\u{201d}"
-                )),
-        )
+        .when_some(context, |d, context| {
+            d.child(
+                div()
+                    .id(SharedString::from(format!("decision-context-{decision}")))
+                    .w_full()
+                    .min_w_0()
+                    .mt_1()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(content(0.08))
+                    .text_size(px(10.))
+                    .text_color(content(0.45))
+                    .child(context),
+            )
+        })
+        .when(!answered, |d| {
+            d.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(content(0.45))
+                    .child("Choose an option, or reply in the chat."),
+            )
+        })
         .into_any_element()
 }

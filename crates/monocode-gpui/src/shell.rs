@@ -679,6 +679,9 @@ pub(crate) struct Shell {
     session_worktrees: HashMap<i64, Option<String>>,
     session_details: HashMap<i64, monocode_core::store::MobileSessionMetadata>,
     sidebar_hidden_sessions: HashSet<i64>,
+    /// Sessions a Mono launched that the store no longer has: a completion
+    /// check must not wait for them.
+    mono_missing_sessions: HashSet<i64>,
     worktree_returns: HashMap<(String, String), i64>,
     tab_drag: Option<TabDrag>,
     /// Tabs sliding between slots: neighbours making room for a drag and,
@@ -1027,6 +1030,7 @@ impl Shell {
             session_worktrees,
             session_details: sidebar_metadata.details,
             sidebar_hidden_sessions: sidebar_metadata.sidebar_hidden,
+            mono_missing_sessions: HashSet::new(),
             worktree_returns: HashMap::new(),
             tab_drag: None,
             tab_shifts: HashMap::new(),
@@ -1133,9 +1137,22 @@ impl Shell {
         let footer = this.usage_footer.clone();
         this.observations.push(cx.subscribe(
             &footer,
-            |this, _, event: &crate::usage_footer::UsageFooterEvent, cx| {
-                let crate::usage_footer::UsageFooterEvent::ApiKey { kind, on } = event;
-                this.set_api_key_billing(*kind, *on, cx);
+            |this, _, event: &crate::usage_footer::UsageFooterEvent, cx| match event {
+                crate::usage_footer::UsageFooterEvent::ApiKey { kind, on } => {
+                    this.set_api_key_billing(*kind, *on, cx)
+                }
+                crate::usage_footer::UsageFooterEvent::Mcp => {
+                    this.usage_footer
+                        .update(cx, |footer, cx| footer.show_mcp(cx));
+                }
+                crate::usage_footer::UsageFooterEvent::ManageMcp => {
+                    cx.spawn(async move |this, cx| {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.open_settings(crate::settings::Section::Mcp, window, cx)
+                        });
+                    })
+                    .detach();
+                }
             },
         ));
         this.observations.push(cx.subscribe(
@@ -1166,6 +1183,7 @@ impl Shell {
         let mut mono_error = monos.read(cx).error.clone();
         this.observations
             .push(cx.observe(&monos, move |this, monos, cx| {
+                this.notify_sidebar(cx);
                 let chrome = monos.read(cx).overview_chrome();
                 if chrome != mono_chrome {
                     mono_chrome = chrome;
@@ -1292,6 +1310,14 @@ impl Shell {
                 let Some(view) = this.sessions.get(&id) else {
                     return;
                 };
+                // App launches begin as durable drafts. Keep the lazy-session
+                // index in sync when submission consumes one (or a new draft
+                // is saved), rather than retaining the launch-time hint.
+                if view.read(cx).has_saved_draft() {
+                    this.draft_sessions.insert(id);
+                } else {
+                    this.draft_sessions.remove(&id);
+                }
                 this.session_worktrees
                     .insert(id, view.read(cx).settings.worktree_cwd.clone());
                 // A finished turn may have edited files or moved to a worktree.
@@ -3812,10 +3838,17 @@ impl Shell {
             let kind = Kind::from_id(&view.summary.provider);
             let profile = view.settings.account.clone();
             let model = view.account_model().map(str::to_owned);
-            let project = view.summary.cwd.clone();
+            let project = view
+                .mcp_footer_project()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
             let session = Some(view.summary.id);
             self.usage_footer.update(cx, |footer, cx| {
                 footer.context(kind, profile, model.as_deref(), project, session, cx)
+            });
+        } else {
+            self.usage_footer.update(cx, |footer, cx| {
+                footer.project_without_session(self.workspace.project.clone(), cx)
             });
         }
     }
@@ -11744,7 +11777,10 @@ mod tests {
     #[gpui::test]
     fn a_split_pane_slides_in_from_its_edge_then_settles(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
-        cx.update(bind_keys);
+        cx.update(|cx| {
+            bind_keys(cx);
+            cx.set_reduce_motion(false);
+        });
         window
             .update(cx, |shell, w, cx| {
                 shell.open(b, w, cx);
@@ -11753,9 +11789,21 @@ mod tests {
             .unwrap();
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-d");
         window
-            .update(cx, |shell, _, _| {
+            .update(cx, |shell, w, cx| {
+                // Test the animation at a fixed frame. Keyboard splitting is
+                // covered separately; async creation can finish and settle
+                // its animation before this test gets control back.
+                let summary = locked(&shell.store)
+                    .unwrap()
+                    .create("claude", &shell.workspace.project)
+                    .unwrap();
+                let id = summary.id;
+                shell.add(summary, cx);
+                let before = shell.active_leaves();
+                shell.workspace.split(id, SplitDir::Right);
+                shell.begin_pane_motion(before, cx);
+                shell.activate_session(id, w, cx);
                 shell
                     .pane_motion
                     .as_ref()

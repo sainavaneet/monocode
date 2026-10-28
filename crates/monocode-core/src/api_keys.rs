@@ -14,6 +14,16 @@ use std::sync::OnceLock;
 pub const CODEX_MODEL_PROVIDER: &str = "monocode-api";
 const CODEX_PROVIDER_DEFINITION: &str = "model_providers.monocode-api={name=\"OpenAI API\",base_url=\"https://api.openai.com/v1\",env_key=\"OPENAI_API_KEY\",wire_api=\"responses\",requires_openai_auth=false}";
 const MAX_KEY_LENGTH: usize = 512;
+static GEMINI_CATALOG_KEY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn configure_gemini_catalog(enabled: bool) {
+    if GEMINI_CATALOG_KEY.swap(enabled, std::sync::atomic::Ordering::Relaxed) != enabled {
+        crate::catalog::invalidate(Kind::Gemini, &crate::accounts::Profile::default());
+    }
+}
+pub(crate) fn gemini_catalog_key() -> bool {
+    GEMINI_CATALOG_KEY.load(std::sync::atomic::Ordering::Relaxed)
+}
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +51,7 @@ pub fn env_var(kind: Kind) -> Result<&'static str, String> {
     match kind {
         Kind::Claude => Ok("ANTHROPIC_API_KEY"),
         Kind::Codex => Ok("OPENAI_API_KEY"),
+        Kind::Gemini => Ok("GEMINI_API_KEY"),
         _ => Err(format!("{} does not take an API key", kind.label())),
     }
 }
@@ -109,7 +120,47 @@ pub fn apply_in(dir: &Path, kind: Kind, command: &mut Command) -> Result<(), Str
             kind.label()
         )
     })?;
-    command.env(env, key);
+    command.env(env, &key);
+    if kind == Kind::Gemini {
+        // API billing has its own Gemini profile. Never rewrite or clear the
+        // user's cached Google login. Project settings remain CLI-managed.
+        let home = dir.join("provider-accounts/gemini/api-key");
+        let config = home.join(".gemini");
+        std::fs::create_dir_all(&config).map_err(|_| "Cannot create Gemini API profile")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| "Cannot protect Gemini API profile")?;
+        }
+        let path = config.join("settings.json");
+        let mut settings: serde_json::Value = match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|_| "Cannot parse Gemini API profile settings")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(_) => return Err("Cannot read Gemini API profile settings".into()),
+        };
+        if !settings.is_object()
+            || (!settings["security"].is_null() && !settings["security"].is_object())
+            || (!settings["security"]["auth"].is_null()
+                && !settings["security"]["auth"].is_object())
+        {
+            return Err("Invalid Gemini API profile authentication settings".into());
+        }
+        settings["security"]["auth"]["selectedType"] = "gemini-api-key".into();
+        let temporary = tempfile::NamedTempFile::new_in(&config)
+            .map_err(|_| "Cannot create Gemini API settings")?;
+        write_secret(temporary.path(), &settings.to_string())?;
+        temporary
+            .persist(&path)
+            .map_err(|_| "Cannot save Gemini API settings")?;
+        command
+            .env("GEMINI_CLI_HOME", home)
+            .env("GOOGLE_API_KEY", &key)
+            .env_remove("GOOGLE_GENAI_USE_VERTEXAI")
+            .env_remove("GOOGLE_GENAI_USE_GCA")
+            .env("GEMINI_CLI_AUTH_OVERRIDE", "gemini-api-key");
+    }
     if kind == Kind::Codex {
         command.args([
             "-c",
@@ -205,6 +256,35 @@ mod tests {
                 configured: false,
                 hint: None
             }
+        );
+    }
+
+    #[test]
+    fn gemini_api_billing_is_child_scoped_and_does_not_expose_key_in_arguments() {
+        let dir = dir();
+        set_in(dir.path(), Kind::Gemini, "test-gemini-1234").unwrap();
+        let mut command = Command::new("gemini");
+        apply_in(dir.path(), Kind::Gemini, &mut command).unwrap();
+        let env = envs(&command);
+        assert!(env.contains(&("GEMINI_API_KEY".into(), Some("test-gemini-1234".into()))));
+        assert!(env.contains(&("GOOGLE_API_KEY".into(), Some("test-gemini-1234".into()))));
+        assert!(args(&command).is_empty());
+        let overlay: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                dir.path()
+                    .join("provider-accounts/gemini/api-key/.gemini/settings.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            overlay["security"]["auth"]["selectedType"],
+            "gemini-api-key"
+        );
+        assert!(!overlay.to_string().contains("test-gemini-1234"));
+        assert_eq!(
+            status_in(dir.path(), Kind::Gemini).unwrap().hint.as_deref(),
+            Some("1234")
         );
     }
 

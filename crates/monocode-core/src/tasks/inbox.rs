@@ -466,7 +466,74 @@ fn question(tasks: &TaskStore<'_>, decision: &DecisionRequest) -> Result<String,
     Ok(text)
 }
 
+/// The final report as one inbox item: what the evidence shows was
+/// delivered, where it is, and what Mono should tell the user. No task
+/// action is owed for it.
+fn final_report(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskError> {
+    let report: super::report::FinalReport = serde_json::from_value(event.payload.clone())?;
+    let flag = |name: &str, held: bool| {
+        if held {
+            name.to_owned()
+        } else {
+            format!("not {name}")
+        }
+    };
+    let mut text = format!(
+        "Task complete ({}).\n{}\nEvidence: {}, {}, {}, {}, {}.",
+        event.id,
+        context(tasks, &event.task_id, None)?,
+        flag("implemented", report.implemented),
+        flag("committed", report.committed),
+        flag("merged", report.merged),
+        flag("pushed", report.pushed),
+        flag("deployed", report.deployed),
+    );
+    for a in &report.assignments {
+        let place = match (&a.path, &a.branch) {
+            (Some(path), Some(branch)) => format!("{path} on {branch}"),
+            (Some(path), None) => path.clone(),
+            _ => "no workspace".into(),
+        };
+        text.push_str(&format!(
+            "\n- Assignment {} ({}): {place}; {} commit(s){}{}",
+            a.id,
+            a.status.as_str(),
+            a.commits.len(),
+            if a.uncommitted {
+                ", uncommitted changes remain"
+            } else {
+                ""
+            },
+            if a.verifications.is_empty() {
+                String::new()
+            } else {
+                format!("; passed checks: {}", a.verifications.join(", "))
+            },
+        ));
+    }
+    let satisfied = report.criteria.iter().filter(|c| c.satisfied).count();
+    text.push_str(&format!(
+        "\nCriteria satisfied: {satisfied} of {}.",
+        report.criteria.len()
+    ));
+    let waived: Vec<String> = report
+        .criteria
+        .iter()
+        .flat_map(|c| c.waived.iter().cloned())
+        .collect();
+    if !waived.is_empty() {
+        text.push_str(&format!("\nWaived: {}.", waived.join("; ")));
+    }
+    text.push_str(
+        "\nTell the user what was delivered and where (worktree and branch), stating implemented, committed, merged, pushed and deployed exactly as above, and what remains (for example an unmerged branch). No task action is needed; merging, pushing or deploying beyond this needs the user's go-ahead and your policy's authority.",
+    );
+    Ok(text)
+}
+
 fn review(tasks: &TaskStore<'_>, event: &super::Event) -> Result<String, TaskError> {
+    if event.kind == super::report::FINAL_REPORT {
+        return final_report(tasks, event);
+    }
     let notice =
         super::notices::describe(&event.kind, &event.task_id, event.assignment_id.as_deref());
     if let Some(notice) = notice {

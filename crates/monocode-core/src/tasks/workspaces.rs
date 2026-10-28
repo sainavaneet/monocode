@@ -10,7 +10,7 @@ use super::autonomy::WorkspacePreference;
 use super::{Assignment, Task, TaskError, TaskStore, Workspace};
 use crate::git::{self, git};
 use crate::orchestration::WorkspaceMode;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A recorded workspace and whether the checkout it came from had
 /// uncommitted changes the worker will not see.
@@ -88,6 +88,83 @@ fn dirty(project: &Path) -> bool {
     git(project, &["status", "--porcelain"]).is_ok_and(|s| !s.trim().is_empty())
 }
 
+/// How long a checkout's dirty state, read by a warm-up, stands in for a
+/// fresh `git status` (a full-tree scan on a large repository) in the
+/// locked launch step. The state is informational: it marks the intent.
+const DIRTY_CACHE_MS: u64 = 60_000;
+
+fn dirty_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, bool)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, bool)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The checkout's dirty state as a recent warm-up read it, else read now.
+fn dirty_at(project: &Path, now: u64) -> bool {
+    if let Ok(cache) = dirty_cache().lock() {
+        if let Some((at, dirty)) = cache.get(project) {
+            if now.saturating_sub(*at) <= DIRTY_CACHE_MS {
+                return *dirty;
+            }
+        }
+    }
+    let dirty = dirty(project);
+    if let Ok(mut cache) = dirty_cache().lock() {
+        cache.insert(project.to_path_buf(), (now, dirty));
+    }
+    dirty
+}
+
+/// A launch the coordinator is about to make, for the warm-up that runs
+/// before the locked tick (`Coordinator::launch_candidates`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WarmUp {
+    pub task: Task,
+    pub assignment: Assignment,
+    pub preference: WorkspacePreference,
+    /// The assignment already has a recorded workspace: nothing to create.
+    pub recorded: bool,
+}
+
+/// Creates the assignment's worktree ahead of the locked launch, so the
+/// checkout (minutes on a large repository) never runs under the store.
+/// Idempotent: `prepare` adopts the worktree it finds on the branch and
+/// records it. Errors are left for `prepare` to report; this returns them
+/// only for logging.
+pub fn warm_up(job: &WarmUp, now: u64) -> Result<(), String> {
+    if job.recorded {
+        return Ok(());
+    }
+    let mode = mode_with(&job.assignment, job.preference)?;
+    if mode != WorkspaceMode::Worktree {
+        return Ok(());
+    }
+    let selected = repository_for(&job.task, &job.assignment)?;
+    let project = selected.as_path();
+    let base = match &job.assignment.base_ref {
+        Some(base) => git(
+            project,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{base}^{{commit}}"),
+            ],
+        )
+        .ok()
+        .map(|s| s.trim().to_owned()),
+        None => head(project),
+    }
+    .ok_or_else(|| "The repository has no commit to base a worktree on.".to_owned())?;
+    let dirty = dirty(project);
+    if let Ok(mut cache) = dirty_cache().lock() {
+        cache.insert(project.to_path_buf(), (now, dirty));
+    }
+    let branch = branch_for(&job.task.id, &job.assignment.id);
+    worktree(project, &branch, &base).map(|_| ())
+}
+
 /// Why no workspace was prepared.
 #[derive(Debug)]
 pub enum PrepareError {
@@ -103,6 +180,55 @@ impl From<TaskError> for PrepareError {
     }
 }
 
+/// Resolve structured routing inside the approved task workspace. Prose is
+/// never used as authority to select a different repository.
+pub fn repository_for(task: &Task, assignment: &Assignment) -> Result<PathBuf, String> {
+    let root = Path::new(&task.project);
+    let selected = match &assignment.repository {
+        Some(repository) => {
+            let root = root
+                .canonicalize()
+                .map_err(|_| "Task workspace is unavailable")?;
+            let path = Path::new(repository);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            let path = path
+                .canonicalize()
+                .map_err(|_| "Assignment repository is unavailable")?;
+            if !path.starts_with(&root) {
+                return Err("Assignment repository is outside the task workspace. Select an approved parent workspace before starting this plan.".into());
+            }
+            let top = git(&path, &["rev-parse", "--show-toplevel"])
+                .map_err(|_| "Assignment repository is not a Git repository")?;
+            if Path::new(top.trim()).canonicalize().ok().as_ref() != Some(&path) {
+                return Err(
+                    "Select the repository root, not a folder within another repository.".into(),
+                );
+            }
+            path
+        }
+        // The same form as the explicit case, so two assignments of one
+        // repository are seen as one repository (symlinked roots included).
+        None => root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+    };
+    // Older Mono plans used this unambiguous prefix without structured routing.
+    // Block mismatches rather than launching in the lead's unrelated checkout.
+    if let Some(named) = assignment
+        .prompt
+        .strip_prefix("Repo ")
+        .and_then(|p| p.split_whitespace().next())
+    {
+        let named = Path::new(named.trim_end_matches('.'));
+        if named.is_absolute() && named.canonicalize().ok() != selected.canonicalize().ok() {
+            return Err(format!("Assignment {} names a different repository in its prompt. Set its repository field explicitly before resuming; no worker was started.", assignment.id));
+        }
+    }
+    Ok(selected)
+}
+
 /// Returns the assignment's recorded workspace, or creates and records one.
 /// `dirty_base` is only reported when the workspace is created. Nothing is
 /// recorded when preparation fails.
@@ -112,26 +238,117 @@ pub fn prepare(
     assignment: &Assignment,
     now: u64,
 ) -> Result<Prepared, PrepareError> {
+    let selected = repository_for(task, assignment).map_err(PrepareError::Workspace)?;
+    let project = selected.as_path();
+    // Accepted dependencies do not magically appear in another worktree.
+    // Refuse stale inputs rather than asking a worker to recreate predecessor work.
+    let recorded = tasks.workspaces(&task.id)?;
+    let mine = recorded
+        .iter()
+        .find(|w| w.assignment_id.as_deref() == Some(&assignment.id));
+    let input_tip = mine.and_then(|w| head(Path::new(&w.path))).or_else(|| {
+        assignment
+            .base_ref
+            .as_ref()
+            .and_then(|base| {
+                git(
+                    project,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{base}^{{commit}}"),
+                    ],
+                )
+                .ok()
+                .map(|s| s.trim().to_owned())
+            })
+            .or_else(|| head(project))
+    });
+    for dependency in assignment
+        .depends_on
+        .iter()
+        .filter(|_| assignment.repository.is_some() || assignment.base_ref.is_some())
+    {
+        if let Some(source) = recorded
+            .iter()
+            .find(|w| w.assignment_id.as_deref() == Some(dependency))
+        {
+            if Path::new(&source.repository).canonicalize().ok() == project.canonicalize().ok() {
+                if let (Some(tip), Some(input)) =
+                    (head(Path::new(&source.path)), input_tip.as_deref())
+                {
+                    if git(project, &["merge-base", "--is-ancestor", &tip, input]).is_err() {
+                        return Err(PrepareError::Workspace(format!("Assignment {} needs the accepted changes from {}. Integrate its branch into a reviewed base_ref before resuming; the worker was not launched with stale inputs.", assignment.id, dependency)));
+                    }
+                }
+            }
+        }
+    }
     let id = workspace_id(&task.id, &assignment.id);
     if let Some(workspace) = tasks.workspaces(&task.id)?.into_iter().find(|w| w.id == id) {
+        let actual = Path::new(&workspace.repository).canonicalize().ok();
+        let expected = git(project, &["rev-parse", "--show-toplevel"])
+            .ok()
+            .and_then(|p| Path::new(p.trim()).canonicalize().ok())
+            .or_else(|| project.canonicalize().ok());
+        if actual != expected {
+            return Err(PrepareError::Workspace("Saved workspace belongs to another repository. Preserve its work and repair the assignment before resuming.".into()));
+        }
+        if let Some(base) = &assignment.base_ref {
+            let expected_base = git(
+                project,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{base}^{{commit}}"),
+                ],
+            )
+            .map_err(PrepareError::Workspace)?;
+            if workspace.base_commit.as_deref() != Some(expected_base.trim()) {
+                return Err(PrepareError::Workspace(
+                    "Saved workspace has a different base commit. Review it before resuming."
+                        .into(),
+                ));
+            }
+        }
         return Ok(Prepared {
             workspace,
             dirty_base: false,
         });
     }
-    let project = Path::new(&task.project);
     let preference = super::policy::of(tasks, &task.id)?
         .map(|policy| policy.autonomy.workspace)
         .unwrap_or_default();
     let mode = mode_with(assignment, preference).map_err(PrepareError::Workspace)?;
-    let dirty_base = mode == WorkspaceMode::Worktree && dirty(project);
+    if mode == WorkspaceMode::Checkout {
+        if let Some(base) = &assignment.base_ref {
+            let expected = git(
+                project,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{base}^{{commit}}"),
+                ],
+            )
+            .map_err(PrepareError::Workspace)?;
+            if head(project).as_deref() != Some(expected.trim()) {
+                return Err(PrepareError::Workspace(
+                    "The checkout is not at the requested base_ref. Select a dedicated worktree to inspect that revision without changing the user's checkout.".into(),
+                ));
+            }
+        }
+    }
+    let dirty_base = mode == WorkspaceMode::Worktree && dirty_at(project, now);
     let repository = git(project, &["rev-parse", "--show-toplevel"])
         .map(|root| root.trim().to_owned())
         .ok();
     let (repository, path, branch, base_commit) = match mode {
         WorkspaceMode::Checkout => (
-            repository.unwrap_or_else(|| task.project.clone()),
-            task.project.clone(),
+            repository.unwrap_or_else(|| selected.to_string_lossy().into_owned()),
+            selected.to_string_lossy().into_owned(),
             git(project, &["symbolic-ref", "--short", "HEAD"])
                 .ok()
                 .map(|s| s.trim().to_owned()),
@@ -144,7 +361,22 @@ pub fn prepare(
                     task.project, assignment.id
                 ))
             })?;
-            let base = head(project).ok_or_else(|| {
+            let base = if let Some(base) = &assignment.base_ref {
+                git(
+                    project,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{base}^{{commit}}"),
+                    ],
+                )
+                .ok()
+                .map(|s| s.trim().to_owned())
+            } else {
+                head(project)
+            }
+            .ok_or_else(|| {
                 PrepareError::Workspace(
                     "The repository has no commit to base a worktree on.".into(),
                 )

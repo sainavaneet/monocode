@@ -49,6 +49,7 @@ pub fn forget_session(kind: Kind, provider_id: &str, account_id: &str, cwd: &Pat
         opencode::forget_session(provider_id, account_id, cwd);
     }
 }
+mod mcp_status;
 mod questions;
 pub mod test_guard;
 pub use questions::{answers_from_text, describe, question_from_json, question_json};
@@ -515,6 +516,16 @@ impl Protocol {
                 self.compaction(None, ToolState::Completed, &mut events);
             }
         }
+        if let Some(status) = self
+            .mono_mcp_status(&v)
+            .or_else(|| self.codex_mcp_status(&v))
+        {
+            events.push(Event::Tool(status));
+        }
+        if self.request.kind == Kind::Codex && v["id"] == mcp_status::STATUS_ID {
+            // Diagnostics are optional: older app servers must still run turns.
+            return Ok(events);
+        }
         if let Some(commands) = self.command_updates(&v) {
             events.push(Event::Commands(commands));
         }
@@ -582,6 +593,12 @@ impl Protocol {
                             .as_str()
                             .ok_or("Codex returned no thread id")?;
                         events.push(Event::SessionId(id.into()));
+                        if self.request.settings.mono.is_some() {
+                            write_json(
+                                stdin,
+                                json!({"id":mcp_status::STATUS_ID,"method":"mcpServerStatus/list","params":{"threadId":id,"limit":100}}),
+                            )?;
+                        }
                         if let Some(model) = v["result"]["model"].as_str() {
                             events.push(Event::Model(model.into()));
                         }
@@ -1374,6 +1391,7 @@ pub(crate) fn catalog_for(kind: Kind, account: crate::accounts::Profile) -> Resu
             model: None,
             settings: Settings {
                 account,
+                use_api_key: kind == Kind::Gemini && crate::api_keys::gemini_catalog_key(),
                 access: AccessMode::ReadOnly,
                 ..Default::default()
             },
@@ -1407,6 +1425,15 @@ fn run_operation(
 ) -> Result<Option<Value>, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Stopped".into());
+    }
+    let mut request = request;
+    if let Some(mono) = &request.settings.mono {
+        request.cwd = crate::mono::project::directory(&mono.mono, &request.cwd)?;
+        let revision = crate::mono::project::revision(request.kind, &request.cwd)?;
+        request
+            .settings
+            .environment
+            .insert(crate::mono::project::REVISION_ENV.into(), revision);
     }
     if request.kind == Kind::OpenCode {
         return opencode::run(request, cancel, controls, probe, compact, emit);

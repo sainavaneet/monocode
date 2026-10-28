@@ -101,6 +101,12 @@ pub struct Task {
     /// Where the work happens; None leaves the choice to the coordinator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMode>,
+    /// Explicit repository within the task workspace; never inferred from prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// Reviewed Git ref or commit to base an isolated worktree on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
     #[serde(default, skip_serializing_if = "is_queued")]
     pub status: AssignmentState,
     /// The durable record's revision; zero before it is persisted.
@@ -146,10 +152,24 @@ pub struct Plan {
     pub summary: String,
     pub tasks: Vec<Task>,
 }
-pub const INSTRUCTIONS: &str = r#"Prepare an orchestration plan for the user's request. Inspect the project with read-only tools. Do not edit or launch workers yet. The user will review and start the plan in MonoCode.
-Return a short explanation followed by exactly one JSON block between <monocode_orchestration> and </monocode_orchestration>.
-Schema: {"title":"short title","summary":"approach","tasks":[{"id":"task-1","title":"assignment title","prompt":"complete self-contained instructions, validation and expected report","files":["src/path"],"depends_on":[]}]}
-Use 1 to 12 assignments, unique ASCII IDs, exact project-relative file or directory scopes ('.' for the whole project), and dependency IDs. Independent assignments may run concurrently (up to four); overlapping scopes run serially. Each worker uses this session's provider, model and access policy. Include verification in the assignments. Never claim that workers have already started."#;
+/// How a plan is written: the JSON block, its schema and the rules each
+/// field follows. Shared by Orchestrator mode and a Mono's own context, so
+/// a plan reads the same wherever it was written.
+macro_rules! plan_format {
+    () => {
+        r#"Return a short explanation followed by exactly one JSON block between <monocode_orchestration> and </monocode_orchestration>.
+Schema: {"title":"short title","summary":"approach","tasks":[{"id":"task-1","title":"assignment title","prompt":"complete self-contained instructions, validation and expected report","files":["src/path"],"depends_on":[],"workspace":"worktree","verification":["cargo test -p crate"],"repository":"optional repository directory","base_ref":"optional branch or commit"}]}
+"workspace" is exactly "worktree" (an isolated branch and worktree; the default for work that changes files) or "checkout" (read-only investigation of the user's checkout), or omitted. "verification" is an array of executable command lines, not descriptions: checks execute directly in the worktree without a shell, so no pipes, redirection, shell variables, inline interpreter code or prose suffixes. For example, use "grep -qx ALPHA_QA_OK alpha.txt", never "cat alpha.txt prints exactly ALPHA_QA_OK". Put expected outcomes and manual checks in the task prompt. Workers must repeat each exact verification command in their reported validation strings.
+"repository" is the repository directory (absolute or relative to the task workspace), and "base_ref" is a Git branch or commit. For work spanning multiple repositories, specify repository on every assignment. Each worktree assignment receives its own isolated branch; never instruct parallel workers to check out a shared branch. Mentioning a repository in the prompt does not select it. Never append branch names, paths, or explanations to workspace. Put branch/base requirements in the task prompt; these are requirements for review, not a guarantee that the coordinator uses a named branch.
+Use 1 to 12 assignments, unique ASCII IDs, exact project-relative file or directory scopes ('.' for the whole project), and dependency IDs. Independent assignments may run concurrently up to the configured worker limit; overlapping scopes in the same repository run serially. Worker provider, account, access and billing follow the task policy and allowed-account list; do not promise a fixed concurrency or fallback provider. Include verification in the assignments. Never claim that workers have already started."#
+    };
+}
+pub const PLAN_FORMAT: &str = plan_format!();
+/// Orchestrator mode's prefix: a plan for this request, nothing else.
+pub const INSTRUCTIONS: &str = concat!(
+    "Prepare an orchestration plan for the user's request. Inspect the project with read-only tools. Do not edit or launch workers yet. The user will review and start the plan in MonoCode.\n",
+    plan_format!()
+);
 const OPEN: &str = "<monocode_orchestration>";
 const CLOSE: &str = "</monocode_orchestration>";
 /// The reply as the transcript shows it, or None when nothing is hidden. The
@@ -188,8 +208,19 @@ pub fn parse(text: &str) -> Result<Plan, String> {
     if body.len() > 256 * 1024 {
         return Err("Task plan is too large.".into());
     }
-    let plan: Plan =
+    let value: serde_json::Value =
         serde_json::from_str(body.trim()).map_err(|e| format!("Invalid task plan: {e}"))?;
+    if let Some(tasks) = value.get("tasks").and_then(|v| v.as_array()) {
+        for (index, task) in tasks.iter().enumerate() {
+            if let Some(workspace) = task.get("workspace").filter(|v| !v.is_null()) {
+                if !matches!(workspace.as_str(), Some("checkout" | "worktree")) {
+                    return Err(format!("Assignment {} has an invalid workspace. Use exactly \"checkout\" or \"worktree\". Keep branch names and base-branch requirements in the task prompt. The proposal was not started.", index + 1));
+                }
+            }
+        }
+    }
+    let plan: Plan =
+        serde_json::from_value(value).map_err(|e| format!("Invalid task plan: {e}"))?;
     validate(&plan)?;
     Ok(plan)
 }
@@ -217,6 +248,19 @@ pub fn validate(plan: &Plan) -> Result<(), String> {
             return Err(
                 "Task IDs must be unique ignoring case and contain only letters, numbers, '-' and '_'.".into(),
             );
+        }
+        for (name, value) in [
+            ("repository", &task.repository),
+            ("base_ref", &task.base_ref),
+        ] {
+            if value.as_ref().is_some_and(|v| {
+                v.trim().is_empty()
+                    || v.len() > 4096
+                    || v.chars().any(char::is_control)
+                    || v.starts_with('-')
+            }) {
+                return Err(format!("Assignment {} has an invalid {name}.", task.id));
+            }
         }
         if task.title.trim().is_empty()
             || task.title.len() > 160
@@ -293,6 +337,27 @@ pub fn worker_prompt(task: &Task, previous: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn workspace_errors_explain_repair_without_accepting_ambiguous_branches() {
+        for workspace in [
+            serde_json::json!("worktree feat/welder-spacing (base pipeline)"),
+            serde_json::json!({"mode":"worktree"}),
+        ] {
+            let value = serde_json::json!({"title":"Work","summary":"","tasks":[{"id":"a","title":"A","prompt":"p","files":["src"],"workspace":workspace}]});
+            let error = parse(&format!("{OPEN}{value}{CLOSE}")).unwrap_err();
+            assert!(error.contains("Assignment 1"));
+            assert!(error.contains("task prompt"));
+            assert!(error.contains("not started"));
+        }
+        for workspace in [
+            serde_json::json!("worktree"),
+            serde_json::json!("checkout"),
+            serde_json::Value::Null,
+        ] {
+            let value = serde_json::json!({"title":"Work","summary":"","tasks":[{"id":"a","title":"A","prompt":"p","files":["src"],"workspace":workspace}]});
+            assert!(parse(&format!("{OPEN}{value}{CLOSE}")).is_ok());
+        }
+    }
     #[test]
     fn progress_labels_are_defined_once_and_keep_their_text() {
         let summary = |live| Summary {

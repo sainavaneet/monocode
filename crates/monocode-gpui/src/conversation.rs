@@ -13,6 +13,7 @@ mod history;
 mod mobile;
 mod mono;
 mod mono_accounts;
+pub(crate) mod mono_activity;
 mod notifications;
 pub(crate) mod orchestration_card;
 mod remote;
@@ -174,6 +175,7 @@ pub(crate) struct Conversation {
     pub(crate) task_monitor: task_monitor::TaskMonitorState,
     /// Plan assignments whose full instructions are unfolded in the card.
     orchestration_open: std::collections::HashSet<String>,
+    orchestration_details_open: bool,
     status: String,
     loaded: bool,
     history_unloaded: bool,
@@ -617,6 +619,7 @@ impl Conversation {
             task_controls: Vec::new(),
             task_monitor: Default::default(),
             orchestration_open: Default::default(),
+            orchestration_details_open: false,
             status: "Loading conversation…".into(),
             loaded: false,
             history_unloaded: false,
@@ -832,6 +835,7 @@ impl Conversation {
                         });
                         this.status = "Ready".into();
                         this.loaded = true;
+                        this.restore_saved_proposal();
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);
                         }
@@ -1001,7 +1005,6 @@ impl Conversation {
             return;
         }
         self.planning_orchestration = self.settings.orchestrator;
-        self.orchestration_plan = None;
         self.orchestration_error = None;
         self.launch_prompt(prompt, cx);
         if self.busy && mode.is_some() {
@@ -2613,8 +2616,23 @@ impl Conversation {
             return;
         }
         if self.busy {
-            self.stop(cx);
+            self.stop_by_user(cx);
         }
+    }
+    /// The user's own Stop (the button, Escape, Mono's Stop reply): besides
+    /// cancelling the turn it holds Mono's queued requests for the user to
+    /// retry or remove. An internal stop (a provider switch, a steer, a
+    /// background hand-off) never does that: its queue carries on once the
+    /// provider has settled.
+    fn stop_by_user(&mut self, cx: &mut Context<Self>) {
+        if !self.busy || self.stopping {
+            return;
+        }
+        // Mono's outbox is separate from the ordinary follow-up queue. Stop
+        // must hold both, otherwise the manager dispatches the next request
+        // as soon as this provider finishes cancelling.
+        self.pause_mono_pending(cx);
+        self.stop(cx);
     }
     fn stop(&mut self, cx: &mut Context<Self>) {
         if !self.busy || self.stopping {
@@ -3173,7 +3191,7 @@ impl Conversation {
                 return;
             }
             if busy {
-                this.stop(cx);
+                this.stop_by_user(cx);
             } else {
                 this.send(cx);
             }

@@ -173,9 +173,7 @@ impl Monos {
                     .monos
                     .iter()
                     .flat_map(|m| m.launches.iter())
-                    .filter(|l| {
-                        (l.origin_turn >> 32) as i64 == session && !l.completed && !l.dismissed
-                    })
+                    .filter(|l| l.origin_session == session && !l.completed && !l.dismissed)
                 {
                     if let Some(view) = owner
                         .read(cx)
@@ -1254,7 +1252,7 @@ impl Monos {
                 .monos
                 .iter_mut()
                 .flat_map(|m| m.launches.iter_mut())
-                .filter(|l| (l.origin_turn >> 32) as i64 == id && !l.completed && !l.dismissed)
+                .filter(|l| l.origin_session == id && !l.completed && !l.dismissed)
                 .map(|l| {
                     l.dismissed = true;
                     l.session_id
@@ -1405,10 +1403,7 @@ impl Monos {
             .iter()
             .flat_map(|m| m.launches.iter())
             .any(|l| {
-                (l.origin_turn >> 32) as i64 == session
-                    && l.notify_on_complete
-                    && !l.completed
-                    && !l.dismissed
+                l.origin_session == session && l.notify_on_complete && !l.completed && !l.dismissed
             })
         {
             self.changed(cx);

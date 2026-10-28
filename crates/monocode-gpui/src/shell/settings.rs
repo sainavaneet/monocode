@@ -339,6 +339,11 @@ impl Shell {
             .unwrap_or(Kind::Codex)
     }
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
+        monocode_core::api_keys::configure_gemini_catalog(
+            self.workspace
+                .preferences
+                .api_key_enabled(monocode_core::provider::Kind::Gemini),
+        );
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
         monocode_core::cli::initialize(&self.workspace.preferences.binary_paths);

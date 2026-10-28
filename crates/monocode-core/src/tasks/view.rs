@@ -15,6 +15,7 @@ use super::store::read_ms;
 use super::timeline::{self, safe, Names, Runner, TimelineEntry};
 use super::{AssignmentState, AttemptState, DecisionState, Task, TaskError, TaskStage, TaskStore};
 use crate::store::Store;
+use rusqlite::OptionalExtension;
 
 /// What Mono is doing for a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +42,7 @@ impl MonoActivity {
 }
 
 /// The sidebar badge of a Mono's tasks. When several apply, the first of
-/// Needs your decision, Recovering, Paused, Reviewing, N working shows.
+/// Decision needed, Recovering, Paused, Reviewing, N working shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Badge {
     NeedsDecision,
@@ -54,7 +55,7 @@ pub enum Badge {
 impl Badge {
     pub fn label(self) -> String {
         match self {
-            Self::NeedsDecision => "Needs your decision".into(),
+            Self::NeedsDecision => "Decision needed".into(),
             Self::Recovering => "Recovering".into(),
             Self::Paused => "Paused".into(),
             Self::Reviewing => "Reviewing".into(),
@@ -155,6 +156,10 @@ pub struct WorkerView {
     pub branch: Option<String>,
     /// Waiting on an answer (from Mono or the user).
     pub needs_input: bool,
+    /// Assignments this one waits for (a queued row says why it waits).
+    pub depends_on: Vec<String>,
+    /// When the current attempt was created, for the elapsed time.
+    pub since: Option<u64>,
 }
 
 impl WorkerView {
@@ -212,6 +217,46 @@ pub struct VerificationProgress {
     pub failed: usize,
 }
 
+/// What a completed task delivered, from its final report's evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportSummary {
+    pub implemented: bool,
+    pub committed: bool,
+    pub merged: bool,
+    pub pushed: bool,
+    pub deployed: bool,
+    /// Required criteria satisfied, of how many.
+    pub criteria_satisfied: usize,
+    pub criteria_total: usize,
+    /// Per assignment: its branch (or path) and how many commits it holds.
+    pub assignments: Vec<(String, usize)>,
+    pub generated_at: u64,
+}
+
+impl ReportSummary {
+    /// "implemented, committed · not merged, not pushed, not deployed".
+    pub fn evidence_line(&self) -> String {
+        let flags = [
+            ("implemented", self.implemented),
+            ("committed", self.committed),
+            ("merged", self.merged),
+            ("pushed", self.pushed),
+            ("deployed", self.deployed),
+        ];
+        let held: Vec<&str> = flags.iter().filter(|(_, h)| *h).map(|(n, _)| *n).collect();
+        let missing: Vec<String> = flags
+            .iter()
+            .filter(|(_, h)| !*h)
+            .map(|(n, _)| format!("not {n}"))
+            .collect();
+        match (held.is_empty(), missing.is_empty()) {
+            (true, _) => missing.join(", "),
+            (false, true) => held.join(", "),
+            (false, false) => format!("{} · {}", held.join(", "), missing.join(", ")),
+        }
+    }
+}
+
 /// One task as the monitoring card shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskMonitor {
@@ -238,6 +283,8 @@ pub struct TaskMonitor {
     /// When a coordinator last synchronized the task (renewed its lease).
     pub last_status_sync: Option<u64>,
     pub last_mono_review: Option<u64>,
+    /// The final report of a completed task; None while it is unfinished.
+    pub report: Option<ReportSummary>,
 }
 
 impl TaskMonitor {
@@ -262,7 +309,9 @@ impl TaskMonitor {
     /// This task's own badge (see [`Badge`] for the precedence).
     pub fn badge(&self) -> Option<Badge> {
         let display = self.control.display;
-        if self.for_user() > 0 {
+        if display == Display::Completed {
+            None
+        } else if self.for_user() > 0 {
             Some(Badge::NeedsDecision)
         } else if self.recovering {
             Some(Badge::Recovering)
@@ -278,7 +327,10 @@ impl TaskMonitor {
 
 /// The monitoring view of every unfinished task `mono` leads, at `now`.
 pub fn monitor(store: &Store, mono: &str, now: u64) -> Result<Vec<TaskMonitor>, TaskError> {
-    let rows = lifecycle::controls(store, mono)?;
+    let mut rows = lifecycle::controls(store, mono)?;
+    // A task that just completed stays on the card with its report (until
+    // the user hides it or it ages out) instead of vanishing.
+    rows.extend(lifecycle::recent_completions(store, mono, now)?);
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -321,12 +373,51 @@ fn one(
             .filter(|lease| lease.expires_at > now)
             .map(|lease| lease.expires_at.saturating_sub(LEASE_TTL_MS)),
         last_mono_review: latest(tasks, &task.id, FROM_MONO)?,
+        report: report(tasks, &task.id)?,
         workers,
         decisions,
         recovery,
         recovering,
         control,
     })
+}
+
+/// The completed task's final report, summarized for the card.
+fn report(tasks: &TaskStore<'_>, task: &str) -> Result<Option<ReportSummary>, TaskError> {
+    let payload: Option<String> = tasks
+        .conn
+        .query_row(
+            "SELECT payload FROM native_task_events WHERE id=?1",
+            [format!("final_report:{task}")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let report: super::report::FinalReport = serde_json::from_str(&payload)?;
+    Ok(Some(ReportSummary {
+        implemented: report.implemented,
+        committed: report.committed,
+        merged: report.merged,
+        pushed: report.pushed,
+        deployed: report.deployed,
+        criteria_satisfied: report.criteria.iter().filter(|c| c.satisfied).count(),
+        criteria_total: report.criteria.len(),
+        assignments: report
+            .assignments
+            .iter()
+            .map(|a| {
+                let place = a
+                    .branch
+                    .clone()
+                    .or_else(|| a.path.clone())
+                    .unwrap_or_else(|| a.id.clone());
+                (safe(&place), a.commits.len())
+            })
+            .collect(),
+        generated_at: report.generated_at,
+    }))
 }
 
 /// The newest events the timeline can show (a bounded tail, oldest first).
@@ -441,6 +532,8 @@ fn workers(
             account_id: latest.and_then(|a| a.account_id.as_deref().map(safe)),
             workspace: workspace.map(|w| safe(&w.path)),
             branch: workspace.and_then(|w| w.branch.as_deref().map(safe)),
+            depends_on: assignment.depends_on.clone(),
+            since: current.map(|a| a.created_at),
         });
     }
     Ok((workers, names))
@@ -570,7 +663,9 @@ fn activity(
     pending: &[String],
 ) -> MonoActivity {
     let assessing = pending.iter().any(|k| k == "task.steer_assess");
-    if task.stage == TaskStage::Planning || assessing {
+    if display == Display::Completed {
+        MonoActivity::Idle
+    } else if task.stage == TaskStage::Planning || assessing {
         MonoActivity::Planning
     } else if decisions.iter().any(|d| d.escalated)
         || matches!(

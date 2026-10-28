@@ -252,7 +252,7 @@ impl Shell {
                     Ok(()) => {
                         if let Some(view) = this.sessions.get(&lead) {
                             view.update(cx, |v, cx| {
-                                v.orchestration_plan = None;
+                                v.clear_saved_proposal();
                                 cx.notify();
                             });
                         }
@@ -475,7 +475,7 @@ impl Shell {
                 self.orchestrations.remove(&lead);
                 if let Some(view) = self.sessions.get(&lead) {
                     view.update(cx, |v, cx| {
-                        v.orchestration_plan = None;
+                        v.clear_saved_proposal();
                         v.set_orchestration_progress(None, cx);
                         if !stopped {
                             v.send_coordinator_report(format!("The orchestration workers have finished. Summarize and verify the combined results, identify incomplete work and report the outcome to the user. Preserve their changes.\n\n{reports}"), cx);
@@ -586,10 +586,12 @@ mod tests {
                         title: "Lead".into(),
                         harness: "claude".into(),
                         model: None,
+                        origin_session: 0,
                         origin_turn: 0,
                         notify_on_complete: false,
                         completed: false,
                         dismissed: false,
+                        input_notified: false,
                     });
                 });
                 let part = |id: &str, file: &str, deps: &[&str]| Task {

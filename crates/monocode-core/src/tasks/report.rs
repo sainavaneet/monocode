@@ -289,6 +289,18 @@ pub(super) fn complete_with(
         payload: serde_json::to_value(&report)?,
     };
     append(&tx, &event, now)?;
+    // The owning Mono hears about the report in its task inbox, so it can
+    // tell the user what was delivered (and what was not) with evidence.
+    let inside = TaskStore { conn: &tx };
+    if inside.task(task_id)?.is_some_and(|t| t.mono_id.is_some()) {
+        inside.enqueue_delivery(
+            &format!("mono-final_report:{task_id}"),
+            &event.id,
+            super::review::MONO_REVIEW,
+            &format!("task:{task_id}"),
+            now,
+        )?;
+    }
     let task = Subject::Task(task_id);
     let completed = State::Stage(TaskStage::Completed);
     apply(&tx, task, completed, requester, tasks.revision(task)?, now)?;

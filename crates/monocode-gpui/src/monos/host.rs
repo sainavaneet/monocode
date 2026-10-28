@@ -1,5 +1,6 @@
 //! Capability-checked app actions used by Mono provider subprocesses.
 use super::*;
+use crate::shell::monos::MonoSession;
 use monocode_core::mono::{Document, Launch, bridge::Call, files, memory};
 use monocode_core::{app_access as app, session_groups::Groups, time::now_ms};
 use serde_json::{Value, json};
@@ -130,7 +131,8 @@ impl Monos {
                                     title: summary.title.clone(),
                                     harness: summary.provider.clone(),
                                     model: settings.model.clone(),
-                                    origin_turn: ((caller as u64) << 32) | origin,
+                                    origin_session: caller,
+                                    origin_turn: origin,
                                     notify_on_complete: flag(
                                         &call.input,
                                         "notifyOnComplete",
@@ -138,6 +140,7 @@ impl Monos {
                                     ),
                                     completed: false,
                                     dismissed: false,
+                                    input_notified: false,
                                 });
                             }
                             let _ = this.owner.update(cx, |owner, cx| {
@@ -335,6 +338,11 @@ impl Monos {
                             .map(|center| center.read(cx).selected(kind, &project))
                             .unwrap_or_default();
                     }
+                    // Child permissions follow the Mono's explicit worker policy,
+                    // not the lead chat's composer permission mode.
+                    settings.access =
+                        monocode_core::tasks::autonomy::live(Some(&mono.id), &project)
+                            .worker_access;
                     let placement = self
                         .owner
                         .update(cx, |owner, cx| {
@@ -366,6 +374,7 @@ impl Monos {
                             monocode_core::catalog::cached_models_for(kind, &settings.account)
                                 .unwrap_or_default()
                         };
+                        let worker_access = settings.access;
                         let mut settings = app::launch_settings(
                             &input,
                             &source_provider,
@@ -373,6 +382,10 @@ impl Monos {
                             kind,
                             &models,
                         )?;
+                        settings.access = monocode_core::tasks::autonomy::restricted_worker_access(
+                            settings.access,
+                            worker_access,
+                        );
                         settings.revision = 0;
                         let mut summary = locked(&store)?.create(&provider, &project)?;
                         app::launch_checkout(&input, &project, summary.id, &mut settings)?;
@@ -383,6 +396,11 @@ impl Monos {
                         let db = locked(&store)?;
                         db.title(summary.id, &summary.title)?;
                         db.configure_agent(summary.id, &provider, &settings)?;
+                        let prompt = monocode_core::mono::delegation::worker_prompt(
+                            &prompt,
+                            &project,
+                            input.get("brief"),
+                        )?;
                         db.prepare_app_prompt(summary.id, &request, &prompt)?;
                         summary.has_messages = true;
                         Ok((
@@ -478,8 +496,10 @@ impl Monos {
                                     {
                                         launch.completed = false;
                                         launch.dismissed = false;
+                                        launch.input_notified = false;
                                         launch.notify_on_complete = true;
-                                        launch.origin_turn = ((call.session as u64) << 32) | origin;
+                                        launch.origin_session = call.session;
+                                        launch.origin_turn = origin;
                                     } else {
                                         let summary = &view.read(cx).summary;
                                         m.launches.push(Launch {
@@ -488,10 +508,12 @@ impl Monos {
                                             title: summary.title.clone(),
                                             harness: summary.provider.clone(),
                                             model: view.read(cx).mono_model(),
-                                            origin_turn: ((call.session as u64) << 32) | origin,
+                                            origin_session: call.session,
+                                            origin_turn: origin,
                                             notify_on_complete: true,
                                             completed: false,
                                             dismissed: false,
+                                            input_notified: false,
                                         });
                                     }
                                 }
@@ -796,22 +818,111 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             })
             .detach();
     }
-    pub(super) fn check_completions(&mut self, cx: &mut Context<Self>) {
-        let views = self
+    /// Each worker's outcome for the completion report, from its live view
+    /// when the window has it, else from its summary.
+    fn launch_outcome(&self, session: i64, views: &[MonoSession], cx: &App) -> &'static str {
+        let entity = self
             .owner
             .upgrade()
-            .map(|o| o.read(cx).mono_session_views(cx))
-            .unwrap_or_default();
+            .and_then(|owner| owner.read(cx).mono_session_entity(session));
+        if let Some(view) = entity {
+            return match super::cards::launched_state(view.read(cx), cx) {
+                "input" => "waiting for the user",
+                "working" => "still working",
+                "draft" => "never sent",
+                "stopped" => "stopped before finishing",
+                "failed" => "failed",
+                _ => "finished",
+            };
+        }
+        match views.iter().find(|v| v.id == session) {
+            Some(v) if v.needs_input => "waiting for the user",
+            Some(v) if v.busy => "still working",
+            Some(v) if !v.has_messages => "never sent",
+            Some(_) => "finished (outcome unknown: its window is closed)",
+            None => "session not found",
+        }
+    }
+
+    /// Mono is told once when a worker it launched waits on the user (an
+    /// approval or a question in the worker's chat), instead of waiting in
+    /// silence for a completion that cannot come until the user acts.
+    fn notify_waiting_workers(&mut self, views: &[MonoSession], cx: &mut Context<Self>) {
+        let mut notices: Vec<(String, i64, String)> = Vec::new();
+        for mono in &mut self.roster.monos {
+            for launch in &mut mono.launches {
+                if !launch.notify_on_complete
+                    || launch.completed
+                    || launch.dismissed
+                    || launch.input_notified
+                {
+                    continue;
+                }
+                let waiting = views
+                    .iter()
+                    .any(|v| v.id == launch.session_id && v.needs_input);
+                if waiting {
+                    launch.input_notified = true;
+                    notices.push((mono.id.clone(), launch.origin_session, format!(
+                        "[Delegated work needs the user]\nSession {}: {} is waiting for the user's approval or answer in its own chat; it is shown to them. Tell the user briefly if useful and end your turn. The completion report follows once it stops.",
+                        launch.session_id, launch.title
+                    )));
+                }
+            }
+        }
+        if notices.is_empty() {
+            return;
+        }
+        self.save(cx);
+        for (mono, source, message) in notices {
+            if let Some(run) = self.running.get_mut(&source) {
+                run.mailbox.push(message);
+                self.habit_changed(source, cx);
+            } else {
+                self.enqueue(&mono, message, Vec::new(), true, cx);
+                self.ensure_chat(&mono, cx);
+            }
+        }
+    }
+
+    pub(super) fn check_completions(&mut self, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let views = owner.read(cx).mono_session_views(cx);
+        self.notify_waiting_workers(&views, cx);
+        // A child the window has not loaded yet is still running for all we
+        // know; only one the store no longer has counts as over. Ask the
+        // window to load the unknown ones, so a restart settles on its own.
+        let unknown: Vec<i64> = self
+            .roster
+            .monos
+            .iter()
+            .flat_map(|m| m.launches.iter())
+            .filter(|l| l.notify_on_complete && !l.completed && !l.dismissed)
+            .map(|l| l.session_id)
+            .filter(|id| !views.iter().any(|v| v.id == *id))
+            .filter(|id| !owner.read(cx).mono_session_missing(*id))
+            .collect();
+        if !unknown.is_empty() {
+            owner.update(cx, |shell, cx| shell.mono_track_sessions(unknown, cx));
+        }
+        let settled = |session: i64| {
+            views.iter().find(|v| v.id == session).map_or_else(
+                || owner.read(cx).mono_session_missing(session),
+                |v| !v.busy && v.has_messages,
+            )
+        };
         let mut ready = Vec::new();
         for mono in &self.roster.monos {
-            let groups: HashSet<_> = mono
+            let groups: HashSet<(i64, u64)> = mono
                 .launches
                 .iter()
                 .filter(|l| l.notify_on_complete && !l.completed && !l.dismissed)
-                .map(|l| l.origin_turn)
+                .map(Launch::group)
                 .collect();
             for group in groups {
-                let source = (group >> 32) as i64;
+                let source = group.0;
                 if self
                     .chats
                     .values()
@@ -824,19 +935,11 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                     .launches
                     .iter()
                     .filter(|l| {
-                        l.origin_turn == group
-                            && l.notify_on_complete
-                            && !l.completed
-                            && !l.dismissed
+                        l.group() == group && l.notify_on_complete && !l.completed && !l.dismissed
                     })
                     .collect();
                 if !children.is_empty()
-                    && children.iter().all(|l| {
-                        views
-                            .iter()
-                            .find(|v| v.id == l.session_id)
-                            .is_none_or(|v| !v.busy && v.has_messages)
-                    })
+                    && children.iter().all(|l| settled(l.session_id))
                     && !self.completion_work.contains(&(mono.id.clone(), group))
                 {
                     ready.push((
@@ -844,7 +947,13 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                         group,
                         children
                             .iter()
-                            .map(|l| (l.session_id, l.title.clone()))
+                            .map(|l| {
+                                (
+                                    l.session_id,
+                                    l.title.clone(),
+                                    self.launch_outcome(l.session_id, &views, cx),
+                                )
+                            })
                             .collect::<Vec<_>>(),
                     ));
                 }
@@ -856,29 +965,47 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             let work = cx.background_executor().spawn(async move {
                 children
                     .into_iter()
-                    .map(|(id, title)| {
+                    .map(|(id, title, outcome)| {
                         let rows = locked(&store)
                             .and_then(|db| db.load(id))
                             .map(|t| monocode_core::response::prose(&t.rows))
                             .unwrap_or_else(|_| "Session was removed".into());
+                        // The end of the transcript holds the worker's own
+                        // report, so a long one is cut from the middle.
                         format!(
-                            "Session {id}: {title}\n{}",
-                            monocode_core::response::limit(&rows, 12000)
+                            "Session {id}: {title}\nOutcome: {outcome}\n{}",
+                            monocode_core::response::limit_keeping_end(&rows, 12000)
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n")
             });
-            cx.spawn(async move |this,cx| {
-                let report=work.await;
-                let _=this.update(cx,|this,cx|{
-                    this.completion_work.remove(&(id.clone(),group));
-                    if let Some(mono)=this.roster.get_mut(&id){for launch in &mut mono.launches{if launch.origin_turn==group{launch.completed=true;}}}
-                    let message=format!("[Delegated work completed]\nAll sessions in this group have stopped. Inspect their results and give an integrated update.\n\n{report}");
-                    let source=(group>>32) as i64;
-                    if let Some(run)=this.running.get_mut(&source){run.mailbox.push(message);this.save(cx);this.habit_changed(source,cx);}else{this.enqueue(&id,message,Vec::new(),true,cx);this.ensure_chat(&id,cx);}
+            cx.spawn(async move |this, cx| {
+                let report = work.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.completion_work.remove(&(id.clone(), group));
+                    if let Some(mono) = this.roster.get_mut(&id) {
+                        for launch in &mut mono.launches {
+                            if launch.group() == group {
+                                launch.completed = true;
+                            }
+                        }
+                    }
+                    let message = format!(
+                        "[Delegated work completed]\nEvery session in this group has stopped. Each outcome below is the app's, not the worker's claim: review the results (sessions.read, the worktree's changes) and give the user an integrated update that says what was verified and what was not.\n\n{report}"
+                    );
+                    let source = group.0;
+                    if let Some(run) = this.running.get_mut(&source) {
+                        run.mailbox.push(message);
+                        this.save(cx);
+                        this.habit_changed(source, cx);
+                    } else {
+                        this.enqueue(&id, message, Vec::new(), true, cx);
+                        this.ensure_chat(&id, cx);
+                    }
                 });
-            }).detach();
+            })
+            .detach();
         }
     }
 }

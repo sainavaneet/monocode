@@ -362,13 +362,15 @@ pub(crate) fn analyze(
     // A headless worker must finish parsing the whole document. A fixed two
     // seconds interrupts large TSX files (and their diff baseline) before the
     // complete tree can be published. Keep small requests short and all work
-    // bounded, while allowing about one second per 64 KiB of actual input.
+    // bounded, while allowing about one second per 32 KiB of actual input.
+    // TSX plus a diff baseline can exceed the old budget even without other
+    // work running. This remains a background operation capped at 30 seconds.
     let bytes = source.len().saturating_add(
         original
             .filter(|original| *original != source)
             .map_or(0, str::len),
     );
-    let budget = Duration::from_secs(bytes.div_ceil(64 * 1024).clamp(2, 30) as u64);
+    let budget = Duration::from_secs(bytes.div_ceil(32 * 1024).clamp(2, 30) as u64);
     let deadline = Instant::now() + budget;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
     let context = Context::full(&runtime).map_err(|e| e.to_string())?;

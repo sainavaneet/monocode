@@ -48,7 +48,8 @@ pub(crate) fn avatar(name: &str, color: u32, status: &str, side: f32, still: boo
         move |bounds, _, window, cx| {
             // "needs-you" holds still, so it must not keep the clock running.
             let working = status == "working";
-            let moves = working || (!still && status != "needs-you");
+            let waiting = status == "waiting";
+            let moves = !still && (working || waiting || status == "idle");
             // Pixel art reads fine at a low frame rate; a working hop is faster.
             let rate = if working {
                 crate::pulse::Rate::Half
@@ -63,7 +64,9 @@ pub(crate) fn avatar(name: &str, color: u32, status: &str, side: f32, still: boo
             let unit = bounds.size.width / 16.;
             let hop = if animate {
                 if status == "working" {
-                    -(t * 9.).sin().abs() * 0.9
+                    -(t * 6.).sin().abs() * 0.55
+                } else if waiting {
+                    (t * 1.8).sin() * 0.16
                 } else if status == "needs-you" {
                     0.
                 } else {
@@ -184,8 +187,8 @@ pub(crate) fn avatar(name: &str, color: u32, status: &str, side: f32, still: boo
                 }
             }
             if status == "needs-you" {
-                draw(12.5, -2.5, 3., 3., rgb(0xffd24a).into(), window);
-                draw(13.25, 0.5, 1.5, 1., rgb(0x8c8680).into(), window);
+                draw(12.5, 0., 2., 2., rgb(0xffd24a).into(), window);
+                draw(13., 2.5, 1., 0.75, rgb(0x8c8680).into(), window);
             }
         },
     )

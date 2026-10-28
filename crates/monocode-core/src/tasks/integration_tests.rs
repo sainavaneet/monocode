@@ -501,7 +501,11 @@ fn merging_without_merge_authority_raises_a_decision_instead() {
     assert!(events(&run.store, INTEGRATION).is_empty());
     let tasks = run.store.tasks().unwrap();
     let decision = tasks.decision("integration:t:1").unwrap().unwrap();
-    assert!(decision.question.contains("merge"), "{decision:?}");
+    assert!(
+        decision.question.starts_with("Merge accepted work"),
+        "{decision:?}"
+    );
+    assert!(!decision.question.contains("mono/"), "{decision:?}");
     assert_eq!(run.task().stage, TaskStage::Integrating);
 
     // The user allows merging and applies it to the task; Mono answers.

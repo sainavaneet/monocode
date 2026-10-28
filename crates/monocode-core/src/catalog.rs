@@ -262,6 +262,8 @@ pub fn models_for(kind: Kind, account: &crate::accounts::Profile) -> Result<Vec<
     };
     let mut models: Vec<_> = if kind == Kind::Fx {
         fx_models(&value)
+    } else if kind == Kind::Gemini {
+        gemini_models(&value)
     } else if kind == Kind::Devin {
         provider::devin::catalog_models(&value)
     } else if kind.is_acp() {
@@ -390,6 +392,29 @@ fn leaves<'a>(values: &'a Value, out: &mut Vec<&'a Value>) {
         }
     }
 }
+// User-requested native model ID, retained even when CLI presets omit it.
+fn gemini_models(value: &Value) -> Vec<Model> {
+    let mut models = acp_models(value);
+    if !models.iter().any(|m| m.id == "gemini-4-argon") {
+        models.push(model("gemini-4-argon", "Gemini 4 Argon (gemini-4-argon)"));
+    }
+    models
+}
+
+#[cfg(test)]
+#[test]
+fn gemini_catalog_includes_argon_without_duplicate_or_default_change() {
+    let value = json!({"models":{"currentModelId":"auto","availableModels":[{"modelId":"auto","name":"Auto"}]}});
+    let models = gemini_models(&value);
+    assert_eq!(
+        models.iter().filter(|m| m.id == "gemini-4-argon").count(),
+        1
+    );
+    assert!(models.iter().find(|m| m.id == "auto").unwrap().default);
+    let value = json!({"models":{"availableModels":[{"modelId":"gemini-4-argon","name":"Argon from CLI"}]}});
+    assert_eq!(gemini_models(&value).len(), 1);
+}
+
 fn acp_models(value: &Value) -> Vec<Model> {
     let configs: Vec<_> = value["configOptions"]
         .as_array()

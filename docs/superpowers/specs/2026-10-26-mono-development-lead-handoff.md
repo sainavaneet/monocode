@@ -481,3 +481,16 @@ From the controller ledger, accepted for later:
   scheduler.
 - Worktree retention and clean-up, spending controls, and deployment evidence
   are not built (`deployed` is never inferred).
+
+### Update 2026-10-28
+
+The final report now reaches the owning Mono's inbox and stays on the
+monitoring card for a day; the lead instructions are one playbook
+(`mono::delegation::policy`) with the plan format split from Orchestrator
+mode's preamble; multi-project Monos chat and start plans again; quick
+workers report with the app's outcome and the end of their transcript, and
+Mono is told once when one waits on the user; worker rows show live
+activity, elapsed time and dependencies; the soul editor no longer dead-ends
+on a conflict; worktree checkouts run before the locked tick
+(`Coordinator::launch_candidates` + `workspaces::warm_up`). Details, proofs
+and what is still open: `docs/superpowers/plans/2026-10-28-super-agent-orchestration.md`.

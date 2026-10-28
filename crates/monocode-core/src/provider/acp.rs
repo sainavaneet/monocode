@@ -51,6 +51,9 @@ pub(super) struct State {
 pub(super) fn configure(command: &mut Command, request: &Request) -> Result<(), String> {
     let settings = &request.settings;
     match request.kind {
+        Kind::Gemini => {
+            command.arg("--acp");
+        }
         Kind::Antigravity => {
             if cfg!(target_os = "linux") {
                 command.arg("--uid=");
@@ -187,13 +190,16 @@ impl Protocol {
                 (Kind::Devin, Stage::ThoughtProbe) => Some(5),
                 (Kind::Cursor | Kind::Grok | Kind::Antigravity, _) => Some(12),
                 (Kind::Hermes, _) => Some(20),
+                (Kind::Gemini, _) => Some(45),
                 (Kind::Devin, _) => Some(30),
                 _ => None,
             }
         } else {
             match (self.request.kind, stage) {
                 (Kind::Cursor, _) => None,
-                (Kind::Grok | Kind::Fx | Kind::Antigravity, Stage::Initialize) => Some(12),
+                (Kind::Grok | Kind::Fx | Kind::Antigravity | Kind::Gemini, Stage::Initialize) => {
+                    Some(12)
+                }
                 (Kind::Hermes | Kind::Devin, Stage::Initialize) => Some(20),
                 (Kind::Grok, Stage::Authenticate) => Some(15),
                 (Kind::Devin, Stage::Authenticate) => {
@@ -205,7 +211,9 @@ impl Protocol {
                 }
                 (Kind::Devin, Stage::New) if self.probe => Some(30),
                 (_, Stage::New | Stage::Load | Stage::Resume) => Some(45),
-                (Kind::Grok | Kind::Fx | Kind::Antigravity, Stage::Configure) => Some(15),
+                (Kind::Grok | Kind::Fx | Kind::Antigravity | Kind::Gemini, Stage::Configure) => {
+                    Some(15)
+                }
                 (Kind::Hermes | Kind::Devin, Stage::Configure) => Some(20),
                 (_, Stage::Prompt) => Some(30 * 60),
                 (Kind::Devin, Stage::ThoughtProbe) => Some(5),
@@ -319,6 +327,17 @@ impl Protocol {
         let settings = &self.request.settings;
         let planning = settings.plan || settings.access == AccessMode::ReadOnly;
         let mode = match kind {
+            Kind::Gemini => {
+                if planning {
+                    "plan"
+                } else {
+                    match settings.access {
+                        AccessMode::FullAccess => "yolo",
+                        AccessMode::AutoAcceptEdits => "autoEdit",
+                        _ => "default",
+                    }
+                }
+            }
             Kind::Antigravity => {
                 if planning {
                     "default"
@@ -376,7 +395,7 @@ impl Protocol {
             && (modes.is_some_and(|modes| modes.iter().any(|m| m["id"] == mode))
                 || matches!(
                     kind,
-                    Kind::Antigravity | Kind::Hermes | Kind::Devin | Kind::Fx
+                    Kind::Antigravity | Kind::Hermes | Kind::Devin | Kind::Fx | Kind::Gemini
                 ))
         {
             self.acp.mode = Some(mode);
@@ -397,7 +416,8 @@ impl Protocol {
         if let Some(model) = selected_model
             .as_ref()
             .filter(|model| {
-                !matches!(kind, Kind::Hermes | Kind::Devin) || model.as_str() != "default"
+                !matches!(kind, Kind::Hermes | Kind::Devin | Kind::Gemini)
+                    || model.as_str() != "default"
             })
             .filter(|model| {
                 !matches!(kind, Kind::Hermes | Kind::Grok)
@@ -540,6 +560,13 @@ impl Protocol {
             self.done = true;
             return Ok(());
         }
+        if kind == Kind::Gemini
+            && error["data"]["details"].as_str().is_some_and(|detail| {
+                detail.contains("Cannot enable privileged approval modes in an untrusted folder")
+            })
+        {
+            return Err("Gemini has not trusted this project in the selected profile. Choose Supervised access, or trust the project using Gemini CLI before requesting Full access.".into());
+        }
         match self.acp.stage {
             Stage::DeleteProbe => {
                 self.done = true;
@@ -567,6 +594,12 @@ impl Protocol {
                     Kind::Cursor | Kind::Grok | Kind::Fx | Kind::Hermes => true,
                     Kind::Antigravity => !timed_out,
                     Kind::Devin => !timed_out && devin_missing,
+                    Kind::Gemini => {
+                        !timed_out
+                            && error["data"]["details"].as_str().is_some_and(|detail| {
+                                detail.starts_with("Invalid session identifier ")
+                            })
+                    }
                     _ => false,
                 };
                 if replace {
@@ -1406,6 +1439,51 @@ pub(super) fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gemini_recreates_a_session_that_failed_before_it_was_saved() {
+        let mut p = protocol(Kind::Gemini);
+        p.acp.stage = Stage::Load;
+        let mut out = Vec::new();
+        p.acp_failure(&json!({"message":"Internal error","data":{"details":"Invalid session identifier \"missing\"."}}), false, &mut out).unwrap();
+        assert_eq!(last(&mut out)["method"], "session/new");
+        p.acp.stage = Stage::Load;
+        assert!(p
+            .acp_failure(
+                &json!({"message":"Internal error","data":{"details":"Connection failed"}}),
+                false,
+                &mut out
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn gemini_uses_native_acp_models_and_permission_modes() {
+        let mut p = protocol(Kind::Gemini);
+        let mut command = Command::new("gemini");
+        configure(&mut command, &p.request).unwrap();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), vec!["--acp"]);
+        for (access, planning, mode) in [
+            (AccessMode::FullAccess, false, "yolo"),
+            (AccessMode::AutoAcceptEdits, false, "autoEdit"),
+            (AccessMode::Supervised, false, "default"),
+            (AccessMode::FullAccess, true, "plan"),
+            (AccessMode::ReadOnly, false, "plan"),
+        ] {
+            p.request.settings.access = access;
+            p.request.settings.plan = planning;
+            p.acp_options(&json!({})).unwrap();
+            assert_eq!(p.acp.mode, Some(mode));
+        }
+        p.request.model = Some("gemini-from-live-catalog".into());
+        p.acp_options(&json!({})).unwrap();
+        assert!(p
+            .acp
+            .options
+            .iter()
+            .any(|(method, params)| *method == "session/set_model"
+                && params["modelId"] == "gemini-from-live-catalog"));
+    }
+
     fn protocol(kind: Kind) -> Protocol {
         Protocol::new(Request {
             kind,

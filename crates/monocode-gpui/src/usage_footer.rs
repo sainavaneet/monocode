@@ -43,7 +43,12 @@ fn index(kind: Kind) -> usize {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum UsageFooterEvent {
     /// The API button beside the chip: bill the saved key, or the login again.
-    ApiKey { kind: Kind, on: bool },
+    ApiKey {
+        kind: Kind,
+        on: bool,
+    },
+    Mcp,
+    ManageMcp,
 }
 impl gpui::EventEmitter<UsageFooterEvent> for UsageFooter {}
 const API_KEY_MISSING: &str = "Add an API key in Settings → Providers first.";
@@ -64,6 +69,11 @@ pub(crate) struct UsageFooter {
     details: FocusHandle,
     previous_focus: Option<FocusHandle>,
     open: bool,
+    mcp_open: bool,
+    mcp_note: String,
+    mcp_request: u64,
+    mcp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    mcp_servers: Vec<(String, String)>,
     /// UsageFooter's `footer` variant: the classic layout's bordered strip.
     classic: bool,
     show_remaining: bool,
@@ -73,7 +83,76 @@ pub(crate) struct UsageFooter {
     api_key_note: Option<String>,
     _clock: gpui::Task<()>,
 }
+impl Drop for UsageFooter {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.mcp_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 impl UsageFooter {
+    pub(crate) fn show_mcp(&mut self, cx: &mut Context<Self>) {
+        self.mcp_open = !self.mcp_open;
+        self.open = false;
+        if self.mcp_open && self.mcp_cancel.is_none() {
+            self.refresh_mcp(cx);
+        }
+        cx.notify();
+    }
+    fn refresh_mcp(&mut self, cx: &mut Context<Self>) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        if let Some(cancel) = self.mcp_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.mcp_request += 1;
+        let request = self.mcp_request;
+        let project = self.project.clone();
+        self.mcp_servers.clear();
+        if project.is_empty() {
+            self.mcp_note = "Select one valid project to initialize its MCP connections.".into();
+            cx.notify();
+            return;
+        }
+        self.mcp_note = format!("Checking project MCP servers · {project}");
+        let kind = self.kind;
+        let profile = self.key.profile.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.mcp_cancel = Some(cancel.clone());
+        let task = cx.background_executor().spawn(async move {
+            monocode_core::mcp::project_connections(
+                kind,
+                std::path::Path::new(&project),
+                &profile,
+                cancel,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.mcp_request != request { return; }
+                this.mcp_cancel = None;
+                match result {
+                    Ok(servers) => {
+                        this.mcp_note = if servers.is_empty() {
+                            format!("{} · No MCP registrations in this project's {} configuration.", this.project, kind.label())
+                        } else {
+                            format!("{} · Independent {} connection check at {}. This does not reconnect an existing chat; its provider owns that connection.", this.project, kind.label(), chrono::Local::now().format("%H:%M:%S"))
+                        };
+                        this.mcp_servers = servers;
+                    }
+                    Err(error) => this.mcp_note = format!("{} · {error}", this.project),
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+    pub(crate) fn project_without_session(&mut self, project: String, cx: &mut Context<Self>) {
+        self.context(self.kind, self.key.profile.clone(), None, project, None, cx);
+    }
     pub(crate) fn context(
         &mut self,
         kind: Kind,
@@ -83,7 +162,12 @@ impl UsageFooter {
         session: Option<i64>,
         cx: &mut Context<Self>,
     ) {
+        let changed_project =
+            self.project != project || self.kind != kind || self.key.profile != profile;
         let key = Key::new(kind, profile, model);
+        if self.project != project || self.session != session {
+            self.mcp_open = false;
+        }
         self.project = project;
         self.session = session;
         if self.key != key {
@@ -95,6 +179,28 @@ impl UsageFooter {
             self.confirm_reset = None;
             self.cache[index(kind)] = Default::default();
             self.refresh(false, cx);
+            cx.notify();
+        }
+        if changed_project {
+            // A changed project invalidates the shown result, but a check
+            // launches provider processes that connect to every MCP server:
+            // it runs only while the panel is open to show it.
+            if let Some(cancel) = self.mcp_cancel.take() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.mcp_request += 1;
+            self.mcp_servers.clear();
+            self.mcp_note = if self.project.is_empty() {
+                "Select one valid project to initialize its MCP connections.".into()
+            } else {
+                format!(
+                    "{} · Open this panel to check its MCP servers.",
+                    self.project
+                )
+            };
+            if self.mcp_open {
+                self.refresh_mcp(cx);
+            }
             cx.notify();
         }
     }
@@ -162,6 +268,11 @@ impl UsageFooter {
             details: cx.focus_handle(),
             previous_focus: None,
             open: false,
+            mcp_open: false,
+            mcp_note: String::new(),
+            mcp_request: 0,
+            mcp_cancel: None,
+            mcp_servers: Vec::new(),
             classic: false,
             show_remaining: false,
             api_keys: Default::default(),
@@ -1071,6 +1182,135 @@ impl Render for UsageFooter {
             .when(monocode_core::api_keys::supports(self.kind), |d| {
                 d.child(self.api_key_button(cx))
             })
+            .child(
+                div()
+                    .id("mcp-settings-button")
+                    .debug_selector(|| "mcp-settings-button".into())
+                    .role(Role::Button)
+                    .aria_label("MCP server status")
+                    .h(px(20.))
+                    .px(px(6.))
+                    .rounded_md()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .text_size(px(10.))
+                    .text_color(content(0.5))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(content(0.08)))
+                    .child(if self.mcp_cancel.is_some() {
+                        "MCP · Connecting"
+                    } else {
+                        "MCP"
+                    })
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(UsageFooterEvent::Mcp))),
+            )
+            .when(self.mcp_open, |d| {
+                let weak = cx.entity().downgrade();
+                d.child(
+                    popover("mcp-status-details", Anchor::Slot(self.anchor.clone()))
+                        .side(Side::Top)
+                        .gap(7.)
+                        .width(360.)
+                        .max_height(420.)
+                        .padding(12.)
+                        .on_dismiss(move |_, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.mcp_open = false;
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("MCP servers for this project"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(content(0.5))
+                                        .child(self.mcp_note.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .id("mcp-server-list")
+                                        .max_h(px(260.))
+                                        .overflow_y_scroll()
+                                        .children(self.mcp_servers.iter().map(|(name, status)| {
+                                            let color = if status == "connected" {
+                                                0x34d399
+                                            } else if status == "disabled" {
+                                                0x94a3b8
+                                            } else if status.contains("failed") {
+                                                0xf87171
+                                            } else {
+                                                0xfbbf24
+                                            };
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .py_1()
+                                                .child(
+                                                    div()
+                                                        .size(px(6.))
+                                                        .rounded_full()
+                                                        .bg(rgb(color)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .text_size(px(12.))
+                                                        .child(name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .max_w(px(180.))
+                                                        .text_size(px(11.))
+                                                        .text_color(content(0.6))
+                                                        .child(status.clone()),
+                                                )
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("check-project-mcp")
+                                        .role(Role::Button)
+                                        .aria_label("Check project MCP connections")
+                                        .text_size(px(12.))
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .child("Check connections ↻")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.refresh_mcp(cx)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("manage-mcp")
+                                        .role(Role::Button)
+                                        .aria_label("Manage MCP servers")
+                                        .text_size(px(12.))
+                                        .py_2()
+                                        .cursor_pointer()
+                                        .child("Manage MCP servers →")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.mcp_open = false;
+                                            cx.emit(UsageFooterEvent::ManageMcp);
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .when(self.open, |d| {
                 d.child(
                     popover("usage-details", Anchor::Slot(self.anchor.clone()))
@@ -1096,6 +1336,52 @@ impl Render for UsageFooter {
 mod tests {
     use super::*;
     use std::{cell::RefCell, rc::Rc};
+
+    /// A check launches provider processes that connect to every MCP
+    /// server, so it runs only while the panel is open; a project change
+    /// cancels the previous result either way.
+    #[gpui::test]
+    fn connection_checks_run_only_while_the_panel_is_open_and_a_project_change_cancels_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let first = std::env::temp_dir().join("mono-mcp-context-test-first");
+        let second = std::env::temp_dir().join("mono-mcp-context-test-second");
+        let view = cx.new(|cx| UsageFooter::new(Kind::Claude, cx));
+        view.update(cx, |footer, cx| {
+            footer.context(
+                Kind::Claude,
+                Default::default(),
+                None,
+                first.display().to_string(),
+                Some(1),
+                cx,
+            );
+            assert!(footer.mcp_cancel.is_none(), "closed panel: no check");
+            assert!(footer.mcp_note.contains("Open this panel"));
+            footer.show_mcp(cx);
+            let cancel = footer.mcp_cancel.clone().expect("opening the panel checks");
+            let request = footer.mcp_request;
+            footer.context(
+                Kind::Claude,
+                Default::default(),
+                None,
+                second.display().to_string(),
+                Some(2),
+                cx,
+            );
+            assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(footer.mcp_request > request);
+            assert!(footer.mcp_note.contains(&second.display().to_string()));
+            assert!(footer.mcp_servers.is_empty());
+            assert!(!footer.mcp_open);
+            assert!(
+                footer.mcp_cancel.is_none(),
+                "the panel closed: no new check"
+            );
+            footer.show_mcp(cx);
+            assert!(footer.mcp_cancel.is_some());
+        });
+    }
 
     #[gpui::test]
     fn api_key_toggle_needs_a_saved_key_and_reports_the_change(cx: &mut gpui::TestAppContext) {

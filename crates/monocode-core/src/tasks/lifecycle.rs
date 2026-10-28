@@ -443,6 +443,68 @@ pub fn controls(store: &Store, mono: &str) -> Result<Vec<ControlRow>, TaskError>
     Ok(rows)
 }
 
+/// How long a completed task stays on the monitoring card after it
+/// completed, unless the user hides it first.
+pub const RECENT_COMPLETION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The setting that records the user hid a completed task's report.
+pub fn dismissed_key(task: &str) -> String {
+    format!("native-task-report-dismissed:{task}")
+}
+
+/// The rows of `mono`'s tasks that completed within
+/// [`RECENT_COMPLETION_MS`] of `now` and were not hidden by the user, so the
+/// card can show their final report instead of vanishing at completion.
+pub fn recent_completions(
+    store: &Store,
+    mono: &str,
+    now: u64,
+) -> Result<Vec<ControlRow>, TaskError> {
+    if !super::coordinator::enabled(store) {
+        return Ok(Vec::new());
+    }
+    let Some(tasks) = store.existing_tasks()? else {
+        return Ok(Vec::new());
+    };
+    let since = now.saturating_sub(RECENT_COMPLETION_MS);
+    let mut statement = tasks.conn.prepare(
+        "SELECT id FROM native_tasks WHERE mono_id=?1 AND lifecycle='completed'
+           AND updated_at>=?2 ORDER BY rowid",
+    )?;
+    let ids = statement
+        .query_map(rusqlite::params![mono, super::store::ms(since)], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = Vec::new();
+    for id in ids {
+        if store
+            .setting(&dismissed_key(&id))
+            .map_err(TaskError::Storage)?
+            .is_some()
+        {
+            continue;
+        }
+        let task = task_or_missing(&tasks, &id)?;
+        rows.push(ControlRow {
+            task_id: task.id,
+            title: task.title,
+            revision: task.revision,
+            plan_revision: task.plan_revision,
+            display: Display::Completed,
+            reason: None,
+            resumable: false,
+            confirm_stopped: false,
+        });
+    }
+    Ok(rows)
+}
+
+/// Hides a completed task's report from the monitoring card.
+pub fn dismiss_report(store: &Store, task: &str) -> Result<(), String> {
+    store.save_setting(&dismissed_key(task), "1")
+}
+
 /// What a worker session shows once it no longer belongs to its task: the
 /// user or the task stopped it, it failed, or a newer attempt replaced it.
 /// Anything typed there afterwards never reports to the task.

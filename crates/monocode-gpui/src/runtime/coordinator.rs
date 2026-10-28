@@ -324,6 +324,28 @@ pub(crate) fn tick_pass(
         Ok(_) => {}
         Err(error) => eprintln!("Task coordinator takeover: {error}"),
     }
+    // The worktrees the tick is about to create are created first, with
+    // the store unlocked: a checkout can take minutes on a large repository
+    // and the UI thread reads the store meanwhile.
+    let now = monocode_core::time::now_ms();
+    let warm_ups = locked(store).map_err(|e| e.to_string()).and_then(|store| {
+        coordinator
+            .launch_candidates(&store, now)
+            .map_err(|e| e.to_string())
+    });
+    match warm_ups {
+        Ok(jobs) => {
+            for job in jobs {
+                if let Err(error) = tasks::workspaces::warm_up(&job, now) {
+                    eprintln!(
+                        "Task coordinator: worktree for {}/{} not prepared ahead: {error}",
+                        job.task.id, job.assignment.id
+                    );
+                }
+            }
+        }
+        Err(error) => eprintln!("Task coordinator: launch candidates: {error}"),
+    }
     let mut tick = locked(store).map_err(|e| e.to_string()).and_then(|store| {
         coordinator
             .tick(&store, launcher, monocode_core::time::now_ms())

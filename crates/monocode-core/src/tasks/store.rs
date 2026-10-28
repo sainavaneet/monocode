@@ -10,8 +10,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use rusqlite::{Transaction, TransactionBehavior};
 use serde_json::json;
 
-/// Only `CREATE ... IF NOT EXISTS` of new tables: the file is shared with the
-/// desktop app, whose schema is never altered.
+/// Only native-owned tables: the shared desktop schema is never altered.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS native_tasks(id TEXT PRIMARY KEY, mono_id TEXT, project TEXT NOT NULL,
   title TEXT NOT NULL, request TEXT NOT NULL, stage TEXT NOT NULL, lifecycle TEXT NOT NULL,
@@ -58,7 +57,45 @@ CREATE TABLE IF NOT EXISTS native_task_recoveries(attempt_id TEXT PRIMARY KEY,
   revision INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);";
 
 pub(crate) fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA)
+    conn.execute_batch(SCHEMA)?;
+    // Additive migration of native-owned tables only. Old plans keep defaults.
+    for column in ["repository", "base_ref"] {
+        if !has_assignment_column(conn, column)? {
+            if let Err(error) = conn.execute_batch(&format!(
+                "ALTER TABLE native_task_assignments ADD COLUMN {column} TEXT"
+            )) {
+                // Another app connection may have completed the same additive
+                // migration between inspection and ALTER. Preserve other errors.
+                if !has_assignment_column(conn, column)? {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn has_assignment_column(conn: &Connection, column: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('native_task_assignments') WHERE name=?1)",
+        [column],
+        |r| r.get(0),
+    )
+}
+fn assignment_columns(conn: &Connection) -> rusqlite::Result<String> {
+    // Read-only legacy stores are not migrated by inspection.
+    Ok(format!(
+        "{ASSIGNMENT},{},{}",
+        if has_assignment_column(conn, "repository")? {
+            "repository"
+        } else {
+            "NULL"
+        },
+        if has_assignment_column(conn, "base_ref")? {
+            "base_ref"
+        } else {
+            "NULL"
+        }
+    ))
 }
 
 pub(super) fn ms(value: u64) -> i64 {
@@ -244,6 +281,8 @@ fn assignment(row: &Row<'_>) -> rusqlite::Result<Assignment> {
         verification: json_column(row, 6)?,
         status: parsed(row, 7, AssignmentState::parse)?,
         revision: read_ms(row, 8)?,
+        repository: row.get(9)?,
+        base_ref: row.get(10)?,
     })
 }
 
@@ -457,7 +496,10 @@ impl TaskStore<'_> {
 
     pub fn assignments(&self, task_id: &str) -> Result<Vec<Assignment>, TaskError> {
         self.all(
-            &format!("SELECT {ASSIGNMENT} FROM native_task_assignments WHERE task_id=? ORDER BY position"),
+            &format!(
+                "SELECT {} FROM native_task_assignments WHERE task_id=? ORDER BY position",
+                assignment_columns(self.conn)?
+            ),
             &[task_id],
             assignment,
         )
@@ -465,7 +507,10 @@ impl TaskStore<'_> {
 
     pub fn assignment(&self, task_id: &str, id: &str) -> Result<Option<Assignment>, TaskError> {
         self.one(
-            &format!("SELECT {ASSIGNMENT} FROM native_task_assignments WHERE task_id=? AND id=?"),
+            &format!(
+                "SELECT {} FROM native_task_assignments WHERE task_id=? AND id=?",
+                assignment_columns(self.conn)?
+            ),
             &[task_id, id],
             assignment,
         )
@@ -493,7 +538,7 @@ impl TaskStore<'_> {
         .bump(
             self.conn,
             assignment.revision,
-            "title=?,prompt=?,files=?,depends_on=?,workspace=?,verification=?",
+            "title=?,prompt=?,files=?,depends_on=?,workspace=?,verification=?,repository=?,base_ref=?",
             vec![
                 &assignment.title,
                 &assignment.prompt,
@@ -501,6 +546,8 @@ impl TaskStore<'_> {
                 &depends_on,
                 &workspace,
                 &verification,
+                &assignment.repository,
+                &assignment.base_ref,
             ],
             now,
         )
@@ -759,14 +806,14 @@ pub(super) fn write_plan(
     tx.execute("DELETE FROM native_task_assignments WHERE task_id=?1", [id])?;
     for (position, assignment) in plan.tasks.iter().enumerate() {
         tx.execute(
-            "INSERT INTO native_task_assignments(task_id,id,position,title,prompt,files,depends_on,workspace,verification,status,revision,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?11,?10)",
+            "INSERT INTO native_task_assignments(task_id,id,position,title,prompt,files,depends_on,workspace,verification,status,revision,updated_at,repository,base_ref)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?11,?10,?12,?13)",
             params![id, assignment.id, position as i64, assignment.title, assignment.prompt,
                 serde_json::to_string(&assignment.files)?,
                 serde_json::to_string(&assignment.depends_on)?,
                 assignment.workspace.map(WorkspaceMode::as_str),
                 serde_json::to_string(&assignment.verification)?, ms(now),
-                first],
+                first, assignment.repository, assignment.base_ref],
         )?;
     }
     let revision = key.bump(

@@ -637,6 +637,51 @@ fn completion_needs_criteria_no_open_decision_and_a_final_report() {
     assert_eq!(persisted.len(), 1);
     assert_eq!(persisted[0].payload, serde_json::to_value(&report).unwrap());
 
+    // The owning Mono hears about the report in its inbox, with the
+    // evidence flags and no task action owed, and the card keeps showing
+    // the task with its report until the user hides it.
+    let batch = crate::tasks::inbox::next_batch(&store, "mono-1", NOW + 21)
+        .unwrap()
+        .expect("the final report reaches Mono");
+    assert!(batch.message.contains("Task complete"), "{}", batch.message);
+    assert!(
+        batch
+            .message
+            .contains("implemented, committed, not merged, not pushed, not deployed"),
+        "{}",
+        batch.message
+    );
+    assert!(batch.message.contains("1 commit(s)"), "{}", batch.message);
+    assert!(
+        batch.message.contains("Criteria satisfied: 1 of 1"),
+        "{}",
+        batch.message
+    );
+    let shown = crate::tasks::view::monitor(&store, "mono-1", NOW + 22).unwrap();
+    assert_eq!(shown.len(), 1);
+    let summary = shown[0]
+        .report
+        .clone()
+        .expect("completed tasks carry their report");
+    assert!(summary.implemented && summary.committed && !summary.merged);
+    assert_eq!(
+        summary.evidence_line(),
+        "implemented, committed · not merged, not pushed, not deployed"
+    );
+    assert_eq!((summary.criteria_satisfied, summary.criteria_total), (1, 1));
+    assert_eq!(summary.assignments[0].1, 1);
+    assert_eq!(shown[0].badge(), None, "a completed task raises no badge");
+    assert_eq!(shown[0].activity, crate::tasks::view::MonoActivity::Idle);
+    // A day later it has aged out; hiding it removes it at once.
+    let later = NOW + 22 + crate::tasks::lifecycle::RECENT_COMPLETION_MS;
+    assert!(crate::tasks::view::monitor(&store, "mono-1", later)
+        .unwrap()
+        .is_empty());
+    crate::tasks::lifecycle::dismiss_report(&store, "t").unwrap();
+    assert!(crate::tasks::view::monitor(&store, "mono-1", NOW + 23)
+        .unwrap()
+        .is_empty());
+
     // Merged comes from the repository, never from what a worker wrote.
     let branch = workspace.branch.clone().unwrap();
     git(&repo.root, &["merge", "-q", "--ff-only", &branch]);

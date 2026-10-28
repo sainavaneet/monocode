@@ -316,7 +316,19 @@ impl TranscriptView {
                                 })
                         })
                         .when(!is_search && !chain, |d| {
-                            d.child(div().min_w_0().truncate().child(shown.target))
+                            d.child(div().min_w_0().truncate().child(
+                                if tool.state == ToolState::Running
+                                    && self.streaming
+                                    && !cx.reduce_motion()
+                                {
+                                    crate::activity::shimmer(
+                                        shown.target,
+                                        self.started_at.elapsed().as_secs_f32(),
+                                    )
+                                } else {
+                                    div().child(shown.target).into_any_element()
+                                },
+                            ))
                         })
                         .when(chain, |d| {
                             let hidden = chips.len().saturating_sub(3);
@@ -327,13 +339,19 @@ impl TranscriptView {
                                 .collect();
                             d.gap_1p5()
                                 .when_some(shown.description.clone(), |d, description| {
-                                    d.child(
-                                        div()
-                                            .min_w(px(64.))
-                                            .flex_shrink(1.)
-                                            .truncate()
-                                            .child(description),
-                                    )
+                                    d.child(div().min_w(px(64.)).flex_shrink(1.).truncate().child(
+                                        if tool.state == ToolState::Running
+                                            && self.streaming
+                                            && !cx.reduce_motion()
+                                        {
+                                            crate::activity::shimmer(
+                                                description,
+                                                self.started_at.elapsed().as_secs_f32(),
+                                            )
+                                        } else {
+                                            div().child(description).into_any_element()
+                                        },
+                                    ))
                                 })
                                 .children(chips.into_iter().take(3).enumerate().map(
                                     |(index, (action, label, path))| {

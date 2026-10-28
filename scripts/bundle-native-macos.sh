@@ -20,7 +20,14 @@ case "$native_data_mode" in
   dev-data|monocode-data) ;;
   *) echo "Unknown data mode: $native_data_mode" >&2; exit 1 ;;
 esac
-native_bundle="$native_target/Monocode Native.app"
+native_bundle_id=dev.usemono.gpui
+native_display_name='Monocode Native'
+if [ "$native_data_mode" = dev-data ]; then
+  native_bundle_id=dev.usemono.gpui.dev
+  native_display_name='Monocode Native Dev'
+fi
+# Keep intermediate app bundles out of Spotlight indexing.
+native_bundle="$native_target/bundles.noindex/Monocode Native.app"
 native_binary="$native_target/monocode-gpui"
 if [ ! -f "$native_binary" ]; then
   echo "Missing native executable: $native_binary" >&2
@@ -58,9 +65,10 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>$native_executable</string>
 <key>MonocodeDataMode</key><string>$native_data_mode</string>
-<key>CFBundleIdentifier</key><string>dev.usemono.gpui</string>
-<key>CFBundleName</key><string>Monocode Native</string>
-<key>CFBundleDisplayName</key><string>Monocode Native</string>
+<key>CFBundleIdentifier</key><string>$native_bundle_id</string>
+<key>CFBundleName</key><string>$native_display_name</string>
+<key>CFBundleDisplayName</key><string>$native_display_name</string>
+<key>NSLocalNetworkUsageDescription</key><string>MonoCode connects to your project's MCP servers and development services on your local network.</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$native_short_version</string>
 <key>CFBundleVersion</key><string>$native_build_version</string>

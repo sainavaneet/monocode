@@ -295,6 +295,18 @@ impl<P: Policy> Coordinator<P> {
         if results.len() < 2 {
             return Ok(None);
         }
+        let repositories: std::collections::HashSet<_> =
+            results.iter().map(|(_, w)| w.repository.clone()).collect();
+        if repositories.len() > 1 {
+            raise_now(tasks, id,
+                "Accepted work spans multiple repositories. Review and integrate each repository separately before completing this task.".into(),
+                "No cross-repository merge was attempted. Each assignment's worktree and commits are preserved.".into(), now)?;
+            return Ok(None);
+        }
+        let mut task = task;
+        if let Some(repository) = repositories.into_iter().next() {
+            task.project = repository;
+        }
         let branch = branch_for(id);
         let names: Vec<String> = results
             .iter()
@@ -312,12 +324,11 @@ impl<P: Policy> Coordinator<P> {
         match self.authorize(store, id, Authority::Merge) {
             Ok(()) => {}
             Err(TaskError::Invalid(reason)) => {
-                let question = format!(
-                    "Task {id}'s accepted work is on {} branches ({}) that must be merged onto its integration branch {branch}, but the task may not merge.",
-                    names.len(),
-                    names.join(", ")
+                let question = format!("Merge accepted work to finish “{}”?", task.title);
+                let context = format!(
+                    "{} accepted workspaces are ready, but automatic merging is disabled. {reason} You can enable merging or integrate them yourself.",
+                    names.len()
                 );
-                let context = format!("{reason} Or integrate the branches yourself.");
                 raise_now(tasks, id, question, context, now)?;
                 return Ok(None);
             }

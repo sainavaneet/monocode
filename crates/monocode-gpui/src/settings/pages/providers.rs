@@ -19,6 +19,13 @@ fn api_key_ids(
     &'static str,
 ) {
     match kind {
+        Kind::Gemini => (
+            "api-key-gemini",
+            "api-key-gemini",
+            "settings-api-key-gemini-input",
+            "api-key-gemini-save",
+            "api-key-gemini-clear",
+        ),
         Kind::Codex => (
             "api-key-codex",
             "api-key-codex",
@@ -59,6 +66,10 @@ impl SettingsView {
         match api_keys::set(kind, &key) {
             Ok(status) => {
                 self.api_key_notice = None;
+                monocode_core::catalog::invalidate(
+                    kind,
+                    &monocode_core::accounts::Profile::default(),
+                );
                 input.update(cx, |input, cx| input.set_text(String::new(), cx));
                 if !status.configured && self.prefs.api_key_enabled(kind) {
                     self.update(cx, |p| {
@@ -86,15 +97,23 @@ impl SettingsView {
     fn api_key_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = self.prefs.clone();
         let mut rows = Vec::new();
-        for (ix, kind) in [Kind::Claude, Kind::Codex].into_iter().enumerate() {
+        for (ix, kind) in [Kind::Claude, Kind::Codex, Kind::Gemini]
+            .into_iter()
+            .enumerate()
+        {
             let status = api_keys::status(kind);
             let configured = status.as_ref().is_ok_and(|s| s.configured);
             let summary = match (&self.api_key_notice, &status) {
                 (Some((noted, text)), _) if *noted == kind => text.clone(),
                 (_, Ok(s)) if s.configured => format!(
-                    "Key ending in …{}. Set as {}.",
+                    "Key ending in …{}. Set as {}.{}",
                     s.hint.clone().unwrap_or_default(),
-                    api_keys::env_var(kind).unwrap_or_default()
+                    api_keys::env_var(kind).unwrap_or_default(),
+                    if kind == Kind::Gemini {
+                        " Uses a separate Gemini API profile."
+                    } else {
+                        ""
+                    }
                 ),
                 (_, Ok(_)) => format!(
                     "No key saved. The CLI keeps using your {} login.",

@@ -265,7 +265,7 @@ impl<P: Policy> Coordinator<P> {
             }
         }
         let assignments = tasks.assignments(&task.id)?;
-        let mut active: Vec<&[String]> = assignments
+        let mut active: Vec<&super::Assignment> = assignments
             .iter()
             .filter(|a| {
                 matches!(
@@ -273,13 +273,12 @@ impl<P: Policy> Coordinator<P> {
                     AssignmentState::Running | AssignmentState::WaitingForDecision
                 )
             })
-            .map(|a| a.files.as_slice())
             .collect();
         // A worker whose stop is unconfirmed still occupies its file scope.
-        let mut occupied: Vec<&[String]> = active.clone();
+        let mut occupied: Vec<&super::Assignment> = active.clone();
         for assignment in &assignments {
             if super::guard::pending_stop(tasks.conn, &task.id, &assignment.id)?.is_some() {
-                occupied.push(assignment.files.as_slice());
+                occupied.push(assignment);
             }
         }
         // The effective policy (snapshot restricted by live): fewer workers
@@ -305,20 +304,112 @@ impl<P: Policy> Coordinator<P> {
             {
                 continue;
             }
-            if occupied
-                .iter()
-                .any(|files| crate::orchestration::overlaps(files, &assignment.files))
-            {
+            if occupied.iter().any(|other| {
+                let same_repository = match (
+                    super::workspaces::repository_for(task, other),
+                    super::workspaces::repository_for(task, assignment),
+                ) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => true,
+                };
+                same_repository && crate::orchestration::overlaps(&other.files, &assignment.files)
+            }) {
                 continue;
             }
             let Some(attempt) = self.begin_launch(store, task, assignment, now)? else {
                 return Ok(());
             };
             self.dispatch(store, task, &attempt, launcher, now, tick)?;
-            active.push(&assignment.files);
-            occupied.push(&assignment.files);
+            active.push(assignment);
+            occupied.push(assignment);
         }
         Ok(())
+    }
+}
+
+impl<P: Policy> Coordinator<P> {
+    /// The launches the next tick is about to make, read from the store
+    /// without Git, so their worktrees can be created before the tick holds
+    /// the store (`workspaces::warm_up`). Over-approximate by design: an
+    /// assignment listed here may still wait at the tick (a stop pending, a
+    /// worktree owned by a live worker, an overlapping scope); the worktree
+    /// it gets is the one the tick would create anyway.
+    pub fn launch_candidates(
+        &self,
+        store: &Store,
+        now: u64,
+    ) -> Result<Vec<super::workspaces::WarmUp>, TaskError> {
+        if !enabled(store) {
+            return Ok(Vec::new());
+        }
+        let tasks = store.tasks()?;
+        let mut jobs = Vec::new();
+        for id in candidates(&tasks)? {
+            let Some(task) = tasks.task(&id)? else {
+                continue;
+            };
+            if task.lifecycle != TaskLifecycle::Active {
+                continue;
+            }
+            if task.stage == TaskStage::Ready && !self.autonomy(store, &task)?.automatic_execution {
+                continue;
+            }
+            let assignments = tasks.assignments(&task.id)?;
+            let active = assignments
+                .iter()
+                .filter(|a| {
+                    matches!(
+                        a.status,
+                        AssignmentState::Running | AssignmentState::WaitingForDecision
+                    )
+                })
+                .count();
+            let limit = self.autonomy(store, &task)?.worker_limit as usize;
+            let room = limit.saturating_sub(active);
+            if room == 0 {
+                continue;
+            }
+            let preference = super::policy::of(&tasks, &task.id)?
+                .map(|policy| policy.autonomy.workspace)
+                .unwrap_or_default();
+            let recorded = tasks.workspaces(&task.id)?;
+            let accepted = |dependency: &String| {
+                assignments
+                    .iter()
+                    .any(|a| &a.id == dependency && a.status == AssignmentState::Accepted)
+            };
+            let next: Vec<&super::Assignment> = assignments
+                .iter()
+                .filter(|a| match a.status {
+                    AssignmentState::Ready => true,
+                    AssignmentState::Queued => a.depends_on.iter().all(accepted),
+                    _ => false,
+                })
+                .collect();
+            let mut taken = 0;
+            for assignment in next {
+                if taken >= room {
+                    break;
+                }
+                if tasks
+                    .launch_blocked(&task.id, assignment, &assignments)?
+                    .is_some()
+                {
+                    continue;
+                }
+                taken += 1;
+                jobs.push(super::workspaces::WarmUp {
+                    task: task.clone(),
+                    assignment: assignment.clone(),
+                    preference,
+                    recorded: recorded
+                        .iter()
+                        .any(|w| w.assignment_id.as_deref() == Some(assignment.id.as_str())),
+                });
+            }
+        }
+        let _ = now;
+        Ok(jobs)
     }
 }
 

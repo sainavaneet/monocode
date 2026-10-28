@@ -107,7 +107,7 @@ if (name === 'xcrun' && args[0] === 'stapler' && process.env.NATIVE_TEST_STAPLER
     for (const artifact of artifacts)
       await access(join(out, artifact.filename));
     const plist = await readFile(
-      join(release, "Monocode Native.app/Contents/Info.plist"),
+      join(release, "bundles.noindex/Monocode Native.app/Contents/Info.plist"),
       "utf8",
     );
     assert.ok(

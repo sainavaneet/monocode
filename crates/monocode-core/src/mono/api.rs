@@ -19,7 +19,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "models.list"|"soul.read"|"habits.list"=>"",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
-        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete",
+        "sessions.start"=>"brief prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete",
         "sessions.send"=>"sessionId prompt project notifyOnComplete",
         "sessions.draft"=>"sessionId prompt project",
         "sessions.stop"|"sessions.archive"|"sessions.delete"=>"sessionId project",
@@ -99,6 +99,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "id",
             "sessionId",
             "besideSessionId",
+            "brief",
             "modelSettings",
             "schedule",
             "tags",
@@ -110,6 +111,9 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         {
             return Err(format!("{key} must be text"));
         }
+    }
+    if let Some(brief) = input.get("brief") {
+        super::delegation::parse(brief)?;
     }
     if input.get("modelSettings").is_some_and(|value| {
         value

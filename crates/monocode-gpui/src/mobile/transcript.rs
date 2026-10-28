@@ -1045,6 +1045,6 @@ mod tests {
         live.mono = Some("Ada");
         let turn = &all(&live)[0];
         assert_eq!(types(turn), ["user", "header"]);
-        assert_eq!(turn["items"][1]["label"], "Reading file…");
+        assert_eq!(turn["items"][1]["label"], "Reviewing Read result…");
     }
 }

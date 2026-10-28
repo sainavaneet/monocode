@@ -24,6 +24,48 @@ fn conversation(cx: &mut TestAppContext) -> WindowHandle<Conversation> {
 }
 
 #[gpui::test]
+fn stopping_mono_holds_unaccepted_messages_for_retry_or_removal(cx: &mut TestAppContext) {
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            let message = monocode_core::mono::Message {
+                id: "queued".into(),
+                text: "Show the saved plan".into(),
+                sent_at: Some(1234),
+                internal: false,
+                error: None,
+                attachments: vec![],
+            };
+            let mono = monocode_core::mono::Mono {
+                outbox: vec![message.clone()],
+                ..Default::default()
+            };
+            view.configure_mono(mono, "/tmp".into(), Default::default(), cx);
+            view.busy = true;
+            view.mono_ui.sending = Some(message.id.clone());
+            view.mono_stop(cx);
+            assert!(view.cancel.load(Ordering::Relaxed));
+            assert!(view.mono_ui.sending.is_none());
+            let held = view.mono_ui.pending[0].clone();
+            assert!(held.error.as_deref().unwrap().starts_with("Paused by Stop"));
+            assert_eq!(
+                view.mono_take_failures(),
+                vec![(held.id.clone(), held.error.clone().unwrap())]
+            );
+            view.stopping = false;
+            assert!(
+                !view.mono_dispatch(&held, cx),
+                "settling Stop must not replay the request"
+            );
+            assert_eq!(
+                held.text, message.text,
+                "preserve the request for explicit retry"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn mono_messages_steer_the_ready_provider_once_and_keep_their_send_time(cx: &mut TestAppContext) {
     let window = conversation(cx);
     let (send, receive) = std::sync::mpsc::channel();

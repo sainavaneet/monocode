@@ -70,6 +70,19 @@ impl<P: Policy> Coordinator<P> {
         let live = self.policy.autonomy(task);
         let provider = self.policy.worker_provider(task);
         let policy = policy::capture_with(store, task, &provider, &live, now)?;
+        let existing_attempt = latest_attempt(&tasks, &task.id, &assignment.id)?.filter(in_flight);
+        let account = if existing_attempt.is_none() {
+            match policy::launch_choice(store, task, &policy, now)? {
+                LaunchAccount::Use(account) => Some(account),
+                LaunchAccount::Wait => return Ok(None),
+                LaunchAccount::Block(reason) => {
+                    unavailable(&tasks, task, assignment, &reason, now)?;
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
         let prepared = match workspaces::prepare(&tasks, task, assignment, now) {
             Ok(prepared) => prepared,
             Err(PrepareError::Workspace(reason)) => {
@@ -83,17 +96,10 @@ impl<P: Policy> Coordinator<P> {
         if super::guard::workspace_owner(tasks.conn, &task.id, &assignment.id)?.is_some() {
             return Ok(None);
         }
-        let attempt = match latest_attempt(&tasks, &task.id, &assignment.id)? {
-            Some(attempt) if in_flight(&attempt) => attempt,
-            _ => {
-                let account = match policy::launch_choice(store, task, &policy, now)? {
-                    LaunchAccount::Use(account) => account,
-                    LaunchAccount::Wait => return Ok(None),
-                    LaunchAccount::Block(reason) => {
-                        unavailable(&tasks, task, assignment, &reason, now)?;
-                        return Ok(None);
-                    }
-                };
+        let attempt = match existing_attempt {
+            Some(attempt) => attempt,
+            None => {
+                let account = account.expect("new launch passed account preflight");
                 let id = crate::mono::new_id();
                 tasks.create_attempt(
                     &NewAttempt {
@@ -321,6 +327,20 @@ pub(super) fn reserve_with(
         &decisions,
         authority,
     );
+    let dependency_workspaces = tasks.workspaces(&task.id).map_err(|e| e.to_string())?;
+    let dependency_context = assignment.depends_on.iter().filter_map(|id| {
+        dependency_workspaces.iter().find(|w| w.assignment_id.as_deref() == Some(id)).map(|w| {
+            format!("- {id}: repository {}; workspace {}; branch {}. Read results there; do not edit another worker's workspace.", w.repository, w.path, w.branch.as_deref().unwrap_or("checkout"))
+        })
+    }).collect::<Vec<_>>();
+    let prompt = if dependency_context.is_empty() {
+        prompt
+    } else {
+        format!(
+            "{prompt}\n\nDependency result locations:\n{}",
+            dependency_context.join("\n")
+        )
+    };
     // Mono's reason for sending the previous attempt back, if it did.
     let previous = tasks
         .attempts(&task.id, &assignment.id)
@@ -376,6 +396,7 @@ pub(super) fn reserve_with(
     };
     let billing = snapshot.as_ref().is_some_and(|p| p.use_api_key);
     let base = Settings {
+        access: authority.worker_access,
         account: profile.clone(),
         use_api_key: billing,
         api_key_pin: Some(billing),
@@ -386,14 +407,14 @@ pub(super) fn reserve_with(
     settings.revision = 0;
     // Validates and selects the recorded worktree before anything is
     // reserved; the session id only names worktrees this never creates.
-    app_access::launch_checkout(&input, &task.project, 0, &mut settings)?;
+    app_access::launch_checkout(&input, &workspace.repository, 0, &mut settings)?;
     let fingerprint = app_access::fingerprint("tasks.launch", &json!(attempt.operation_id));
     let (mut session, fresh) = store.create_app_session(
         LAUNCH_CALLER,
         &attempt.operation_id,
         &fingerprint,
         kind.id(),
-        &task.project,
+        &workspace.repository,
     )?;
     let mut resumed = false;
     if fresh {

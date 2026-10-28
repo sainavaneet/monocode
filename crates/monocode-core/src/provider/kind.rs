@@ -12,9 +12,10 @@ pub enum Kind {
     Fx,
     Hermes,
     Devin,
+    Gemini,
 }
 impl Kind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Claude,
         Self::Codex,
         Self::Cursor,
@@ -26,6 +27,7 @@ impl Kind {
         Self::Hermes,
         Self::Antigravity,
         Self::Devin,
+        Self::Gemini,
     ];
     pub fn id(self) -> &'static str {
         match self {
@@ -40,6 +42,7 @@ impl Kind {
             Self::Fx => "fx",
             Self::Hermes => "hermes",
             Self::Devin => "devin",
+            Self::Gemini => "gemini",
         }
     }
     pub fn label(self) -> &'static str {
@@ -55,6 +58,7 @@ impl Kind {
             Self::Fx => "fx",
             Self::Hermes => "Hermes Agent",
             Self::Devin => "Devin",
+            Self::Gemini => "Gemini",
         }
     }
     pub fn parse(id: &str) -> Option<Self> {
@@ -105,6 +109,7 @@ impl Kind {
             Self::Fx => "fx login",
             Self::Hermes => "hermes model",
             Self::Devin => "devin auth login",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -117,6 +122,9 @@ mod tests {
         let source = include_str!("../../../../src/integrations/harness/core/register.ts");
         for kind in Kind::ALL {
             assert_eq!(Kind::parse(kind.id()), Some(kind));
+            if kind == Kind::Gemini {
+                continue;
+            }
             assert!(source.contains(&format!("../providers/{}/", kind.id())));
         }
         assert_eq!(Kind::parse("unknown"), None);

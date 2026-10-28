@@ -9,7 +9,8 @@ use monocode_core::accounts::eligibility::AllowedAccount;
 use monocode_core::tasks::TaskLifecycle;
 use monocode_core::tasks::autonomy::{Autonomy, MonoAutonomy};
 
-const WORK: [&str; 5] = [
+const WORK: [&str; 6] = [
+    "autonomy-worker-access",
     "autonomy-automatic-execution",
     "autonomy-workers",
     "autonomy-workspace",

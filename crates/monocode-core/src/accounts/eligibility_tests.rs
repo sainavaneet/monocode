@@ -10,6 +10,29 @@ fn store() -> Store {
     Store::open(Path::new(":memory:")).unwrap()
 }
 
+#[test]
+fn verified_subscription_clears_only_its_older_auth_failure_and_preserves_cooldown() {
+    let db = store();
+    mark_unhealthy(&db, "claude", "default", NOW).unwrap();
+    mark_unhealthy(&db, "claude", "account-other", NOW).unwrap();
+    update(&db, |book| {
+        let mut h = book.get("claude", "default");
+        h.cooldown_until = Some(NOW + 1000);
+        book.set("claude", "default", h);
+    })
+    .unwrap();
+    verified_subscription_turn(&db, "claude", "default", NOW + 1, true, NOW + 2).unwrap();
+    assert!(health(&db).unwrap().get("claude", "default").unhealthy);
+    verified_subscription_turn(&db, "claude", "default", NOW - 1, false, NOW + 2).unwrap();
+    assert!(health(&db).unwrap().get("claude", "default").unhealthy);
+    verified_subscription_turn(&db, "claude", "default", NOW + 1, false, NOW + 2).unwrap();
+    let h = health(&db).unwrap();
+    assert!(!h.get("claude", "default").unhealthy);
+    assert_eq!(h.get("claude", "default").failure, None);
+    assert_eq!(h.get("claude", "default").cooldown_until, Some(NOW + 1000));
+    assert!(h.get("claude", "account-other").unhealthy);
+}
+
 fn list(entries: &[(&str, i64, Option<&str>)]) -> Allowlist {
     Allowlist {
         accounts: entries
@@ -262,4 +285,28 @@ fn every_failure_category_plans_its_account_action() {
         AccountPlan::Switch(next) => assert_eq!(next.provider, "claude"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn authentication_fallback_requires_an_explicitly_allowed_provider() {
+    let mut allowed = list(&[("default", 0, None)]);
+    allowed.accounts.push(AllowedAccount {
+        provider: "claude".into(),
+        account_id: "default".into(),
+        priority: 1,
+        quota_group: None,
+    });
+    let store = store();
+    mark_unhealthy(&store, "codex", "default", NOW).unwrap();
+    let health = health(&store).unwrap();
+    assert!(first_eligible(&pool(&allowed, &health), "codex", None, NOW).is_none());
+    allowed.provider_fallback = true;
+    assert_eq!(
+        first_eligible(&pool(&allowed, &health), "codex", None, NOW)
+            .unwrap()
+            .provider,
+        "claude"
+    );
+    allowed.accounts.pop();
+    assert!(first_eligible(&pool(&allowed, &health), "codex", None, NOW).is_none());
 }

@@ -45,9 +45,12 @@ test("Finder launches use development data for dev bundles and installed data fo
       });
       assert.ifError(packaged.error);
       assert.equal(packaged.status, 0, packaged.stdout + packaged.stderr);
-      const bundle = join(output, "Monocode Native.app/Contents");
+      const bundle = join(output, "bundles.noindex/Monocode Native.app/Contents");
       const plist = await readFile(join(bundle, "Info.plist"), "utf8");
       assert.ok(plist.includes(`<key>MonocodeDataMode</key><string>${mode}</string>`));
+      const identifier = mode === "dev-data" ? "dev.usemono.gpui.dev" : "dev.usemono.gpui";
+      assert.ok(plist.includes(`<key>CFBundleIdentifier</key><string>${identifier}</string>`));
+      assert.ok(plist.includes("<key>NSLocalNetworkUsageDescription</key>"));
       // macOS rejects menu bar items from a process that exec'd after launch.
       assert.ok(plist.includes("<key>CFBundleExecutable</key><string>monocode-gpui</string>"));
       await assert.rejects(access(join(bundle, "MacOS/monocode-launcher")));

@@ -27,6 +27,8 @@ mod status;
 mod task_monitor_tests;
 mod task_overview;
 #[cfg(test)]
+mod task_plan_tests;
+#[cfg(test)]
 mod task_session_tests;
 #[cfg(test)]
 mod task_tests;
@@ -97,6 +99,7 @@ pub(crate) struct Monos {
     root: PathBuf,
     prefs: crate::settings::Preferences,
     pub(crate) roster: Roster,
+    pub(crate) collapsed_workers: HashSet<String>,
     pub(crate) active: Option<String>,
     chats: HashMap<String, Entity<Conversation>>,
     bridge: Option<mono::bridge::Server>,
@@ -123,6 +126,12 @@ pub(crate) struct Monos {
     field_blurs: HashSet<gpui::EntityId>,
     file_versions: HashMap<String, (String, String)>,
     saving_files: HashSet<String>,
+    /// Files whose save hit a real conflict: the disk's text and hash, for
+    /// the user to keep theirs or take the disk's.
+    file_conflicts: HashMap<String, (String, String)>,
+    /// Hashes each editor has opened or saved, newest last: a late reload
+    /// carrying one of them is stale and never replaces the editor's text.
+    file_hashes: HashMap<String, Vec<String>>,
     file_load_revision: u64,
     files: Option<AgentFiles>,
     habits: Vec<Habit>,
@@ -143,7 +152,7 @@ pub(crate) struct Monos {
     rail_ids: Vec<String>,
     running: HashMap<i64, RunningHabit>,
     active_run: Option<i64>,
-    completion_work: HashSet<(String, u64)>,
+    completion_work: HashSet<(String, (i64, u64))>,
     /// The open background dialog, centred in the window it opened in.
     background: Option<(
         Entity<crate::project_settings::BackgroundDialog>,
@@ -335,6 +344,7 @@ impl Monos {
             root,
             prefs,
             roster,
+            collapsed_workers: HashSet::new(),
             active: None,
             chats: HashMap::new(),
             bridge,
@@ -361,6 +371,8 @@ impl Monos {
             field_blurs: HashSet::new(),
             file_versions: HashMap::new(),
             saving_files: HashSet::new(),
+            file_conflicts: HashMap::new(),
+            file_hashes: HashMap::new(),
             file_load_revision: 0,
             files: None,
             habits: Vec::new(),
@@ -428,6 +440,18 @@ impl Monos {
                 }
             }
         }));
+        // Restore worker summaries for every sidebar group, including Monos
+        // that have not been opened in this app run.
+        let launches = this
+            .roster
+            .monos
+            .iter()
+            .flat_map(|mono| mono.launches.iter().map(|launch| launch.session_id))
+            .collect();
+        let owner = this.owner.clone();
+        cx.defer(move |cx| {
+            let _ = owner.update(cx, |shell, cx| shell.mono_track_sessions(launches, cx));
+        });
         if this.prefs.monos
             && let Some(id) = active.filter(|id| this.roster.get(id).is_some())
         {
@@ -507,6 +531,8 @@ impl Monos {
             .unwrap_or("idle");
         let status = match state {
             "working" => "Working",
+            "waiting" => "Waiting",
+            "paused" => "Paused",
             "needs-you" => "Needs you",
             _ => "Idle",
         };
@@ -756,6 +782,26 @@ impl Monos {
                 let source = id.clone();
                 this.observations.push(cx.subscribe(
                     &view,
+                    move |this,
+                          view,
+                          event: &crate::conversation::composer_features::StartOrchestration,
+                          cx| {
+                        this.start_chat_plan(&source, &view, event.0.clone(), cx);
+                    },
+                ));
+                let source = id.clone();
+                this.observations.push(cx.subscribe(
+                    &view,
+                    move |this,
+                          _,
+                          event: &crate::conversation::task_monitor::DismissTaskReport,
+                          cx| {
+                        this.dismiss_task_report(&source, &event.task_id, cx);
+                    },
+                ));
+                let source = id.clone();
+                this.observations.push(cx.subscribe(
+                    &view,
                     move |this, _, event: &MonoSubmitted, cx| {
                         this.user_reply(&source, &event.text, cx);
                         this.enqueue(
@@ -783,6 +829,21 @@ impl Monos {
                             view.downgrade(),
                             cx,
                         )
+                    },
+                ));
+                this.observations.push(cx.subscribe(
+                    &view,
+                    |this, chat, _: &crate::conversation::mono_activity::OpenMonoActivity, cx| {
+                        let rows = chat.read(cx).transcript.read(cx).history_rows();
+                        this.activity_turn = Some(
+                            rows.iter()
+                                .rposition(|row| row.first && row.is_prompt())
+                                .map_or(0, |i| i + 1),
+                        );
+                        this.show_overview(cx);
+                        this.route = None;
+                        this.overview_tab = OverviewTab::Activity;
+                        cx.notify();
                     },
                 ));
                 this.observations.push(cx.subscribe(
@@ -832,9 +893,8 @@ impl Monos {
                 let source = id.clone();
                 this.observations
                     .push(cx.observe(&view, move |this, _, cx| {
-                        if this.active.as_ref() == Some(&source) {
-                            cx.notify();
-                        }
+                        // Background Monos also feed the sidebar activity card.
+                        cx.notify();
                         this.dispatch(&source, cx);
                     }));
                 let source = id.clone();
@@ -1085,6 +1145,13 @@ impl Monos {
         self.dispatch(id, cx);
         self.changed(cx);
     }
+    pub(crate) fn open_home(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_open_file(cx);
+        self.route = None;
+        self.settings = None;
+        self.open(id, window, cx);
+    }
+
     pub(crate) fn open(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.prefs.monos || self.roster.get(id).is_none() {
             return;
@@ -1196,23 +1263,30 @@ impl Monos {
         })
         .detach();
     }
-    pub(crate) fn rail(&mut self, project: Option<String>, cx: &mut Context<Self>) -> AnyElement {
-        self.rail_impl(project, false, false, cx)
+    pub(crate) fn rail(
+        &mut self,
+        project: Option<String>,
+        workers: HashMap<String, AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.rail_impl(project, false, false, workers, cx)
     }
     /// Original navigation lists every Mono, before the projects; the inset
     /// layout continues to list only the current project's Monos.
     pub(crate) fn project_navigation_rail(
         &mut self,
         compact: bool,
+        workers: HashMap<String, AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.rail_impl(None, true, compact, cx)
+        self.rail_impl(None, true, compact, workers, cx)
     }
     fn rail_impl(
         &mut self,
         project: Option<String>,
         original: bool,
         compact: bool,
+        mut workers: HashMap<String, AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if !self.prefs.monos {
@@ -1306,6 +1380,7 @@ impl Monos {
                 )
             })
             .children(roster.into_iter().enumerate().map(|(index, mono)| {
+                let worker_group = workers.remove(&mono.id);
                 let active = self.active.as_deref() == Some(&mono.id);
                 let state = self
                     .chats
@@ -1349,7 +1424,7 @@ impl Monos {
                 let context = id.clone();
                 let drag = id.clone();
                 let slot = self.rail_bounds[&id].clone();
-                div()
+                let row = div()
                     .id(SharedString::from(format!("mono-rail-{id}")))
                     .debug_selector({
                         let id = id.clone();
@@ -1387,7 +1462,7 @@ impl Monos {
                                         .rounded_full()
                                         .border_1()
                                         .border_color(rgb(crate::right_panel::BACKGROUND_BASE))
-                                        .bg(if state == "working" {
+                                        .bg(if state == "working" || state == "waiting" {
                                             rgb(mono.color).into()
                                         } else if state == "needs-you" {
                                             accent_color()
@@ -1495,7 +1570,8 @@ impl Monos {
                             this.skip_click = false;
                             this.drag = Some((drag.clone(), event.position, None));
                         }),
-                    )
+                    );
+                div().child(row).children(worker_group)
             }))
             // MonoRailSection owns its menu and background dialog; the Mono
             // view paints them instead while it is open.

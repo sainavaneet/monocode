@@ -304,6 +304,61 @@ fn operator_children_are_visible_durable_and_do_not_navigate_by_default(cx: &mut
 }
 
 #[gpui::test]
+fn submitted_app_launch_no_longer_advertises_its_consumed_draft(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    let child = launch(window, caller, "consume-draft", json!({}), cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&child].update(cx, |view, cx| {
+                // Exercise durable submission without invoking a real provider.
+                view.summary.provider = "fixture".into();
+                view.install_app_launch(view.settings.clone(), true, cx);
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(!shell.sessions[&child].read(cx).has_saved_draft());
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .follow_ups(child)
+                    .unwrap()
+                    .draft
+                    .is_none()
+            );
+        })
+        .unwrap();
+    let read = call(
+        window,
+        caller,
+        "read-consumed",
+        "sessions.read",
+        json!({"sessionId":child}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(read["hasDraft"], false);
+    let list = call(
+        window,
+        caller,
+        "list-consumed",
+        "sessions.list",
+        json!({}),
+        cx,
+    )
+    .unwrap();
+    let child = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == child)
+        .unwrap();
+    assert_eq!(child["hasDraft"], false);
+}
+
+#[gpui::test]
 fn operator_launches_can_build_nested_splits(cx: &mut TestAppContext) {
     let (window, _, caller) = setup(cx);
     let right = launch(window, caller, "right", json!({"placement":"right"}), cx);

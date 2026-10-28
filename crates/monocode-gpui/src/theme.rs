@@ -302,6 +302,7 @@ pub(crate) fn icon(path: &'static str, side: f32) -> Svg {
 }
 pub(crate) fn provider_icon(provider: &str, side: f32) -> Div {
     let (path, monochrome, scale) = match provider {
+        "gemini" => ("gemini.svg", false, 1.),
         "claude" => ("claude.svg", false, 1.),
         "cursor" => ("cursor.svg", true, 1.),
         "grok" => ("grok.svg", true, 1.),

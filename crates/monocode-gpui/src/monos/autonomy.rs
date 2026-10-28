@@ -85,8 +85,22 @@ const BILLING: &[(&str, &str)] = &[
 ];
 
 /// Every field of the policy, in display order.
-pub(crate) fn fields() -> [Field; 12] {
+pub(crate) fn fields() -> [Field; 13] {
     [
+        Field {
+            id: "autonomy-worker-access",
+            label: "Worker access",
+            description: "Full access runs worker commands and edits without routine approval prompts. Applies when an agent starts or restarts. For an existing task, apply this policy, then pause and resume its workers.",
+            control: Control::Choice {
+                options: &[
+                    ("full-access", "Full access"),
+                    ("supervised", "Supervised"),
+                    ("read-only", "Read-only"),
+                ],
+                get: |p| p.worker_access.id().into(),
+                set: |p, value| p.worker_access = monocode_core::agent::AccessMode::from_id(value),
+            },
+        },
         Field {
             id: "autonomy-automatic-execution",
             label: "Start planned work on its own",

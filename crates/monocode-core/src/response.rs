@@ -53,6 +53,22 @@ pub fn limit(text: &str, count: usize) -> String {
         )
     }
 }
+/// Like [`limit`], but keeps the end of the text: a worker's final summary
+/// comes last, so a report cut from the front would lose exactly the part
+/// that matters.
+pub fn limit_keeping_end(text: &str, count: usize) -> String {
+    let total = text.chars().count();
+    if total <= count {
+        return text.into();
+    }
+    let head = count / 4;
+    let marker_len = 48;
+    let tail = count.saturating_sub(head + marker_len).max(1);
+    let omitted = total.saturating_sub(head + tail);
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(total - tail).collect();
+    format!("{start}\n\n[… {omitted} characters omitted …]\n\n{end}")
+}
 pub fn prose(rows: &[Row]) -> String {
     let mut messages: Vec<String> = Vec::new();
     let mut previous = false;

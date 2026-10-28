@@ -6,11 +6,18 @@ use super::review::{Review, ReviewOutcome};
 use super::{Assignment, DecisionRequest, DecisionState, Task, Workspace};
 use crate::orchestration::WorkspaceMode;
 
-const REPORTING: &str = "Report through the app commands (`monocode-gpui app ACTION --json '{...}'`); the task and attempt come from this session:\n\
+const REPORTING: &str = "The task and attempt come from this session:\n\
 - tasks.worker.status {} shows your assignment and answered decisions.\n\
 - tasks.worker.ask {question, context?, scope?} when you need a decision; then end your turn: the answer arrives as your next message. Do not report success while a question is unanswered.\n\
 - tasks.worker.blocked {reason} if you cannot continue.\n\
-- tasks.worker.result {outcome: \"succeeded\"|\"failed\", summary, workspace, commits, validation, evidence, remainingWork, limitations} once, when done. It is a claim Mono reviews against the acceptance criteria; it does not complete the task.";
+- tasks.worker.result {outcome: \"succeeded\"|\"failed\", summary, workspace, commits, validation, evidence, remainingWork, limitations} once, when done. summary and workspace are strings. commits, validation, evidence, remainingWork and limitations are arrays of strings (use [] when empty), never objects. commits contains only commit hashes, not log subjects. It is a claim Mono reviews against the acceptance criteria; it does not complete the task.\n\
+Never print environment variables, credentials, tokens, or app capability values. Use the executable path provided above directly; do not search the environment or PATH for it.";
+
+fn reporting(executable: &std::path::Path) -> String {
+    let path = executable.to_string_lossy();
+    let command = shlex::try_quote(&path).unwrap_or_default();
+    format!("Report through this exact app executable: {command} app ACTION --json '{{...}}'.\n{REPORTING}")
+}
 
 fn list(items: &[String], none: &str) -> String {
     if items.is_empty() {
@@ -86,6 +93,9 @@ pub fn worker_brief(
     decisions: &[DecisionRequest],
     authority: &Autonomy,
 ) -> String {
+    let reporting = std::env::current_exe()
+        .map(|path| reporting(&path))
+        .unwrap_or_else(|_| "App executable unavailable. Report the blocker in your reply; do not inspect credentials or environment variables.".into());
     let commits = if authority.commit {
         "Commit your work there"
     } else {
@@ -134,8 +144,8 @@ pub fn worker_brief(
          {rules}\n\
          {forbidden}\
          Depends on (already accepted): {deps}\n\
-         Expected verification: {checks}\n\n\
-         {REPORTING}",
+         Expected verification (run each exact command; include that exact command and its result in a validation string): {checks}\n\n\
+         {reporting}",
         task_title = task.title,
         id = assignment.id,
         title = assignment.title,

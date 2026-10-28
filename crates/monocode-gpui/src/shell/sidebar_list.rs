@@ -127,7 +127,7 @@ impl SidebarList {
 }
 
 /// The badge on a Mono's sidebar row for its durable tasks: `2 working`,
-/// `Needs your decision`, `Reviewing`, `Recovering` or `Paused` (see
+/// `Decision needed`, `Reviewing`, `Recovering` or `Paused` (see
 /// `tasks::view::Badge` for which wins). The label is also in a nested
 /// debug selector, `mono-task-badge-<mono>:<label>`.
 pub(crate) fn task_badge(mono: &str, badge: Badge) -> AnyElement {
@@ -515,12 +515,13 @@ impl Shell {
         let content = match row {
             Row::Navigation => return self.sidebar_navigation(cx),
             Row::Monos => {
+                let workers = self.mono_worker_groups(false, cx);
                 return self
                     .monos
                     .clone()
                     .map(|monos| {
                         monos.update(cx, |monos, cx| {
-                            monos.rail(Some(self.workspace.project.clone()), cx)
+                            monos.rail(Some(self.workspace.project.clone()), workers, cx)
                         })
                     })
                     .unwrap_or_else(|| div().into_any());

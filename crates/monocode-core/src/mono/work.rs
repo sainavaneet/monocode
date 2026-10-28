@@ -249,10 +249,12 @@ impl super::Mono {
                 .iter()
                 .find(|old| old.session_id == launch.session_id)
             {
+                launch.origin_session = previous.origin_session;
                 launch.origin_turn = previous.origin_turn;
                 launch.notify_on_complete = previous.notify_on_complete;
                 launch.completed = previous.completed;
                 launch.dismissed = previous.dismissed;
+                launch.input_notified = previous.input_notified;
             }
         }
         self.documents.retain(|d| {

@@ -42,6 +42,8 @@ fn header_button(
 fn status_label(state: &str) -> &'static str {
     match state {
         "working" => "Working",
+        "waiting" => "Waiting",
+        "paused" => "Paused",
         "needs-you" => "Needs you",
         _ => "Idle",
     }
@@ -50,7 +52,7 @@ fn status_label(state: &str) -> &'static str {
 /// color while it works, grey at rest.
 fn status_fill(state: &str, color: u32) -> gpui::Hsla {
     match state {
-        "working" => rgb(color).into(),
+        "working" | "waiting" => rgb(color).into(),
         "needs-you" => accent_color(),
         _ => content(0.3),
     }

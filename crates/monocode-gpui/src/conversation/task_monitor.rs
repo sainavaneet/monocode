@@ -18,12 +18,16 @@ use std::collections::{HashMap, HashSet};
 const TIMELINE_MAX_HEIGHT: f32 = 220.;
 
 /// A worker session as the app sees it now, between store reads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LiveWorker {
     pub(crate) busy: bool,
     /// Waiting on a permission or an answer in its chat.
     pub(crate) needs_input: bool,
     pub(crate) updated_at: u64,
+    /// The tool it runs now ("Edit src/lib.rs"), while its turn runs.
+    pub(crate) activity: Option<String>,
+    /// When its current turn started.
+    pub(crate) started_at: Option<u64>,
 }
 
 /// What the card shows: the persisted view and the live sessions.
@@ -42,8 +46,15 @@ pub(crate) struct OpenTaskChanges {
 }
 impl EventEmitter<OpenTaskChanges> for Conversation {}
 
+/// Hides a completed task's report from the card (the user has seen it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DismissTaskReport {
+    pub(crate) task_id: String,
+}
+impl EventEmitter<DismissTaskReport> for Conversation {}
+
 impl LiveWorker {
-    fn core(self) -> Live {
+    fn core(&self) -> Live {
         Live {
             busy: self.busy,
             needs_input: self.needs_input,
@@ -76,6 +87,49 @@ fn display_color(display: Display) -> gpui::Hsla {
         Display::Completed => tint(DIFF_ADD, 0.9),
         Display::Blocked | Display::Cancelling | Display::Cancelled => tint(RED_400, 0.9),
         Display::Waiting | Display::Pausing | Display::Paused => tint(AMBER_400, 0.9),
+    }
+}
+
+/// "3m 12s" or "2h 5m": how long a worker has been at it.
+pub(crate) fn elapsed(since: u64, now: u64) -> String {
+    let seconds = now.saturating_sub(since) / 1000;
+    let (hours, minutes, rest) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {rest}s")
+    } else {
+        format!("{rest}s")
+    }
+}
+
+/// The second line of a worker row: what it does now and for how long, or
+/// why it waits. None when there is nothing more to say than its state.
+pub(crate) fn worker_detail(
+    worker: &WorkerView,
+    state: WorkerState,
+    live: &HashMap<i64, LiveWorker>,
+    now: u64,
+) -> Option<String> {
+    let session = worker.session.and_then(|s| live.get(&s));
+    match state {
+        WorkerState::Working => {
+            let doing = session
+                .and_then(|l| l.activity.clone())
+                .unwrap_or_else(|| "Working".into());
+            let since = session.and_then(|l| l.started_at).or(worker.since);
+            Some(match since {
+                Some(since) => format!("{doing} · {}", elapsed(since, now)),
+                None => doing,
+            })
+        }
+        WorkerState::NeedsInput => Some("Waiting for an answer".into()),
+        WorkerState::Starting => Some("Starting its session".into()),
+        WorkerState::Queued if !worker.depends_on.is_empty() => {
+            Some(format!("After {}", worker.depends_on.join(", ")))
+        }
+        WorkerState::Queued => Some("Waiting for a free worker slot".into()),
+        _ => None,
     }
 }
 
@@ -274,12 +328,109 @@ impl Conversation {
         )
     }
 
+    /// A completed task: its title, what the evidence shows was delivered
+    /// and where, and a button to hide it once read. No worker rows, no
+    /// times: nothing moves any more.
+    fn task_report_card(
+        &self,
+        task: &TaskMonitor,
+        report: &monocode_core::tasks::view::ReportSummary,
+        now: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = task.control.task_id.clone();
+        let project = std::path::Path::new(&task.project)
+            .file_name()
+            .map_or(task.project.clone(), |n| n.to_string_lossy().into_owned());
+        let hide = {
+            let id = id.clone();
+            small_button(format!("task-monitor-{id}-hide"), "Hide").on_click(cx.listener(
+                move |_, _, _, cx| {
+                    cx.emit(DismissTaskReport {
+                        task_id: id.clone(),
+                    })
+                },
+            ))
+        };
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(content(0.9))
+                    .child(format!("{} · {project}", task.control.title)),
+            )
+            .child(chip(
+                format!("task-monitor-{id}-state-Completed"),
+                "Completed",
+                display_color(Display::Completed),
+            ))
+            .child(hide);
+        let places = report
+            .assignments
+            .iter()
+            .map(|(place, commits)| match commits {
+                0 => format!("{place} (no commits)"),
+                1 => format!("{place} (1 commit)"),
+                n => format!("{place} ({n} commits)"),
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        div()
+            .id(SharedString::from(format!("task-monitor-{id}")))
+            .debug_selector({
+                let id = id.clone();
+                move || format!("task-monitor-{id}")
+            })
+            .p_2()
+            .rounded_md()
+            .bg(content(0.03))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(header)
+            .child(line(
+                format!("task-monitor-{id}-report"),
+                format!("Delivered: {}", report.evidence_line()),
+                tint(DIFF_ADD, 0.85),
+            ))
+            .child(line(
+                format!("task-monitor-{id}-criteria"),
+                format!(
+                    "Criteria: {} of {} satisfied · completed {}",
+                    report.criteria_satisfied,
+                    report.criteria_total,
+                    ago(Some(report.generated_at), now)
+                ),
+                content(0.6),
+            ))
+            .when(!places.is_empty(), |card| {
+                card.child(
+                    line(
+                        format!("task-monitor-{id}-places"),
+                        format!("Where: {places}"),
+                        content(0.5),
+                    )
+                    .truncate(),
+                )
+            })
+            .into_any_element()
+    }
+
     fn task_monitor_card(
         &self,
         task: &TaskMonitor,
         now: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(report) = &task.report {
+            return self.task_report_card(task, report, now, cx);
+        }
         let id = task.control.task_id.clone();
         let live = &self.task_monitor.live;
         let display = task.control.display.label();
@@ -363,7 +514,7 @@ impl Conversation {
             .children(
                 task.workers
                     .iter()
-                    .map(|w| self.task_worker_row(&id, w, cx)),
+                    .map(|w| self.task_worker_row(&id, w, now, cx)),
             )
             .children(self.task_decision_lines(task))
             .children(task.recovery.iter().enumerate().map(|(ix, text)| {
@@ -386,7 +537,6 @@ impl Conversation {
                     .flex_wrap()
                     .items_center()
                     .gap_1()
-                    .children(self.task_control_buttons(&task.control, cx))
                     .child(div().flex_1())
                     .child(self.task_timeline_toggle(task, cx)),
             )
@@ -398,11 +548,13 @@ impl Conversation {
         &self,
         task: &str,
         worker: &WorkerView,
+        now: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let state = worker_state(worker, &self.task_monitor.live);
         let label = state.label();
         let key = format!("task-worker-{task}-{}", worker.assignment_id);
+        let detail = worker_detail(worker, state, &self.task_monitor.live, now);
         let place = match (&worker.workspace, &worker.branch) {
             (Some(path), Some(branch)) => format!("{path} · {branch}"),
             (Some(path), None) => path.clone(),
@@ -454,6 +606,20 @@ impl Conversation {
                     .children(open)
                     .children(changes),
             )
+            .when_some(detail, |row, detail| {
+                row.child(
+                    line(
+                        format!("{key}-detail"),
+                        detail,
+                        if state == WorkerState::Working {
+                            tint(FUCHSIA_300, 0.75)
+                        } else {
+                            content(0.5)
+                        },
+                    )
+                    .truncate(),
+                )
+            })
             .child(line(
                 format!("{key}-workspace"),
                 format!("{place}{runner}"),
@@ -472,9 +638,7 @@ impl Conversation {
         if waiting > 0 {
             lines.push(line(
                 format!("task-monitor-{id}-needs-you"),
-                format!(
-                    "Needs your decision ({waiting}): answer on the decision card in this chat"
-                ),
+                format!("Decision needed ({waiting}): answer on the decision card in this chat"),
                 tint(AMBER_400, 0.95),
             ));
         }

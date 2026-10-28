@@ -9,6 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+mod capabilities;
 pub(crate) mod coordinator;
 #[cfg(all(test, unix))]
 mod coordinator_tests;
@@ -17,6 +18,8 @@ mod follow_up_tests;
 mod handoff;
 #[cfg(all(test, unix))]
 mod handoff_tests;
+#[cfg(all(test, unix))]
+mod mono_project_tests;
 mod persistence;
 pub(crate) mod remote;
 mod visual_discovery;
@@ -420,6 +423,26 @@ fn run_turn_using(
         }
         let kind = Kind::parse(&summary.provider)
             .ok_or_else(|| format!("Unknown provider: {}", summary.provider))?;
+        let launch_cwd = if let Some(mono) = &settings.mono {
+            let cwd = monocode_core::mono::project::directory(
+                &mono.mono,
+                std::path::Path::new(&summary.cwd),
+            )?;
+            let revision = monocode_core::mono::project::revision(kind, &cwd)?;
+            let receipt = serde_json::json!({"cwd":cwd,"provider":kind.id(),"account":settings.account.id,"revision":revision}).to_string();
+            let key = format!("mono-project-context:{}", summary.id);
+            let db = locked(&store)?;
+            if db.setting(&key)?.as_deref() != Some(receipt.as_str()) {
+                // A changed project/config starts a new native provider context.
+                // The Mono rotation brief below carries the existing transcript.
+                provider_id = None;
+                db.reset_provider_id(summary.id)?;
+                db.save_setting(&key, &receipt)?;
+            }
+            cwd
+        } else {
+            std::path::PathBuf::from(settings.worktree_cwd.as_deref().unwrap_or(&summary.cwd))
+        };
         let binary = resolve_binary(kind).ok_or_else(|| {
             format!(
                 "{} CLI not found. Install it and sign in, or set MONOCODE_{}_BINARY.",
@@ -438,7 +461,14 @@ fn run_turn_using(
             prompt
         } else if let Some(mono) = &settings.mono {
             let files = monocode_core::mono::load_files(&mono.root, &mono.mono)?;
-            let added = monocode_core::mono::context(&mono.mono, &files, &mono.executable);
+            let durable = monocode_core::tasks::coordinator::enabled(&*locked(&store)?);
+            let added = monocode_core::mono::context_with(
+                &mono.mono,
+                &files,
+                &mono.executable,
+                Some(&launch_cwd),
+                durable,
+            );
             let fingerprint = monocode_core::mono::files::content_hash(&added);
             mono_fingerprint = Some(fingerprint.clone());
             let rotated = provider_id.is_some() && context.ratio().is_some_and(|r| r >= 0.8);
@@ -560,17 +590,18 @@ fn run_turn_using(
         let request = Request {
             kind,
             binary,
-            cwd: settings
-                .worktree_cwd
-                .as_deref()
-                .unwrap_or(&summary.cwd)
-                .into(),
+            cwd: launch_cwd,
             prompt,
             provider_id: provider_id.clone(),
             model: settings.model.clone(),
             settings,
         };
         let mut tool_rows = std::collections::HashMap::new();
+        let auth_started = monocode_core::time::now_ms();
+        let auth_account = request.settings.account.id.clone();
+        let auth_api = request.settings.use_api_key;
+        let capability_redactor = capabilities::Redactor::new(&request.settings.environment);
+        let mut authenticated_reply = false;
         // The running-work list attributes the provider and its tools to this session.
         let result = monocode_core::process::owned_by(summary.id, || {
             provider::run_with_controls(request, cancel.clone(), Some(controls), |events| {
@@ -680,6 +711,8 @@ fn run_turn_using(
                             }
                         }
                         Event::Text(text) => {
+                            let text = capability_redactor.text(text);
+                            authenticated_reply |= !text.trim().is_empty();
                             if transcript.rows.last().is_none_or(|r| r.role != "assistant") {
                                 start = start.min(transcript.begin("assistant"));
                             }
@@ -691,6 +724,7 @@ fn run_turn_using(
                             if text.is_empty() {
                                 continue;
                             }
+                            let text = capability_redactor.text(text);
                             if transcript.rows.last().is_none_or(|r| r.role != "reasoning") {
                                 start = start.min(transcript.begin("reasoning"));
                             }
@@ -699,6 +733,7 @@ fn run_turn_using(
                             pending.changed(at);
                         }
                         Event::Tool(tool) => {
+                            let tool = capability_redactor.tool(tool);
                             if tool.is_compaction() {
                                 status = if tool.state == monocode_core::tool::ToolState::Running {
                                     "Compacting context…"
@@ -884,6 +919,20 @@ fn run_turn_using(
                 publication_result
             })
         });
+        if result.is_ok() && authenticated_reply && !cancel.load(Ordering::Relaxed) {
+            // A model response proves authentication; startup/MCP status alone
+            // does not. Never let API billing validate subscription credentials.
+            if let Ok(store) = locked(&store) {
+                let _ = monocode_core::accounts::eligibility::verified_subscription_turn(
+                    &store,
+                    kind.id(),
+                    &auth_account,
+                    auth_started,
+                    auth_api,
+                    monocode_core::time::now_ms(),
+                );
+            }
+        }
         if result.is_ok()
             && let Some(fingerprint) = &mono_fingerprint
         {

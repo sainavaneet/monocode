@@ -160,3 +160,81 @@ fn delivery_receipt_is_saved_with_the_user_message() {
         Some("1")
     );
 }
+
+#[test]
+fn the_context_states_the_session_project_for_a_multi_project_mono_and_the_plan_format_when_on() {
+    let root = std::env::temp_dir().join(format!("mono-context-{}", new_id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let files = files::load(&root, "m", None).unwrap();
+    let mut mono = Mono {
+        projects: vec!["/code/a".into(), "/code/b".into()],
+        ..Default::default()
+    };
+    let exe = Path::new("/app/monocode-gpui");
+    let quick = context_with(&mono, &files, exe, Some(Path::new("/code/a")), false);
+    assert!(quick.contains("Your provider session runs in /code/a"));
+    assert!(quick.contains("1. Answer directly"));
+    assert!(!quick.contains("3. Durable task plan"));
+    assert!(!quick.contains("<monocode_orchestration>"));
+    let durable = context_with(&mono, &files, exe, Some(Path::new("/code/a")), true);
+    assert!(durable.contains("3. Durable task plan"));
+    assert!(durable.contains("Plan format (route 3):"));
+    assert!(durable.contains("<monocode_orchestration>"));
+    assert!(!durable.contains("Prepare an orchestration plan for the user's request"));
+    // One project: nothing to disambiguate.
+    mono.projects.truncate(1);
+    let single = context_with(&mono, &files, exe, Some(Path::new("/code/a")), false);
+    assert!(!single.contains("Your provider session runs in"));
+    assert_eq!(
+        context(&mono, &files, exe),
+        context_with(&mono, &files, exe, None, false)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_plan_runs_in_the_one_assigned_project_its_assignments_name() {
+    use crate::orchestration::{Plan, Task};
+    let task = |id: &str, repository: Option<&str>| Task {
+        id: id.into(),
+        repository: repository.map(str::to_owned),
+        ..Default::default()
+    };
+    let plan = |tasks: Vec<Task>| Plan {
+        title: "P".into(),
+        summary: String::new(),
+        tasks,
+    };
+    let mut mono = Mono {
+        projects: vec!["/code/app".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        mono.plan_project(&plan(vec![task("a", None)])).unwrap(),
+        "/code/app"
+    );
+    mono.projects.push("/code/lib".into());
+    let by_path = plan(vec![task("a", Some("/code/lib")), task("b", Some("lib"))]);
+    assert_eq!(mono.plan_project(&by_path).unwrap(), "/code/lib");
+    let inside = plan(vec![task("a", Some("/code/app/packages/web"))]);
+    assert_eq!(mono.plan_project(&inside).unwrap(), "/code/app");
+    let missing = mono.plan_project(&plan(vec![task("a", None)])).unwrap_err();
+    assert!(
+        missing.contains("give assignment a a repository"),
+        "{missing}"
+    );
+    let foreign = mono
+        .plan_project(&plan(vec![task("a", Some("/elsewhere"))]))
+        .unwrap_err();
+    assert!(
+        foreign.contains("not one of this Mono's projects"),
+        "{foreign}"
+    );
+    let split = plan(vec![task("a", Some("app")), task("b", Some("lib"))]);
+    assert!(mono
+        .plan_project(&split)
+        .unwrap_err()
+        .contains("one plan per project"));
+    mono.projects.clear();
+    assert!(mono.plan_project(&by_path).is_err());
+}

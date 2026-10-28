@@ -30,6 +30,8 @@ impl Monos {
                 let key = format!("{id}:SOUL.md");
                 this.fields.remove(&format!("file:{key}"));
                 this.file_versions.remove(&key);
+                this.file_hashes.remove(&key);
+                this.file_conflicts.remove(&key);
                 if this.active.as_deref() == Some(&id) {
                     this.files = Some(files);
                 }
@@ -49,8 +51,13 @@ impl Monos {
     ) -> Entity<Input> {
         let key = format!("{}:{path}", self.active.as_deref().unwrap_or_default());
         let field_key = format!("file:{key}");
+        // A version this editor already opened or saved is not news: a
+        // reload that started before a save and landed after it must not
+        // revert the editor to the text it had before.
+        let seen = self.remember_hash(&key, &hash);
         if let Some((old, old_hash)) = self.file_versions.get(&key)
             && old_hash != &hash
+            && !seen
             && !self.saving_files.contains(&key)
             && let Some(field) = self
                 .fields
@@ -65,6 +72,21 @@ impl Monos {
             .entry(key)
             .or_insert((text.clone(), hash));
         self.field(&field_key, "Markdown", text, true, cx)
+    }
+
+    /// Records `hash` as a version the editor for `key` knows; true when it
+    /// already did.
+    fn remember_hash(&mut self, key: &str, hash: &str) -> bool {
+        const REMEMBERED: usize = 8;
+        let known = self.file_hashes.entry(key.to_owned()).or_default();
+        if known.iter().any(|h| h == hash) {
+            return true;
+        }
+        known.push(hash.to_owned());
+        if known.len() > REMEMBERED {
+            known.remove(0);
+        }
+        false
     }
     pub(super) fn soul_page(&mut self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
         let body = if let Some(files) = self.files.clone() {
@@ -104,6 +126,7 @@ impl Monos {
                 .into_any_element()
         };
         let _ = mono;
+        let conflict = self.conflict_bar("SOUL.md", cx);
         div()
             .id("mono-soul-page")
             .debug_selector(|| "mono-soul-page".into())
@@ -113,6 +136,7 @@ impl Monos {
             .flex_col()
             .child(Self::settings_page_header("Soul"))
             .child(body)
+            .children(conflict)
             .into_any_element()
     }
     pub(super) fn settings_page_header(title: &'static str) -> gpui::Div {
@@ -168,7 +192,19 @@ impl Monos {
             let target = id.clone();
             let content = text.clone();
             let work = cx.background_executor().spawn(async move {
-                files::save(&root, &target, None, &path, &content, Some(&hash))
+                match files::save(&root, &target, None, &path, &content, Some(&hash)) {
+                    Ok(hash) => Ok(hash),
+                    // A conflict: say what the disk holds now, so the editor
+                    // can tell hash drift from a real change.
+                    Err(e) if e == files::CONFLICT => {
+                        match files::read(&root, &target, None, &path) {
+                            Ok(disk) => Err((disk.text.unwrap_or_default(), disk.hash)),
+                            Err(e) => Err((e, String::new())),
+                        }
+                    }
+                    Err(e) => Err((e, String::new())),
+                }
+                .map_err(|(text, hash)| (path, text, hash))
             });
             cx.spawn(async move |this, cx| {
                 let result = work.await;
@@ -176,13 +212,26 @@ impl Monos {
                     this.saving_files.remove(&key);
                     match result {
                         Ok(hash) => {
-                            this.file_versions.insert(key, (text, hash));
+                            this.file_conflicts.remove(&key);
+                            this.adopt_saved(&key, &text, &hash);
                             this.reload_files(&id, cx);
                         }
-                        Err(e) => {
+                        Err((_, error, disk_hash)) if disk_hash.is_empty() => {
                             this.error = Some(format!(
-                                "Could not save: {e}. Your edits are still in the editor."
+                                "Could not save: {error}. Your edits are still in the editor."
                             ))
+                        }
+                        // The disk still holds the text the editor opened:
+                        // only the hash drifted, so adopt it and save again.
+                        Err((_, disk, disk_hash)) if disk == old => {
+                            this.file_versions.insert(key, (old, disk_hash));
+                            this.save_open_file(cx);
+                        }
+                        Err((path, disk, disk_hash)) => {
+                            this.file_conflicts.insert(key, (disk, disk_hash));
+                            this.error = Some(format!(
+                                "{path} changed on disk while you were editing (your Mono or another window wrote it). Your edits are still in the editor: choose Keep mine or Take theirs below the editor."
+                            ));
                         }
                     }
                     cx.notify();
@@ -190,6 +239,99 @@ impl Monos {
             })
             .detach();
         }
+    }
+
+    /// The editor's saved version, and the loaded files with it, so a
+    /// render before the reload finishes does not revert the editor to the
+    /// stale copy (which used to leave the editor with a dead hash and every
+    /// later save in conflict).
+    fn adopt_saved(&mut self, key: &str, text: &str, hash: &str) {
+        self.remember_hash(key, hash);
+        self.file_versions
+            .insert(key.to_owned(), (text.to_owned(), hash.to_owned()));
+        if key.ends_with(":SOUL.md")
+            && let Some(files) = &mut self.files
+        {
+            files.soul = Some(text.to_owned());
+            files.soul_hash = hash.to_owned();
+        }
+    }
+
+    /// Resolves a save conflict: keep the editor's text (overwrite the disk)
+    /// or take the disk's text (discard the edits).
+    pub(super) fn resolve_file_conflict(
+        &mut self,
+        path: &str,
+        keep_mine: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.active.clone() else {
+            return;
+        };
+        let key = format!("{id}:{path}");
+        let Some((disk, disk_hash)) = self.file_conflicts.remove(&key) else {
+            return;
+        };
+        self.error = None;
+        if !keep_mine {
+            if let Some(field) = self.fields.get(&format!("file:{key}")) {
+                field.update(cx, |f, cx| f.set_text(disk.clone(), cx));
+            }
+            self.adopt_saved(&key, &disk, &disk_hash);
+            self.reload_files(&id, cx);
+            cx.notify();
+            return;
+        }
+        // Mine: the disk's current hash is what the save expects now.
+        if let Some((_, hash)) = self.file_versions.get_mut(&key) {
+            *hash = disk_hash;
+        }
+        self.save_open_file(cx);
+    }
+
+    /// The bar under a file editor whose save conflicted.
+    fn conflict_bar(&self, path: &'static str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let key = format!("{}:{path}", self.active.as_deref().unwrap_or_default());
+        if !self.file_conflicts.contains_key(&key) {
+            return None;
+        }
+        let button = |id: &'static str, label: &'static str, keep: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .role(Role::Button)
+                .aria_label(label)
+                .cursor_pointer()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(content(0.08))
+                .hover(|s| s.bg(content(0.14)))
+                .text_size(px(12.))
+                .child(label)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.resolve_file_conflict(path, keep, cx)),
+                )
+        };
+        Some(
+            div()
+                .id("mono-file-conflict")
+                .debug_selector(|| "mono-file-conflict".into())
+                .flex_shrink_0()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(content(0.06))
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(content(0.7))
+                .child(div().flex_1().child(format!("{path} changed on disk.")))
+                .child(button("mono-file-keep-mine", "Keep mine", true))
+                .child(button("mono-file-take-theirs", "Take theirs", false))
+                .into_any_element(),
+        )
     }
 
     pub(super) fn file_work(

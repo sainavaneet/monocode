@@ -370,7 +370,9 @@ pub(crate) fn mono_work_label(source: &[Row], group: usize) -> String {
         .unwrap_or(source.len());
     let mut thought = 0usize;
     let mut latest = None;
-    for (ix, row) in source[turn..end].iter().enumerate() {
+    let mut running = Vec::new();
+    for at in turn..end {
+        let row = &source[at];
         if !row.first {
             continue;
         }
@@ -379,17 +381,26 @@ pub(crate) fn mono_work_label(source: &[Row], group: usize) -> String {
                 thought += 1;
                 latest = None;
             }
-            "tool" => latest = Some(turn + ix),
+            "tool" => {
+                let stop = (at + 1..end).find(|&i| source[i].first).unwrap_or(end);
+                let text: String = source[at..stop].iter().map(|r| r.text.as_str()).collect();
+                if let Ok(tool) = serde_json::from_str::<ToolCall>(&text) {
+                    // Provider initialization inventory is diagnostic history, not work.
+                    if tool.id == "monocode-mcp-startup" {
+                        continue;
+                    }
+                    if tool.state == ToolState::Running {
+                        running.push(tool.clone());
+                    }
+                    latest = Some(tool);
+                }
+            }
             _ => {}
         }
     }
-    let Some(tool) = latest.and_then(|at| {
-        let end = (at + 1..source.len())
-            .find(|&i| source[i].first)
-            .unwrap_or(source.len());
-        let text: String = source[at..end].iter().map(|r| r.text.as_str()).collect();
-        serde_json::from_str::<ToolCall>(&text).ok()
-    }) else {
+    // A later completion or commentary must not hide another in-flight call.
+    let active_count = running.len();
+    let Some(tool) = running.pop().or(latest) else {
         return THINKING[thought.saturating_sub(1) % THINKING.len()].into();
     };
     if tool.is_milestone() {
@@ -401,15 +412,24 @@ pub(crate) fn mono_work_label(source: &[Row], group: usize) -> String {
             "Compacting context…".into()
         };
     }
-    match tool.summary().0.as_str() {
-        "Run" => "Running command…",
-        "Edit" | "Write" => "Editing file…",
-        "Read" => "Reading file…",
-        "Find" | "List" | "Search" | "Glob" | "Grep" => "Exploring project…",
-        "Agent" | "Task" => "Running agent…",
-        _ => "Using tool…",
+    // Name only: never copy arbitrary command arguments or credentials to the sidebar.
+    let name: String = tool
+        .name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(100)
+        .collect();
+    let label = match tool.state {
+        ToolState::Running => format!("Running {name}…"),
+        ToolState::Completed => format!("Reviewing {name} result…"),
+        ToolState::Failed => format!("{name} failed"),
+        ToolState::Cancelled => format!("{name} cancelled"),
+    };
+    if active_count > 1 {
+        format!("{label} · +{} running", active_count - 1)
+    } else {
+        label
     }
-    .into()
 }
 /// isEmojiOnlyMessage: up to three emoji, which read as a reaction.
 pub(crate) fn is_emoji_only(text: &str) -> bool {
@@ -587,9 +607,11 @@ impl TranscriptView {
     pub(crate) fn side_question(&mut self) {
         self.side_question = true;
     }
-    pub(crate) fn activity(rows: Vec<Row>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn activity(rows: Vec<Row>, live: bool, cx: &mut Context<Self>) -> Self {
         let mut view = Self::new();
         view.document = true;
+        view.streaming = live;
+        view.started = live.then(Instant::now);
         view.patch(0, rows, cx);
         view
     }
@@ -992,7 +1014,11 @@ impl TranscriptView {
                     .size(px(14.))
                     .flex_shrink_0()
                     .child(crate::monos::avatar::avatar(
-                        &mascot, color, "idle", 14., true,
+                        &mascot,
+                        color,
+                        if label.is_some() { "working" } else { "idle" },
+                        14.,
+                        label.is_none(),
                     )),
             )
             .child(
@@ -1015,31 +1041,30 @@ impl TranscriptView {
             .text_color(content(0.5))
             .child(pill)
             .when_some(label, |d, label| {
-                d.child(div().flex_shrink_0().text_color(content(0.25)).child("·"))
-                    .child(
-                        div()
-                            .id(("mono-turn-ticker", turn))
-                            .debug_selector(|| "mono-turn-ticker".into())
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .hover(|s| s.opacity(0.7))
-                            .child(if cx.reduce_motion() {
-                                div().child(label).into_any_element()
-                            } else {
-                                crate::activity::shimmer(
-                                    label,
-                                    self.started.map_or(0., |s| s.elapsed().as_secs_f32()),
-                                )
-                            })
-                            .when(turn < self.source.len(), |d| {
-                                d.role(Role::Button).aria_label("Show activity").on_click(
-                                    cx.listener(move |_, _, _, cx| {
-                                        cx.emit(MonoResponseAction::Activity(turn))
-                                    }),
-                                )
-                            }),
-                    )
+                d.child(div().text_color(content(0.25)).child("·")).child(
+                    div()
+                        .id(("mono-turn-ticker", turn))
+                        .debug_selector(|| "mono-turn-ticker".into())
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .hover(|s| s.opacity(0.7))
+                        .child(if cx.reduce_motion() {
+                            div().child(label).into_any_element()
+                        } else {
+                            crate::activity::shimmer(
+                                label,
+                                self.started.map_or(0., |s| s.elapsed().as_secs_f32()),
+                            )
+                        })
+                        .when(turn < self.source.len(), |d| {
+                            d.role(Role::Button)
+                                .aria_label("Show activity")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(MonoResponseAction::Activity(turn))
+                                }))
+                        }),
+                )
             })
             .into_any_element()
     }

@@ -656,6 +656,135 @@ fn identity_and_context_editors_survive_switches_and_save_to_their_own_files(
         })
     });
 }
+/// A render between the save and the reload used to adopt the stale loaded
+/// copy, revert the editor and leave it with a dead hash, so every later
+/// save conflicted. The saved version wins, and a second save succeeds.
+#[gpui::test]
+fn the_soul_editor_keeps_its_saved_text_across_a_stale_render_and_saves_again(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let key = format!("file:{}:SOUL.md", s.id);
+    let stale = cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            m.settings = Some(SettingsSection::Soul);
+            let mono = m.current().unwrap().clone();
+            let _ = m.soul_page(&mono, cx);
+            let stale = m.files.clone().unwrap();
+            m.fields[&key].update(cx, |f, cx| f.set_text("# Soul\nA\n".into(), cx));
+            m.save_open_file(cx);
+            stale
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            // The reload has not landed: the loaded files are the old copy.
+            m.files = Some(stale);
+            let mono = m.current().unwrap().clone();
+            let _ = m.soul_page(&mono, cx);
+            assert_eq!(m.fields[&key].read(cx).content.as_str(), "# Soul\nA\n");
+            m.fields[&key].update(cx, |f, cx| f.set_text("# Soul\nB\n".into(), cx));
+            m.save_open_file(cx);
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        mono::files::read(&s.root, &s.id, None, "SOUL.md")
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("# Soul\nB\n")
+    );
+    cx.update(|cx| {
+        let m = s.manager.read(cx);
+        assert!(m.error.is_none(), "{:?}", m.error);
+        assert!(m.file_conflicts.is_empty());
+    });
+}
+
+/// A real conflict (the Mono or another window wrote the file) keeps the
+/// edits and offers Keep mine / Take theirs instead of a dead end.
+#[gpui::test]
+fn a_real_soul_conflict_is_resolved_by_keeping_mine_or_taking_theirs(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let key = format!("file:{}:SOUL.md", s.id);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            m.settings = Some(SettingsSection::Soul);
+            let mono = m.current().unwrap().clone();
+            let _ = m.soul_page(&mono, cx);
+            m.fields[&key].update(cx, |f, cx| f.set_text("# Soul\nmine\n".into(), cx));
+        })
+    });
+    // Written out of band while the editor was open.
+    mono::files::save(&s.root, &s.id, None, "SOUL.md", "# Soul\ntheirs\n", None).unwrap();
+    cx.update(|cx| s.manager.update(cx, |m, cx| m.save_open_file(cx)));
+    cx.run_until_parked();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.refresh().unwrap();
+    visual.update(|_, cx| {
+        let m = s.manager.read(cx);
+        assert!(
+            m.error
+                .as_deref()
+                .is_some_and(|e| e.contains("changed on disk")),
+            "{:?}",
+            m.error
+        );
+        assert_eq!(m.fields[&key].read(cx).content.as_str(), "# Soul\nmine\n");
+    });
+    assert_eq!(
+        mono::files::read(&s.root, &s.id, None, "SOUL.md")
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("# Soul\ntheirs\n")
+    );
+    let keep = visual
+        .debug_bounds("mono-file-keep-mine")
+        .expect("conflict bar offers Keep mine");
+    assert!(visual.debug_bounds("mono-file-take-theirs").is_some());
+    visual.simulate_click(keep.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(
+        mono::files::read(&s.root, &s.id, None, "SOUL.md")
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("# Soul\nmine\n")
+    );
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("mono-file-keep-mine").is_none());
+    visual.update(|_, cx| assert!(s.manager.read(cx).error.is_none()));
+
+    // Take theirs: the editor shows the disk's text and nothing is written.
+    mono::files::save(&s.root, &s.id, None, "SOUL.md", "# Soul\nnewer\n", None).unwrap();
+    visual.update(|_, cx| {
+        s.manager.update(cx, |m, cx| {
+            m.fields[&key].update(cx, |f, cx| f.set_text("# Soul\nmine again\n".into(), cx));
+            m.save_open_file(cx);
+        })
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let take = visual.debug_bounds("mono-file-take-theirs").unwrap();
+    visual.simulate_click(take.center(), Default::default());
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        let m = s.manager.read(cx);
+        assert_eq!(m.fields[&key].read(cx).content.as_str(), "# Soul\nnewer\n");
+        assert!(m.file_conflicts.is_empty());
+    });
+    assert_eq!(
+        mono::files::read(&s.root, &s.id, None, "SOUL.md")
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("# Soul\nnewer\n")
+    );
+}
+
 #[gpui::test]
 fn app_receipt_lookup_does_not_wait_for_storage_on_the_ui_thread(cx: &mut TestAppContext) {
     let s = setup(cx);
@@ -768,7 +897,28 @@ fn app_actions_are_project_scoped_and_mutation_retries_are_idempotent(cx: &mut T
             .unwrap()
             .is_err()
     );
-    let start=call(&s,"draft","sessions.start",json!({"project":s.project,"prompt":"Review the project","title":"Review draft","draft":true}),cx).try_recv().unwrap().unwrap();
+    let rejected = call(
+        &s,
+        "invalid-brief",
+        "sessions.start",
+        json!({"project":s.project,"prompt":"Review","draft":true,"brief":{"objective":"Review"}}),
+        cx,
+    )
+    .try_recv()
+    .unwrap();
+    assert!(rejected.is_err());
+    cx.update(|cx| {
+        assert!(
+            s.manager
+                .read(cx)
+                .roster
+                .get(&s.id)
+                .unwrap()
+                .launches
+                .is_empty()
+        )
+    });
+    let start=call(&s,"draft","sessions.start",json!({"project":s.project,"prompt":"Review the project","title":"Review draft","draft":true,"brief":{"objective":"Review parser", "context":"src/parser.rs; unverified", "constraints":"Read only", "deliverable":"Findings", "verification":"Cite file evidence"}}),cx).try_recv().unwrap().unwrap();
     let child = start["sessionId"].as_i64().unwrap();
     cx.update(|cx| {
         let m = s.manager.read(cx);
@@ -776,16 +926,18 @@ fn app_actions_are_project_scoped_and_mutation_retries_are_idempotent(cx: &mut T
         let owner = m.owner.upgrade().unwrap();
         let view = owner.read(cx).mono_session_entity(child).unwrap();
         assert!(view.read(cx).has_saved_draft());
-        assert_eq!(
-            locked(&s.store)
-                .unwrap()
-                .follow_ups(child)
-                .unwrap()
-                .draft
-                .unwrap()
-                .text,
-            "Review the project"
-        );
+        assert_eq!(view.read(cx).settings.access, AccessMode::FullAccess);
+        let draft = locked(&s.store)
+            .unwrap()
+            .follow_ups(child)
+            .unwrap()
+            .draft
+            .unwrap()
+            .text;
+        assert!(draft.starts_with("Review the project"));
+        assert!(draft.contains("src/parser.rs; unverified"));
+        assert!(draft.contains("Cite file evidence"));
+        assert!(draft.contains("Read only"));
         assert!(!view.read(cx).busy);
         assert!(m.hidden_session(child));
     });
@@ -895,6 +1047,18 @@ fn queued_messages_are_saved_before_dispatch_and_do_not_run_while_blocked(cx: &m
     cx.run_until_parked();
     let saved = Roster::load(&locked(&s.store).unwrap()).unwrap();
     assert_eq!(saved.monos[0].outbox[0].id, message);
+    s.manager
+        .update(cx, |m, cx| m.queue_changed(&s.id, &message, true, cx));
+    cx.run_until_parked();
+    assert!(
+        Roster::load(&locked(&s.store).unwrap())
+            .unwrap()
+            .get(&s.id)
+            .unwrap()
+            .outbox
+            .is_empty(),
+        "removing a blocked request must persist without running it"
+    );
     assert_eq!(
         locked(&s.store)
             .unwrap()
@@ -1747,4 +1911,67 @@ fn habits_and_documents_search_like_sessions(cx: &mut TestAppContext) {
     search(visual, "mono-document-search", "release");
     assert!(visual.debug_bounds("mono-document-plan").is_none());
     assert!(visual.debug_bounds("mono-document-summary").is_some());
+}
+
+#[gpui::test]
+fn sidebar_worker_group_reuses_saved_chat_and_collapses(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    s.manager.update(cx, |m, cx| {
+        m.settings = None;
+        cx.notify();
+    });
+    let started = call(&s, "sidebar-worker", "sessions.start",
+        json!({"project":s.project,"prompt":"Review quietly","title":"Sidebar worker","draft":true}), cx)
+        .try_recv().unwrap().unwrap();
+    let child = started["sessionId"].as_i64().unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    visual.refresh().unwrap();
+    let header: &'static str = Box::leak(format!("mono-workers-{}", s.id).into_boxed_str());
+    let row: &'static str = Box::leak(format!("sidebar-session-{child}").into_boxed_str());
+    assert!(visual.debug_bounds(row).is_some());
+    let toggle = visual.debug_bounds(header).unwrap();
+    visual.simulate_click(toggle.center(), Default::default());
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds(row).is_none());
+    let toggle = visual.debug_bounds(header).unwrap();
+    visual.simulate_click(toggle.center(), Default::default());
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let worker = visual.debug_bounds(row).unwrap();
+    visual.simulate_click(worker.center(), Default::default());
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    s.window
+        .update(visual, |shell, _, _| {
+            assert_eq!(shell.workspace.active, Some(child))
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn sidebar_activity_shows_single_mono_and_hides_when_idle(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let chat = s.manager.update(cx, |m, cx| {
+        m.settings = None;
+        cx.notify();
+        m.open_chat(&s.id).unwrap()
+    });
+    chat.update(cx, |view, cx| {
+        view.busy = true;
+        cx.notify();
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("sidebar-activity-card").is_some());
+    chat.update(visual, |view, cx| {
+        view.busy = false;
+        cx.notify();
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("sidebar-activity-card").is_none());
 }

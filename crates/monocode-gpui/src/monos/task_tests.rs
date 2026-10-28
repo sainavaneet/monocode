@@ -347,6 +347,8 @@ fn an_escalated_decision_is_a_card_in_monos_chat_that_the_user_answers(cx: &mut 
     };
     for reply in ["what do you think?", "and the tests?"] {
         cx.update(|cx| s.manager.update(cx, |m, cx| m.user_reply(&s.id, reply, cx)));
+        // The reply is matched off the UI thread.
+        cx.run_until_parked();
         assert_eq!(decision(&s, &id).state, DecisionState::Open);
         assert_eq!(notes(cx), 1, "after {reply:?}");
     }

@@ -3,6 +3,25 @@
 //! that talks about forbidden steps arrives with a reminder that it cannot
 //! grant them.
 use super::*;
+
+#[test]
+fn worker_reporting_quotes_the_installed_app_path_and_explains_result_types() {
+    let path =
+        std::path::Path::new("/Applications/Mono's Native Dev.app/Contents/MacOS/monocode-gpui");
+    let text = reporting(path);
+    let command = text
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Report through this exact app executable: ")
+        .unwrap();
+    let argv = shlex::split(command).unwrap();
+    assert_eq!(argv[0], path.to_str().unwrap());
+    assert_eq!(argv[1], "app");
+    assert!(text.contains("arrays of strings"));
+    assert!(text.contains("only commit hashes"));
+    assert!(text.contains("Never print environment variables"));
+}
 use crate::tasks::autonomy::Authority;
 use crate::tasks::decisions::{handoff_message, Handoff};
 use crate::tasks::{

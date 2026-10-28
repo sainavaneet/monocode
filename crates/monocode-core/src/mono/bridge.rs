@@ -21,7 +21,8 @@ Actions:
 models.list {}
 sessions.list {project?}
 sessions.read {sessionId,project?,before?,limit?,maxChars?}
-sessions.start {prompt,project?,harness?,model?,modelSettings?,effort?,runtimeMode?,title?,draft?,reveal?,workspaceMode?,worktreeBase?,worktreeCwd?,placement?,besideSessionId?,notifyOnComplete?}
+sessions.start {prompt,project?,brief?,harness?,model?,modelSettings?,effort?,runtimeMode?,title?,draft?,reveal?,workspaceMode?,worktreeBase?,worktreeCwd?,placement?,besideSessionId?,notifyOnComplete?}
+brief {objective,context,constraints,deliverable,verification} is the worker's assignment (five nonblank texts); a Mono sends it with every launch. workspaceMode worktree gives the worker its own branch and worktree. For a Mono, notifyOnComplete defaults to true for a sent prompt: one completion report arrives in your chat once every session started in the same turn has stopped, with each worker's outcome (ready, failed, stopped or waiting on the user) and its final message.
 sessions.send {sessionId,prompt,project?,notifyOnComplete?}
 sessions.draft {sessionId,prompt,project?}
 sessions.stop / sessions.archive / sessions.delete {sessionId,project?}

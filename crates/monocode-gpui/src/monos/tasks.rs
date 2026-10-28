@@ -21,7 +21,103 @@ type Pass = (
     Vec<(String, Vec<TaskMonitor>)>,
 );
 
+/// Put the work that is actually moving now ahead of older orchestration
+/// records. Storage deliberately uses creation order, but presentation must
+/// not let an older, all-workers-finished task become the Mono's headline
+/// while another task has a live worker.
+pub(super) fn task_display_priority(task: &TaskMonitor) -> (u8, std::cmp::Reverse<u64>) {
+    use monocode_core::tasks::lifecycle::Display;
+
+    let rank = if task.control.display == Display::Completed {
+        4
+    } else if task.working() > 0 {
+        0
+    } else if task.for_user() > 0 || task.recovering {
+        1
+    } else if task.activity == view::MonoActivity::Reviewing {
+        2
+    } else {
+        3
+    };
+    let newest = task
+        .last_worker_activity
+        .into_iter()
+        .chain(task.last_mono_review)
+        .chain(task.latest().map(|entry| entry.at))
+        .max()
+        .unwrap_or_default();
+    (rank, std::cmp::Reverse(newest))
+}
+
 impl Monos {
+    pub(super) fn start_chat_plan(
+        &mut self,
+        mono: &str,
+        view: &Entity<Conversation>,
+        plan: monocode_core::orchestration::Plan,
+        cx: &mut Context<Self>,
+    ) {
+        use monocode_core::tasks::{NewTask, policy};
+        if !self.tasks_enabled() || view.read(cx).busy {
+            return;
+        }
+        let chat = view.read(cx);
+        let lead = chat.summary.id;
+        let Some(owner) = self.roster.get(mono).filter(|m| m.session_id == Some(lead)) else {
+            return;
+        };
+        // Mono chats run in the user's home directory, not the assigned repo:
+        // the task runs in the assigned project the plan names, never a guess.
+        let project = match owner.plan_project(&plan) {
+            Ok(project) => project,
+            Err(error) => {
+                self.error = Some(format!("To start this plan: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let provider = chat.summary.provider.clone();
+        let new = NewTask {
+            id: format!("{}{}", policy::plan_task_prefix(lead), mono::new_id()),
+            mono_id: Some(mono.to_owned()),
+            project,
+            title: plan.title.clone(),
+            request: plan.summary.clone(),
+            criteria: policy::plan_criteria(&plan),
+        };
+        let store = self.store.clone();
+        let view = view.downgrade();
+        let work = cx.background_executor().spawn(async move {
+            let store = locked(&store)?;
+            if !policy::started_plans(&store, lead)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            {
+                return Err("A task from this chat's plan is still running.".to_owned());
+            }
+            policy::start_plan(&store, &new, &plan, &provider, Requester::User, now_ms())
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        let _ = view.update(cx, |v, cx| {
+                            v.clear_saved_proposal();
+                            cx.notify();
+                        });
+                        this.pump_tasks(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// `tasks.decisions.*`, `tasks.review.*` and `tasks.criteria.verify` from
     /// a Mono's chat. A habit run cannot act on tasks; the Mono comes from
     /// the calling session, never from the input.
@@ -168,9 +264,16 @@ impl Monos {
             })
             .unwrap_or_default();
         let mut changed = false;
-        for (mono, tasks) in monitors {
+        for (mono, mut tasks) in monitors {
+            tasks.sort_by_key(task_display_priority);
             if let Some(chat) = self.chats.get(&mono) {
-                let rows = tasks.iter().map(|t| t.control.clone()).collect();
+                // A completed task has no controls left; its card shows the
+                // report instead of a control row.
+                let rows = tasks
+                    .iter()
+                    .filter(|t| t.report.is_none())
+                    .map(|t| t.control.clone())
+                    .collect();
                 let sessions: Vec<i64> = tasks
                     .iter()
                     .flat_map(|t| t.workers.iter().filter_map(|w| w.session))
@@ -181,7 +284,7 @@ impl Monos {
                     chat.set_task_monitor(shown, cx);
                     for session in sessions {
                         if let Some(state) = live.get(&session) {
-                            chat.set_worker_live(session, *state, cx);
+                            chat.set_worker_live(session, state.clone(), cx);
                         }
                     }
                 });
@@ -194,6 +297,30 @@ impl Monos {
         if changed {
             cx.notify();
         }
+    }
+
+    /// The user hid a completed task's report: it leaves the card now and
+    /// the store remembers, so the next pump does not bring it back.
+    pub(crate) fn dismiss_task_report(&mut self, mono: &str, task: &str, cx: &mut Context<Self>) {
+        if let Some(tasks) = self.task_monitors.get_mut(mono) {
+            tasks.retain(|t| t.control.task_id != task);
+            let shown = tasks.clone();
+            if let Some(chat) = self.chats.get(mono) {
+                chat.update(cx, |chat, cx| chat.set_task_monitor(shown, cx));
+            }
+        }
+        let store = self.store.clone();
+        let task = task.to_owned();
+        cx.background_executor()
+            .spawn(async move {
+                let result = locked(&store)
+                    .and_then(|db| monocode_core::tasks::lifecycle::dismiss_report(&db, &task));
+                if let Err(error) = result {
+                    eprintln!("Mono task report {task}: {error}");
+                }
+            })
+            .detach();
+        cx.notify();
     }
 
     /// The sidebar badge of a Mono's tasks (see `tasks::view::Badge`).
@@ -214,6 +341,19 @@ impl Monos {
         badges
     }
 
+    /// The Mono and orchestration task that own a worker session. The global
+    /// Activity list uses this to keep the lead above its visible workers.
+    pub(crate) fn task_worker_owner(&self, session: i64) -> Option<(String, String)> {
+        self.task_monitors.iter().find_map(|(mono, tasks)| {
+            tasks.iter().find_map(|task| {
+                task.workers
+                    .iter()
+                    .any(|worker| worker.session == Some(session))
+                    .then(|| (mono.clone(), task.control.title.clone()))
+            })
+        })
+    }
+
     /// A worker session changed in the app: its Mono's card shows it now,
     /// before the next store read.
     pub(crate) fn task_worker_changed(
@@ -227,7 +367,10 @@ impl Monos {
                 .iter()
                 .any(|t| t.workers.iter().any(|w| w.session == Some(session)));
             if let (true, Some(chat)) = (ours, self.chats.get(mono)) {
-                chat.update(cx, |chat, cx| chat.set_worker_live(session, live, cx));
+                chat.update(cx, |chat, cx| {
+                    chat.set_worker_live(session, live.clone(), cx)
+                });
+                cx.notify();
             }
         }
     }
@@ -389,54 +532,89 @@ impl Monos {
     }
 
     /// A message the user sent in a Mono's chat answers a decision card only
-    /// when it does so unambiguously; otherwise the app asks.
+    /// when it does so unambiguously; otherwise the app asks. The store is
+    /// read and written off the UI thread: this runs on every message.
     pub(super) fn user_reply(&mut self, mono: &str, text: &str, cx: &mut Context<Self>) {
-        let matched = locked(&self.store).and_then(|db| {
+        enum Outcome {
+            Answered,
+            AnswerFailed(String),
+            Unclear(Vec<String>),
+            None,
+        }
+        let store = self.store.clone();
+        let mono_id = mono.to_owned();
+        let text = text.to_owned();
+        let work = cx.background_executor().spawn(async move {
+            let db = locked(&store)?;
             if !coordinator::enabled(&db) {
-                return Ok(ReplyMatch::None);
+                return Ok::<Outcome, String>(Outcome::None);
             }
-            match db.existing_tasks().map_err(|e| e.to_string())? {
-                Some(tasks) => tasks
-                    .match_user_reply(mono, text)
-                    .map_err(|e| e.to_string()),
-                None => Ok(ReplyMatch::None),
+            let Some(tasks) = db.existing_tasks().map_err(|e| e.to_string())? else {
+                return Ok(Outcome::None);
+            };
+            match tasks
+                .match_user_reply(&mono_id, &text)
+                .map_err(|e| e.to_string())?
+            {
+                ReplyMatch::Resolves {
+                    decision,
+                    revision,
+                    answer,
+                } => {
+                    // Only this Mono's open user decisions take its user's answer.
+                    let open = tasks.user_decisions(&mono_id).map_err(|e| e.to_string())?;
+                    if !open.iter().any(|(d, _)| d.id == decision) {
+                        return Ok(Outcome::AnswerFailed(format!(
+                            "Decision {decision} is no longer waiting for you."
+                        )));
+                    }
+                    match tasks.answer_as(&decision, revision, &answer, Requester::User, now_ms()) {
+                        Ok(_) => Ok(Outcome::Answered),
+                        Err(error) => Ok(Outcome::AnswerFailed(error.to_string())),
+                    }
+                }
+                ReplyMatch::Unclear(open) => Ok(Outcome::Unclear(open)),
+                ReplyMatch::None => Ok(Outcome::None),
             }
         });
-        match matched {
-            Ok(ReplyMatch::Resolves {
-                decision,
-                revision,
-                answer,
-            }) => {
-                self.record_user_answer(mono, &decision, revision, &answer, cx);
-            }
-            // Asked once per decision: the first reply after its card that
-            // does not answer it, not every later message to Mono.
-            Ok(ReplyMatch::Unclear(open)) => {
-                let open: Vec<String> = open
-                    .into_iter()
-                    .filter(|id| self.task_noted.insert(id.clone()))
-                    .collect();
-                if open.is_empty() {
-                    return;
+        let mono = mono.to_owned();
+        cx.spawn(async move |this, cx| {
+            let matched = work.await;
+            let _ = this.update(cx, |this, cx| match matched {
+                Ok(Outcome::Answered) => this.refresh_cards(cx),
+                Ok(Outcome::AnswerFailed(error)) => {
+                    this.error = Some(error);
+                    this.changed(cx);
                 }
-                let note = format!(
-                    "This message did not answer {}. Choose an option on the decision card, or start your reply with the decision id and a colon (for example `{}: …`).",
-                    if open.len() == 1 {
-                        format!("decision {}", open[0])
-                    } else {
-                        format!("the open decisions ({})", open.join(", "))
-                    },
-                    open[0]
-                );
-                if let Some(owner) = self.roster.get_mut(mono) {
-                    owner.pending_reports.push(note);
+                // Asked once per decision: the first reply after its card that
+                // does not answer it, not every later message to Mono.
+                Ok(Outcome::Unclear(open)) => {
+                    let open: Vec<String> = open
+                        .into_iter()
+                        .filter(|id| this.task_noted.insert(id.clone()))
+                        .collect();
+                    if open.is_empty() {
+                        return;
+                    }
+                    let note = format!(
+                        "This message did not answer {}. Choose an option on the decision card, or start your reply with the decision id and a colon (for example `{}: …`).",
+                        if open.len() == 1 {
+                            format!("decision {}", open[0])
+                        } else {
+                            format!("the open decisions ({})", open.join(", "))
+                        },
+                        open[0]
+                    );
+                    if let Some(owner) = this.roster.get_mut(&mono) {
+                        owner.pending_reports.push(note);
+                    }
+                    this.save(cx);
                 }
-                self.save(cx);
-            }
-            Ok(ReplyMatch::None) => {}
-            Err(error) => eprintln!("Decision reply: {error}"),
-        }
+                Ok(Outcome::None) => {}
+                Err(error) => eprintln!("Decision reply: {error}"),
+            });
+        })
+        .detach();
     }
 
     /// A choice on a decision card: the user's unambiguous answer, which Mono

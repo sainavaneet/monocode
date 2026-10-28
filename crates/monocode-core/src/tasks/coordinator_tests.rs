@@ -213,6 +213,7 @@ fn one_assignment_launches_into_its_worktree_and_reports_durably() {
     let started = launcher.started.borrow();
     assert_eq!(started.len(), 1);
     let (session, settings) = &started[0];
+    assert_eq!(settings.access, crate::agent::AccessMode::FullAccess);
     assert_eq!(
         attempt.session_id.as_deref(),
         Some(store.persisted_session_id(session.id).unwrap().as_str())
@@ -222,6 +223,7 @@ fn one_assignment_launches_into_its_worktree_and_reports_durably() {
         Some(workspace.path.as_str())
     );
     let saved = store.agent_settings(session.id).unwrap().unwrap();
+    assert_eq!(saved.access, crate::agent::AccessMode::FullAccess);
     assert_eq!(saved.worktree_cwd.as_deref(), Some(workspace.path.as_str()));
     let brief = store.follow_ups(session.id).unwrap().draft.unwrap().text;
     for needle in [

@@ -248,3 +248,44 @@ for line in sys.stdin:
         assert!(profile.identity(Kind::Codex).is_none());
     }
 }
+
+#[test]
+fn default_account_removes_api_overrides_without_removing_oauth_or_project_environment() {
+    for (kind, keys, oauth) in [
+        (
+            Kind::Claude,
+            [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+            ],
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ),
+        (
+            Kind::Codex,
+            ["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"],
+            "CODEX_ACCESS_TOKEN",
+        ),
+    ] {
+        let mut command = Command::new("fixture");
+        for key in keys {
+            command.env(key, "unintended-fixture");
+        }
+        command
+            .env(oauth, "oauth-fixture")
+            .env("PROJECT_TEST", "preserved");
+        Profile::default().apply(kind, &mut command).unwrap();
+        let env: HashMap<_, _> = command.get_envs().collect();
+        for key in keys {
+            assert_eq!(env[std::ffi::OsStr::new(key)], None);
+        }
+        assert_eq!(
+            env[std::ffi::OsStr::new(oauth)],
+            Some(std::ffi::OsStr::new("oauth-fixture"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("PROJECT_TEST")],
+            Some(std::ffi::OsStr::new("preserved"))
+        );
+    }
+}

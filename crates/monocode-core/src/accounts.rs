@@ -104,6 +104,26 @@ impl Profile {
             .ok_or_else(|| format!("Could not find the {} home directory", kind.label()))
     }
     pub fn apply(&self, kind: Kind, command: &mut Command) -> Result<(), String> {
+        // Account-backed launches must not silently inherit API billing from
+        // the GUI's shell environment. Explicit API mode installs the saved
+        // key after applying the account profile.
+        match kind {
+            // A proxy base URL belongs to the key it was set with: without
+            // the key, keeping it would send the login to the proxy.
+            Kind::Claude => {
+                command
+                    .env_remove("ANTHROPIC_API_KEY")
+                    .env_remove("ANTHROPIC_AUTH_TOKEN")
+                    .env_remove("ANTHROPIC_BASE_URL");
+            }
+            Kind::Codex => {
+                command
+                    .env_remove("OPENAI_API_KEY")
+                    .env_remove("CODEX_API_KEY")
+                    .env_remove("OPENAI_BASE_URL");
+            }
+            _ => {}
+        }
         let Some(dir) = self.directory(kind)? else {
             return Ok(());
         };

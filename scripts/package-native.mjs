@@ -163,7 +163,7 @@ export async function packageNative({
         },
       },
     );
-    const app = join(dirname(binary), "Monocode Native.app");
+    const app = join(dirname(binary), "bundles.noindex", "Monocode Native.app");
     if (
       !process.env.APPLE_SIGNING_IDENTITY ||
       process.env.APPLE_SIGNING_IDENTITY === "-"

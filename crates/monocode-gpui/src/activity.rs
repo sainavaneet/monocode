@@ -12,6 +12,17 @@ pub(crate) fn shimmer(text: String, elapsed: f32) -> AnyElement {
     Shimmer {
         text: StyledText::new(text),
         elapsed,
+        quiet: false,
+    }
+    .into_any_element()
+}
+
+/// A slower, softer sweep for compact status labels, driven at paint time.
+pub(crate) fn status_shimmer(text: String) -> AnyElement {
+    Shimmer {
+        text: StyledText::new(text),
+        elapsed: 0.,
+        quiet: true,
     }
     .into_any_element()
 }
@@ -19,6 +30,7 @@ pub(crate) fn shimmer(text: String, elapsed: f32) -> AnyElement {
 struct Shimmer {
     text: StyledText,
     elapsed: f32,
+    quiet: bool,
 }
 impl IntoElement for Shimmer {
     type Element = Self;
@@ -54,7 +66,15 @@ impl Element for Shimmer {
         cx: &mut App,
     ) {
         // The sweep repaints its whole transcript, so it runs at 15fps.
-        crate::pulse::request(crate::pulse::Rate::Half, window, cx);
+        crate::pulse::request(
+            if self.quiet {
+                crate::pulse::Rate::Smooth
+            } else {
+                crate::pulse::Rate::Half
+            },
+            window,
+            cx,
+        );
         self.text.prepaint(None, None, bounds, state, window, cx);
     }
     fn paint(
@@ -65,8 +85,13 @@ impl Element for Shimmer {
         _: &mut (),
         _: &mut (),
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) {
+        let elapsed = if self.quiet {
+            crate::pulse::elapsed(cx).as_secs_f32()
+        } else {
+            self.elapsed
+        };
         let layout = self.text.layout();
         let line_height = layout.line_height();
         // Both callers use a single truncated line; retain StyledText's layout
@@ -78,11 +103,22 @@ impl Element for Shimmer {
                     let line = &wrapped.unwrapped_layout;
                     let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
                     let width = f32::from(line.width).max(1.);
-                    let center = -0.25 + (self.elapsed / 1.6).fract() * 1.5;
+                    let center = if self.quiet {
+                        -0.4 + (elapsed / 2.8).fract() * 1.8
+                    } else {
+                        -0.25 + (elapsed / 1.6).fract() * 1.5
+                    };
                     for run in &line.runs {
                         for glyph in &run.glyphs {
                             let x = f32::from(glyph.position.x + line.font_size * 0.25) / width;
-                            let sweep = (1. - (x - center).abs() / (2. / 7.)).max(0.);
+                            let sweep = (1.
+                                - (x - center).abs() / if self.quiet { 0.4 } else { 2. / 7. })
+                            .max(0.);
+                            let sweep = if self.quiet {
+                                sweep * sweep * (3. - 2. * sweep)
+                            } else {
+                                sweep
+                            };
                             let origin = bounds.origin
                                 + point(glyph.position.x, baseline + glyph.position.y);
                             if glyph.is_emoji {
@@ -98,7 +134,11 @@ impl Element for Shimmer {
                                     run.font_id,
                                     glyph.id,
                                     line.font_size,
-                                    crate::theme::content(0.4 + 0.6 * sweep),
+                                    crate::theme::content(if self.quiet {
+                                        0.48 + 0.32 * sweep
+                                    } else {
+                                        0.4 + 0.6 * sweep
+                                    }),
                                 );
                             }
                         }
@@ -329,6 +369,7 @@ mod shimmer_tests {
                             let shimmer = Shimmer {
                                 text: StyledText::new(text),
                                 elapsed,
+                                quiet: false,
                             };
                             let layout = shimmer.text.layout().clone();
                             let mut shimmer = shimmer.into_any_element();

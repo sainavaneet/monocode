@@ -442,11 +442,13 @@ impl Shell {
             Some(ProjectRailRow::Project { .. })
         );
         match row {
-            ProjectRailRow::Monos => self
-                .monos
-                .clone()
-                .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(compact, cx)))
-                .unwrap_or_else(|| div().into_any()),
+            ProjectRailRow::Monos => {
+                let workers = self.mono_worker_groups(compact, cx);
+                self.monos
+                    .clone()
+                    .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(compact, workers, cx)))
+                    .unwrap_or_else(|| div().into_any())
+            }
             ProjectRailRow::Heading(label) => self.project_rail_heading(label, compact, cx),
             ProjectRailRow::Project { path, grouped } => {
                 self.project_rail_row(ix, path, compact, grouped, row_gap, cx)
@@ -715,7 +717,11 @@ impl Shell {
                 self.monos
                     .clone()
                     .filter(|m| !m.read(cx).roster.monos.is_empty())
-                    .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(true, cx)))
+                    .map(|m| {
+                        m.update(cx, |m, cx| {
+                            m.project_navigation_rail(true, HashMap::new(), cx)
+                        })
+                    })
             } else {
                 None
             };

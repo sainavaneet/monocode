@@ -767,3 +767,35 @@ fn turning_provider_fallback_off_or_lowering_retries_reaches_running_tasks() {
     assert_eq!(launcher.count(), 1, "no replacement past the lowered limit");
     assert_eq!(status(&store, "t", "a"), AssignmentState::Failed);
 }
+
+#[test]
+fn worker_access_defaults_to_full_and_respects_explicit_policy_restrictions() {
+    use crate::agent::AccessMode;
+    let full = Autonomy::default();
+    assert_eq!(full.worker_access, AccessMode::FullAccess);
+    let legacy: Autonomy = serde_json::from_str("{}").unwrap();
+    assert_eq!(legacy.worker_access, AccessMode::FullAccess);
+    let supervised = Autonomy {
+        worker_access: AccessMode::Supervised,
+        ..full.clone()
+    };
+    assert_eq!(
+        full.restricted_by(&supervised).worker_access,
+        AccessMode::Supervised
+    );
+    assert_eq!(
+        supervised.restricted_by(&full).worker_access,
+        AccessMode::Supervised
+    );
+    let read_only = Autonomy {
+        worker_access: AccessMode::ReadOnly,
+        ..full.clone()
+    };
+    assert_eq!(
+        full.restricted_by(&read_only).worker_access,
+        AccessMode::ReadOnly
+    );
+    let restored: Autonomy =
+        serde_json::from_str(&serde_json::to_string(&supervised).unwrap()).unwrap();
+    assert_eq!(restored.worker_access, AccessMode::Supervised);
+}
